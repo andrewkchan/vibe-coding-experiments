@@ -1,5 +1,11 @@
 # Mini-Figma: A Web-Based Vector Editor
 
+
+
+https://github.com/user-attachments/assets/803a29a2-a619-412e-97df-34c21a6b5334
+
+
+
 ## Overview
 
 Mini-Figma is a lightweight, web-based 2D vector editor with an infinite canvas, inspired by Figma. It's designed to provide essential vector editing features with a focus on simplicity and a clean user interface. This project was developed as a pair programming exercise between a human user and an AI assistant (Gemini 2.5 Pro).
