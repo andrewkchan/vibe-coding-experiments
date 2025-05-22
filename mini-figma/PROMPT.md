@@ -19,8 +19,9 @@ WRT code style, keep comments to an absolute minimum; the code should be self-do
 
 Work only within the `mini-figma` folder. Do not edit any files outside. Create a plan and ask for my approval before beginning to code. In the plan, feel free to add any features which you feel are important, but make sure to honor the overall goals of simplicity and good, clean design. 
 
-## Cursor info
+## Meta
 
-```
-59fb4e03-34bd-4216-90ac-a2c64472b977
-```
+- Cursor agent mode
+- Gemini 2.5 Pro MAX
+- Request ID: `59fb4e03-34bd-4216-90ac-a2c64472b977`
+- ~30 requests, 70 tool calls, $5 total

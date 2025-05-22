@@ -66,10 +66,12 @@ const PropertiesPanel: React.FC = () => {
     objRef: O,
     property: P
   ) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-    let newValue: string | number = event.target.value;
+    let newValue: string | number | undefined = event.target.value;
     let parsedNumValue: number | undefined = undefined;
 
-    if (typeof objRef[property] === 'number') {
+    if (property === 'name' && newValue === '') {
+        newValue = undefined; 
+    } else if (typeof objRef[property] === 'number') {
       parsedNumValue = parseFloat(newValue as string);
       if (isNaN(parsedNumValue)) {
         return; 
@@ -81,14 +83,11 @@ const PropertiesPanel: React.FC = () => {
       const pathObj = objRef as PathObject;
       const currentVal = pathObj[property as 'x' | 'y'];
       const delta = (parsedNumValue !== undefined ? parsedNumValue : parseFloat(newValue as string)) - currentVal;
-
       if (isNaN(delta)) return;
-
       const newPoints = pathObj.points.map(p => ({
         x: p.x + (property === 'x' ? delta : 0),
         y: p.y + (property === 'y' ? delta : 0),
       }));
-      
       updateObject(objRef.id, { 
         [property]: newValue, 
         points: newPoints 
@@ -101,6 +100,10 @@ const PropertiesPanel: React.FC = () => {
   const renderCommonProperties = (obj: CanvasObject) => (
     <div style={sectionStyle}>
       <h4 style={sectionTitleStyle}>Common Properties</h4>
+      <div>
+        <label style={labelStyle} htmlFor={`prop-name-${obj.id}`}>Name:</label>
+        <input style={inputStyle} type="text" id={`prop-name-${obj.id}`} value={obj.name || ''} onChange={makeChangeHandler(obj, 'name')} placeholder="Layer Name" />
+      </div>
       <div>
         <label style={labelStyle} htmlFor={`prop-id-${obj.id}`}>ID:</label>
         <input style={{...inputStyle, backgroundColor: '#eee'}} type="text" id={`prop-id-${obj.id}`} value={obj.id} readOnly />
@@ -199,7 +202,8 @@ const PropertiesPanel: React.FC = () => {
           </div>
         );
       default:
-        return <p>Unsupported object type for properties panel.</p>;
+        const _exhaustiveCheck: never = obj;
+        return <p>Unsupported object type: {(_exhaustiveCheck as CanvasObject).id}</p>;
     }
   };
 

@@ -10,6 +10,7 @@ export enum ToolType {
 // Base interface for all canvas objects
 export interface CanvasObjectBase {
   id: string;
+  name?: string; // Optional user-defined name
   x: number;
   y: number;
   opacity: number; // 0.0 to 1.0
@@ -56,6 +57,11 @@ export interface TextObject extends CanvasObjectBase {
 export type CanvasObject = RectangleObject | EllipseObject | PathObject | TextObject;
 
 // Type for the application state (will be expanded)
+export type HandleType = 
+  | 'TopLeft' | 'TopMiddle' | 'TopRight' 
+  | 'MiddleLeft' | 'MiddleRight' 
+  | 'BottomLeft' | 'BottomMiddle' | 'BottomRight';
+
 export interface AppState {
   activeTool: ToolType;
   objects: CanvasObject[];
@@ -66,9 +72,19 @@ export interface AppState {
     zoom: number;
   };
   drawingState: {
-    isDrawing: boolean;
-    startPoint: { x: number; y: number } | null;
-    currentObjectId: string | null; // ID of the object being actively drawn/resized
-    // We might add tool-specific drawing state here later if needed
+    isDrawing: boolean; 
+    startPoint: { x: number; y: number } | null; 
+    currentObjectId: string | null; 
+    isDragging: boolean; 
+    dragObjectInitialX?: number; 
+    dragObjectInitialY?: number; 
+    isPanning?: boolean; 
+    initialPanX?: number; 
+    initialPanY?: number;
+
+    // Resizing specific state
+    isResizing?: boolean;
+    activeHandle?: HandleType;
+    resizeObjectSnapshot?: Partial<RectangleObject | EllipseObject>; // Store initial state of the object being resized
   };
 } 

@@ -1,54 +1,87 @@
-# React + TypeScript + Vite
+# Mini-Figma: A Web-Based Vector Editor
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+## Overview
 
-Currently, two official plugins are available:
+Mini-Figma is a lightweight, web-based 2D vector editor with an infinite canvas, inspired by Figma. It's designed to provide essential vector editing features with a focus on simplicity and a clean user interface. This project was developed as a pair programming exercise between a human user and an AI assistant (Gemini 2.5 Pro).
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+The application is built using React, TypeScript, and the HTML5 Canvas 2D API, all bundled with Vite.
 
-## Expanding the ESLint configuration
+## Features Implemented
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+*   **Infinite Canvas:** Smooth panning and zooming capabilities.
+*   **Toolbar:** Located at the top, providing quick access to drawing and selection tools using Feather Icons.
+*   **Selection Tool (`Select`):**
+    *   Select shapes (Rectangles, Ellipses) and paths by clicking on them.
+    *   Select Text objects.
+    *   Visual feedback (bounding box or point highlights) for selected objects.
+    *   Drag selected objects across the canvas.
+*   **Pen Tool (`Pen`):**
+    *   Place nodes one at a time to create multi-segment stroked paths.
+    *   Live preview line from the last point to the cursor.
+    *   Close paths by clicking near the starting node.
+    *   Finalize paths by selecting another tool or pressing `ESC`.
+*   **Rectangle Tool (`Rectangle`):**
+    *   Click and drag to define rectangle dimensions.
+    *   Single click to create a default-sized rectangle.
+*   **Ellipse Tool (`Ellipse`):**
+    *   Click and drag to define the bounding box for an ellipse.
+    *   Single click to create a default-sized ellipse.
+*   **Text Tool (`Text`):**
+    *   Click to place a text object with default content and styling.
+*   **Properties Panel (Right Panel):**
+    *   Displays properties of the currently selected single object.
+    *   Allows editing of common properties: Name, X, Y, Opacity.
+    *   Allows editing of shape-specific properties:
+        *   **Rectangle:** Width, Height, Fill Color.
+        *   **Ellipse:** Radius X, Radius Y, Fill Color.
+        *   **Path:** Stroke Color, Stroke Width.
+        *   **Text:** Content, Font Size, Font Family, Fill Color.
+    *   Changes in the panel immediately update the object on the canvas, and vice-versa for direct manipulations (like dragging).
+    *   Moving a Path object via its X/Y properties in the panel correctly offsets all its constituent points.
+*   **Layers Panel (Left Panel):**
+    *   Displays an ordered list of all objects on the canvas (topmost object at the top of the list).
+    *   Shows an icon representing the object type and its user-defined name (or a default name).
+    *   Highlights the layer corresponding to the selected object.
+    *   Clicking a layer item selects the corresponding object on the canvas.
+*   **UI:**
+    *   Responsive layout that fills the browser viewport.
+    *   Styled for a clean and modern look.
+    *   Cursor changes to indicate active tools, panning, and resizing operations.
 
-```js
-export default tseslint.config({
-  extends: [
-    // Remove ...tseslint.configs.recommended and replace with this
-    ...tseslint.configs.recommendedTypeChecked,
-    // Alternatively, use this for stricter rules
-    ...tseslint.configs.strictTypeChecked,
-    // Optionally, add this for stylistic rules
-    ...tseslint.configs.stylisticTypeChecked,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
-```
+## How to Install and Run
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+1.  **Prerequisites:**
+    *   Node.js (which includes npm) installed on your system. Recommended LTS version.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+2.  **Clone the repository (if applicable) or navigate to the `mini-figma` project directory.**
 
-export default tseslint.config({
-  plugins: {
-    // Add the react-x and react-dom plugins
-    'react-x': reactX,
-    'react-dom': reactDom,
-  },
-  rules: {
-    // other rules...
-    // Enable its recommended typescript rules
-    ...reactX.configs['recommended-typescript'].rules,
-    ...reactDom.configs.recommended.rules,
-  },
-})
-```
+3.  **Install Dependencies:**
+    Open your terminal in the `mini-figma` project root and run:
+    ```bash
+    npm install
+    ```
+
+4.  **Run the Development Server:**
+    After installation is complete, run:
+    ```bash
+    npm run dev
+    ```
+    This will start the Vite development server, typically on `http://localhost:5173` (the exact port will be shown in the terminal). Open this URL in your web browser to use the application.
+
+## Development Notes
+
+This application was collaboratively developed by a human user and an AI assistant (Gemini 2.5 Pro). The development process involved:
+
+*   The user providing high-level requirements and feature lists.
+*   The AI assistant generating a plan, then iteratively writing and refining the TypeScript/React code, CSS, and project configuration files.
+*   The AI assistant using a suite of tools to interact with the user's workspace, including:
+    *   Creating and editing files (`edit_file`).
+    *   Reading files (`read_file`).
+    *   Listing directory contents (`list_dir`).
+    *   Running terminal commands (`run_terminal_cmd`) for tasks like project initialization and dependency installation.
+    *   Searching the codebase (`codebase_search`, `grep_search`).
+*   The user providing feedback, debugging information (like console errors or visual discrepancies), and guiding the AI on architectural choices and refinements.
+
+The primary goal was to achieve the simplest code structure that supports the essential 2D vector editing features, emphasizing modularity and clean design while minimizing over-abstraction.
+
+**Disclaimer:** As an AI-generated application, while functional for the implemented features, it may contain bugs, architectural decisions reflective of the AI's current understanding, or areas for optimization. It serves as an example of AI-assisted development.

@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useStore } from '../store/store';
-import { ToolType, type CanvasObject, type RectangleObject, type EllipseObject, type PathObject, type TextObject } from '../types/canvas';
+import { ToolType, type CanvasObject, type RectangleObject, type EllipseObject, type PathObject, type TextObject, type HandleType } from '../types/canvas';
 
 const DEFAULT_RECT_WIDTH = 100;
 const DEFAULT_RECT_HEIGHT = 100;
@@ -23,12 +23,18 @@ const DEFAULT_TEXT_CONTENT = "Text";
 const DEFAULT_FONT_SIZE = 24; // in pixels
 const DEFAULT_FONT_FAMILY = 'Arial';
 const DEFAULT_TEXT_COLOR = '#333333';
+const ZOOM_SENSITIVITY = 0.001;
+
+const HANDLE_SIZE = 8; // Visual size of handles on screen
+const HANDLE_HIT_AREA_PADDING = 4; // Extra padding for easier handle clicking
 
 const CanvasView: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   // For Pen tool preview line
   const [previewLineEndPoint, setPreviewLineEndPoint] = useState<{x: number, y: number} | null>(null);
+  const [isSpacebarDown, setIsSpacebarDown] = useState(false);
+  const [hoveredHandle, setHoveredHandle] = useState<HandleType | null>(null);
 
   // Get state and actions from the store
   const {
@@ -42,17 +48,35 @@ const CanvasView: React.FC = () => {
     startDrawing,
     endDrawing,
     setSelectedObjectIds, // Added for selection
+    startDragging, // Added
+    endDragging,   // Added
+    startPanning,
+    updatePan,
+    endPanning,
+    setCanvasView, // For zoom
+    startResizing, // Added
+    endResizing,   // Added
   } = useStore((state) => state);
 
-  const getMousePosition = (event: React.MouseEvent | MouseEvent): { x: number; y: number } => {
+  // Convert screen coordinates (e.g., mouse event) to canvas/world coordinates
+  const screenToWorld = (screenX: number, screenY: number): { x: number; y: number } => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
-    // TODO: Adjust for canvas pan and zoom later
-    return {
-      x: event.clientX - rect.left,
-      y: event.clientY - rect.top,
-    };
+    // 1. Adjust for canvas position on screen
+    let worldX = screenX - rect.left;
+    let worldY = screenY - rect.top;
+    // 2. Adjust for panning
+    worldX -= canvasView.panX;
+    worldY -= canvasView.panY;
+    // 3. Adjust for zooming
+    worldX /= canvasView.zoom;
+    worldY /= canvasView.zoom;
+    return { x: worldX, y: worldY };
+  };
+
+  const getMouseCanvasCoordinates = (event: React.MouseEvent | MouseEvent): { x: number; y: number } => {
+    return screenToWorld(event.clientX, event.clientY);
   };
 
   // Hit testing functions
@@ -122,58 +146,136 @@ const CanvasView: React.FC = () => {
 
   // Hit testing for text (basic bounding box for now)
   const isPointInText = (px: number, py: number, textObj: TextObject, ctx: CanvasRenderingContext2D): boolean => {
-    ctx.font = `${textObj.fontSize}px ${textObj.fontFamily}`;
+    // Ensure font is set correctly for accurate measurement in world space (scaled by zoom)
+    const currentFont = `${textObj.fontSize * canvasView.zoom}px ${textObj.fontFamily}`;
+    // Temporarily set unscaled font for measurement if needed, or ensure textObj itself uses world units for fontSize if it does not.
+    // For simplicity, if textObj.fontSize is in world units, this measure is fine.
+    // The rendering part handles scaling. Here we assume textObj properties are world units.
+    ctx.font = `${textObj.fontSize}px ${textObj.fontFamily}`; 
     const textMetrics = ctx.measureText(textObj.content);
-    // Approximate bounding box. More accurate would involve actualBoundingBoxAscent/Descent.
     const textWidth = textMetrics.width;
-    const textHeight = textObj.fontSize; // Approximation
-
-    // Assuming textObj.x, textObj.y is the top-left corner for this hit-test approximation
-    // Note: Rendering is typically baseline. For hit-testing, a bounding box is easier.
-    // Let's adjust textObj.y to be the top of the text for hit-testing purposes.
-    const hitTestY = textObj.y - textHeight * 0.75; // Approximate top based on baseline
-
+    const textHeight = textObj.fontSize; 
+    const hitTestY = textObj.y - textHeight * 0.75; // Assumes textObj.y is baseline
     return px >= textObj.x && px <= textObj.x + textWidth && py >= hitTestY && py <= hitTestY + textHeight;
   };
 
+  // Function to get handle positions for a given object (Rectangle or Ellipse)
+  const getHandles = (obj: RectangleObject | EllipseObject): Record<HandleType, {x: number, y: number}> | null => {
+    if (obj.type === 'rectangle') {
+      const { x, y, width, height } = obj;
+      return {
+        TopLeft: { x, y }, TopMiddle: { x: x + width / 2, y }, TopRight: { x: x + width, y },
+        MiddleLeft: { x, y: y + height / 2 }, MiddleRight: { x: x + width, y: y + height / 2 },
+        BottomLeft: { x, y: y + height }, BottomMiddle: { x: x + width / 2, y: y + height }, BottomRight: { x: x + width, y: y + height },
+      };
+    }
+    if (obj.type === 'ellipse') {
+        const { x, y, radiusX, radiusY } = obj;
+        // Bounding box for ellipse handles
+        const left = x - radiusX; const top = y - radiusY;
+        const right = x + radiusX; const bottom = y + radiusY;
+        return {
+            TopLeft: { x: left, y: top }, TopMiddle: { x: x, y: top }, TopRight: { x: right, y: top },
+            MiddleLeft: { x: left, y: y }, MiddleRight: { x: right, y: y },
+            BottomLeft: { x: left, y: bottom }, BottomMiddle: { x: x, y: bottom }, BottomRight: { x: right, y: bottom },
+        };
+    }
+    return null;
+  };
+
+  const getCursorForHandle = (handle: HandleType | null): string => {
+    if (!handle) return 'default';
+    switch (handle) {
+      case 'TopLeft': case 'BottomRight': return 'nwse-resize';
+      case 'TopRight': case 'BottomLeft': return 'nesw-resize';
+      case 'TopMiddle': case 'BottomMiddle': return 'ns-resize';
+      case 'MiddleLeft': case 'MiddleRight': return 'ew-resize';
+      default: return 'default';
+    }
+  };
+
   const handleMouseDown = (event: React.MouseEvent) => {
-    const { x, y } = getMousePosition(event);
+    const { x: worldMouseX, y: worldMouseY } = getMouseCanvasCoordinates(event);
     const canvas = canvasRef.current;
     let ctx: CanvasRenderingContext2D | null = null;
     if (canvas) {
         ctx = canvas.getContext('2d');
     }
 
+    if (isSpacebarDown || (activeTool === ToolType.SELECT && event.button === 1)) { // Spacebar or Middle mouse for pan
+        startPanning(event.clientX, event.clientY, canvasView.panX, canvasView.panY);
+        return;
+    }
+
     if (activeTool === ToolType.SELECT) {
-      let objectHit = false;
-      if (ctx) { // Ensure ctx is available for text hit testing
+      const selectedObj = selectedObjectIds.length === 1 ? objects.find(o => o.id === selectedObjectIds[0]) : undefined;
+      
+      // Check for handle click first if an object is selected and resizable
+      if (selectedObj && (selectedObj.type === 'rectangle' || selectedObj.type === 'ellipse')) {
+        const handles = getHandles(selectedObj as RectangleObject | EllipseObject);
+        const handleSizeWorld = (HANDLE_SIZE + HANDLE_HIT_AREA_PADDING * 2) / canvasView.zoom; // Handle size in world units
+        if (handles) {
+          for (const handleType in handles) {
+            const handlePos = handles[handleType as HandleType];
+            if ( worldMouseX >= handlePos.x - handleSizeWorld / 2 && worldMouseX <= handlePos.x + handleSizeWorld / 2 &&
+                 worldMouseY >= handlePos.y - handleSizeWorld / 2 && worldMouseY <= handlePos.y + handleSizeWorld / 2
+            ) {
+              let snapshot: Partial<RectangleObject | EllipseObject>;
+              if (selectedObj.type === 'rectangle') {
+                const { id, type, x, y, width, height, opacity, name, fillColor, strokeColor, strokeWidth } = selectedObj as RectangleObject;
+                snapshot = { id, type, x, y, width, height, opacity, name, fillColor, strokeColor, strokeWidth };
+              } else { // Ellipse
+                const { id, type, x, y, radiusX, radiusY, opacity, name, fillColor, strokeColor, strokeWidth } = selectedObj as EllipseObject;
+                snapshot = { id, type, x, y, radiusX, radiusY, opacity, name, fillColor, strokeColor, strokeWidth };
+              }
+              startResizing(selectedObj.id, handleType as HandleType, worldMouseX, worldMouseY, snapshot);
+              return;
+            }
+          }
+        }
+      }
+
+      // If not clicking a handle, proceed with object selection/drag
+      let hitObject: CanvasObject | undefined = undefined;
+      if (ctx) {
         for (let i = objects.length - 1; i >= 0; i--) {
             const obj = objects[i];
             let hit = false;
-            if (obj.type === 'rectangle') {
-            hit = isPointInRect(x, y, obj as RectangleObject);
-            } else if (obj.type === 'ellipse') {
-            hit = isPointInEllipse(x, y, obj as EllipseObject);
-            } else if (obj.type === 'path') {
-            hit = isPointOnPath(x, y, obj as PathObject);
-            } else if (obj.type === 'text') {
-            hit = isPointInText(x, y, obj as TextObject, ctx);
-            }
-
+            if (obj.type === 'rectangle') hit = isPointInRect(worldMouseX, worldMouseY, obj as RectangleObject);
+            else if (obj.type === 'ellipse') hit = isPointInEllipse(worldMouseX, worldMouseY, obj as EllipseObject);
+            else if (obj.type === 'path') hit = isPointOnPath(worldMouseX, worldMouseY, obj as PathObject);
+            else if (obj.type === 'text') hit = isPointInText(worldMouseX, worldMouseY, obj as TextObject, ctx);
+            
             if (hit) {
-            setSelectedObjectIds([obj.id]);
-            objectHit = true;
-            break; 
+              hitObject = obj;
+              break; 
             }
         }
       }
-      if (!objectHit) {
+
+      if (hitObject) {
+        if (!selectedObjectIds.includes(hitObject.id)) {
+          setSelectedObjectIds([hitObject.id]);
+        }
+        // Now start dragging this object
+        startDragging(hitObject.id, worldMouseX, worldMouseY, hitObject.x, hitObject.y);
+      } else {
         setSelectedObjectIds([]);
+        endDragging(); // Ensure no dragging state if clicked on empty canvas
       }
       return; 
-    } else if (activeTool === ToolType.TEXT) {
+    }
+    
+    // Reset dragging state if a drawing tool is activated by mousedown
+    if (drawingState.isDragging) endDragging();
+
+    if (drawingState.isPanning) endPanning(); // Should not happen if spacebar logic is correct, but as safeguard.
+
+    if (drawingState.isResizing) endResizing(); // End resizing if mouse is down
+
+    if (activeTool === ToolType.TEXT) {
       const newTextData: Omit<TextObject, 'id'> = {
-        type: 'text', x, y, content: DEFAULT_TEXT_CONTENT, fontSize: DEFAULT_FONT_SIZE, 
+        type: 'text', name: 'Text', x: worldMouseX, y: worldMouseY, content: DEFAULT_TEXT_CONTENT, fontSize: DEFAULT_FONT_SIZE, 
         fontFamily: DEFAULT_FONT_FAMILY, fillColor: DEFAULT_TEXT_COLOR, opacity: 1,
       };
       const newId = addObject(newTextData);
@@ -182,87 +284,199 @@ const CanvasView: React.FC = () => {
     }
     if (activeTool === ToolType.RECTANGLE) {
       const newRectData: Omit<RectangleObject, 'id'> = {
-        type: 'rectangle', x, y, width: 0, height: 0, fillColor: '#aabbcc', opacity: 1,
+        type: 'rectangle', name: 'Rectangle', x: worldMouseX, y: worldMouseY, width: 0, height: 0, fillColor: '#aabbcc', opacity: 1,
       };
       const newId = addObject(newRectData);
-      startDrawing(x, y, newId);
+      startDrawing(worldMouseX, worldMouseY, newId);
     } else if (activeTool === ToolType.ELLIPSE) {
       const newEllipseData: Omit<EllipseObject, 'id'> = {
-        type: 'ellipse', x, y, radiusX: 0, radiusY: 0, fillColor: '#ccbbaa', opacity: 1,
+        type: 'ellipse', name: 'Ellipse', x: worldMouseX, y: worldMouseY, radiusX: 0, radiusY: 0, fillColor: '#ccbbaa', opacity: 1,
       };
       const newId = addObject(newEllipseData);
-      startDrawing(x, y, newId);
+      startDrawing(worldMouseX, worldMouseY, newId);
     } else if (activeTool === ToolType.PEN) {
       const currentPathId = drawingState.currentObjectId;
       const existingPathObject = objects.find(obj => obj.id === currentPathId && obj.type === 'path');
       const existingPath = existingPathObject as PathObject | undefined;
       if (drawingState.isDrawing && existingPath && existingPath.points.length > 0) {
         const firstPoint = existingPath.points[0];
-        const distanceToStart = Math.sqrt(distSq(x, y, firstPoint.x, firstPoint.y));
+        const distanceToStart = Math.sqrt(distSq(worldMouseX, worldMouseY, firstPoint.x, firstPoint.y));
         if (distanceToStart < PATH_CLOSING_THRESHOLD && existingPath.points.length > 1) {
           const closedPoints = [...existingPath.points, { x: firstPoint.x, y: firstPoint.y }];
           updateObject(currentPathId!, { points: closedPoints } as Partial<PathObject>); 
           endDrawing();
           setPreviewLineEndPoint(null);
         } else {
-          const updatedPoints = [...existingPath.points, { x, y }];
+          const updatedPoints = [...existingPath.points, { x: worldMouseX, y: worldMouseY }];
           updateObject(currentPathId!, { points: updatedPoints } as Partial<PathObject>); 
         }
       } else {
         endDrawing(); 
         const newPathData: Omit<PathObject, 'id'> = {
-          type: 'path', points: [{ x, y }], strokeColor: DEFAULT_PATH_STROKE_COLOR, strokeWidth: DEFAULT_PATH_STROKE_WIDTH, opacity: 1, x, y,
+          type: 'path', name: 'Path', points: [{ x: worldMouseX, y: worldMouseY }], strokeColor: DEFAULT_PATH_STROKE_COLOR, strokeWidth: DEFAULT_PATH_STROKE_WIDTH, opacity: 1, x: worldMouseX, y: worldMouseY,
         };
         const newId = addObject(newPathData);
-        startDrawing(x, y, newId);
+        startDrawing(worldMouseX, worldMouseY, newId);
       }
     }
   };
 
   const handleMouseMove = (event: React.MouseEvent) => {
-    const { x: currentMouseX, y: currentMouseY } = getMousePosition(event);
-    
-    if (activeTool === ToolType.PEN && drawingState.isDrawing && drawingState.currentObjectId) {
-      setPreviewLineEndPoint({ x: currentMouseX, y: currentMouseY });
-    } else {
-      setPreviewLineEndPoint(null);
+    const { x: worldMouseX, y: worldMouseY } = getMouseCanvasCoordinates(event);
+    const screenMouseX = event.clientX;
+    const screenMouseY = event.clientY;
+
+    if (drawingState.isPanning) {
+        updatePan(screenMouseX, screenMouseY); // updatePan uses screen coordinates to calculate delta from screen startPoint
+        return;
     }
 
-    if (!drawingState.isDrawing || !drawingState.startPoint || !drawingState.currentObjectId || activeTool === ToolType.TEXT) return;
-    const { startPoint, currentObjectId } = drawingState;
+    if (drawingState.isResizing && drawingState.currentObjectId && drawingState.startPoint && drawingState.activeHandle && drawingState.resizeObjectSnapshot) {
+      const obj = drawingState.resizeObjectSnapshot;
+      const { startPoint, activeHandle } = drawingState;
+      const dx = worldMouseX - startPoint.x;
+      const dy = worldMouseY - startPoint.y;
+      let newProps: Partial<RectangleObject | EllipseObject> = {};
 
-    if (activeTool === ToolType.RECTANGLE) {
-      const rectX = Math.min(currentMouseX, startPoint.x);
-      const rectY = Math.min(currentMouseY, startPoint.y);
-      const rectWidth = Math.abs(currentMouseX - startPoint.x);
-      const rectHeight = Math.abs(currentMouseY - startPoint.y);
-      updateObject(currentObjectId, {
-        x: rectX,
-        y: rectY,
-        width: rectWidth,
-        height: rectHeight,
-      } as Partial<RectangleObject>);
-    } else if (activeTool === ToolType.ELLIPSE) {
-      const rectX = Math.min(currentMouseX, startPoint.x);
-      const rectY = Math.min(currentMouseY, startPoint.y);
-      const rectWidth = Math.abs(currentMouseX - startPoint.x);
-      const rectHeight = Math.abs(currentMouseY - startPoint.y);
+      if (obj.type === 'rectangle') {
+        let { x = 0, y = 0, width = 0, height = 0 } = obj as Partial<RectangleObject>; 
+        switch (activeHandle) {
+          case 'TopLeft': x += dx; y += dy; width -= dx; height -= dy; break;
+          case 'TopMiddle': y += dy; height -= dy; break;
+          case 'TopRight': y += dy; width += dx; height -= dy; break;
+          case 'MiddleLeft': x += dx; width -= dx; break;
+          case 'MiddleRight': width += dx; break;
+          case 'BottomLeft': x += dx; height += dy; width -= dx; break;
+          case 'BottomMiddle': height += dy; break;
+          case 'BottomRight': width += dx; height += dy; break;
+        }
+        if (width < 0) { x += width; width *= -1; } // Handle negative width/height by flipping
+        if (height < 0) { y += height; height *= -1; }
+        newProps = { x, y, width, height };
+      } else if (obj.type === 'ellipse') {
+        let { x = 0, y = 0, radiusX = 0, radiusY = 0 } = obj as Partial<EllipseObject>; 
+        // For ellipses, resizing from corners/edges modifies radii and potentially center
+        // This simplified version adjusts radii based on which edge/corner is dragged
+        // For a more intuitive feel, one might need to adjust center as well for some handles
+        const initialBoundingBox = {
+            left: (obj.x ?? 0) - (obj.radiusX ?? 0), top: (obj.y ?? 0) - (obj.radiusY ?? 0),
+            right: (obj.x ?? 0) + (obj.radiusX ?? 0), bottom: (obj.y ?? 0) + (obj.radiusY ?? 0),
+        };
+        let newLeft = initialBoundingBox.left, newTop = initialBoundingBox.top;
+        let newRight = initialBoundingBox.right, newBottom = initialBoundingBox.bottom;
 
-      const centerX = rectX + rectWidth / 2;
-      const centerY = rectY + rectHeight / 2;
-      const radiusX = rectWidth / 2;
-      const radiusY = rectHeight / 2;
+        if (activeHandle.includes('Left')) newLeft += dx;
+        if (activeHandle.includes('Right')) newRight += dx;
+        if (activeHandle.includes('Top')) newTop += dy;
+        if (activeHandle.includes('Bottom')) newBottom += dy;
+        
+        if (activeHandle === 'MiddleLeft' || activeHandle === 'MiddleRight') { /* only x affected */ } 
+        else if (activeHandle === 'TopMiddle' || activeHandle === 'BottomMiddle') { /* only y affected */ } 
+        else { /* Corner handles affect both */ }
 
-      updateObject(currentObjectId, {
-        x: centerX,
-        y: centerY,
-        radiusX,
-        radiusY,
-      } as Partial<EllipseObject>);
+        if (newLeft > newRight) [newLeft, newRight] = [newRight, newLeft];
+        if (newTop > newBottom) [newTop, newBottom] = [newBottom, newTop];
+        
+        newProps = {
+            x: (newLeft + newRight) / 2,
+            y: (newTop + newBottom) / 2,
+            radiusX: (newRight - newLeft) / 2,
+            radiusY: (newBottom - newTop) / 2,
+        };
+      }
+      if (Object.keys(newProps).length > 0) updateObject(drawingState.currentObjectId, newProps);
+      return; // Prevent other mouse move actions
+    }
+
+    // Hovering over handles for cursor change
+    let cursorToSet: string | null = null;
+    if (activeTool === ToolType.SELECT && selectedObjectIds.length === 1 && !drawingState.isDragging && !drawingState.isResizing) {
+        const selectedObj = objects.find(o => o.id === selectedObjectIds[0]);
+        if (selectedObj && (selectedObj.type === 'rectangle' || selectedObj.type === 'ellipse')) {
+            const handles = getHandles(selectedObj as RectangleObject | EllipseObject);
+            const handleSizeWorld = (HANDLE_SIZE + HANDLE_HIT_AREA_PADDING * 2) / canvasView.zoom;
+            if (handles) {
+                let foundHandle: HandleType | null = null;
+                for (const handleType in handles) {
+                    const handlePos = handles[handleType as HandleType];
+                    if ( worldMouseX >= handlePos.x - handleSizeWorld / 2 && worldMouseX <= handlePos.x + handleSizeWorld / 2 &&
+                         worldMouseY >= handlePos.y - handleSizeWorld / 2 && worldMouseY <= handlePos.y + handleSizeWorld / 2 ) {
+                        foundHandle = handleType as HandleType;
+                        break;
+                    }
+                }
+                setHoveredHandle(foundHandle);
+                cursorToSet = getCursorForHandle(foundHandle);
+            }
+        } else {
+            if (hoveredHandle) setHoveredHandle(null); // Clear if selected object is not resizable or no object selected
+        }
+    } else {
+        if (hoveredHandle) setHoveredHandle(null); // Clear if not in select mode or currently dragging/resizing
+    }
+
+    if (drawingState.isDragging && drawingState.currentObjectId && drawingState.startPoint) {
+        const objToDrag = objects.find(o => o.id === drawingState.currentObjectId);
+        if (!objToDrag) {
+            endDragging();
+            return;
+        }
+
+        const deltaX = worldMouseX - drawingState.startPoint.x;
+        const deltaY = worldMouseY - drawingState.startPoint.y;
+
+        const newObjX = (drawingState.dragObjectInitialX ?? 0) + deltaX;
+        const newObjY = (drawingState.dragObjectInitialY ?? 0) + deltaY;
+
+        if (objToDrag.type === 'path') {
+            const path = objToDrag as PathObject;
+            const currentStoredPathX = path.x;
+            const currentStoredPathY = path.y;
+            const pointDeltaX = newObjX - currentStoredPathX;
+            const pointDeltaY = newObjY - currentStoredPathY;
+            const movedPoints = path.points.map(p => ({
+                x: p.x + pointDeltaX,
+                y: p.y + pointDeltaY,
+            }));
+
+            updateObject(drawingState.currentObjectId, { x: newObjX, y: newObjY, points: movedPoints } as Partial<PathObject>);
+        } else {
+            updateObject(drawingState.currentObjectId, { x: newObjX, y: newObjY } as Partial<CanvasObject>);
+        }
+    } else if (activeTool === ToolType.PEN && drawingState.isDrawing && drawingState.currentObjectId) {
+      setPreviewLineEndPoint({ x: worldMouseX, y: worldMouseY });
+    } else if (drawingState.isDrawing && drawingState.startPoint && drawingState.currentObjectId && activeTool !== ToolType.TEXT) {
+      // Shape drawing logic (Rectangle, Ellipse)
+      const { startPoint, currentObjectId } = drawingState;
+      if (activeTool === ToolType.RECTANGLE) {
+        const rectX = Math.min(worldMouseX, startPoint.x);
+        const rectY = Math.min(worldMouseY, startPoint.y);
+        const rectWidth = Math.abs(worldMouseX - startPoint.x);
+        const rectHeight = Math.abs(worldMouseY - startPoint.y);
+        updateObject(currentObjectId, { x: rectX, y: rectY, width: rectWidth, height: rectHeight } as Partial<RectangleObject>);
+      } else if (activeTool === ToolType.ELLIPSE) {
+        const rectX = Math.min(worldMouseX, startPoint.x);
+        const rectY = Math.min(worldMouseY, startPoint.y);
+        const rectWidth = Math.abs(worldMouseX - startPoint.x);
+        const rectHeight = Math.abs(worldMouseY - startPoint.y);
+        const centerX = rectX + rectWidth / 2;
+        const centerY = rectY + rectHeight / 2;
+        const radiusX = rectWidth / 2;
+        const radiusY = rectHeight / 2;
+        updateObject(currentObjectId, { x: centerX, y: centerY, radiusX, radiusY } as Partial<EllipseObject>);
+      }
+    } else {
+        setPreviewLineEndPoint(null); // Clear pen preview if not applicable
     }
   };
 
   const handleMouseUp = (event: React.MouseEvent) => {
+    if (drawingState.isPanning) { endPanning(); return; }
+    if (drawingState.isResizing) { endResizing(); return; } // End resizing on mouse up
+    if (drawingState.isDragging) {
+        endDragging();
+        return; // Important to return after handling drag end
+    }
     if (activeTool === ToolType.PEN || activeTool === ToolType.TEXT) {
       return; 
     }
@@ -270,45 +484,59 @@ const CanvasView: React.FC = () => {
       endDrawing();
       return;
     }
-    const { x: currentMouseX, y: currentMouseY } = getMousePosition(event);
+    const { x: worldMouseX, y: worldMouseY } = getMouseCanvasCoordinates(event);
     const { startPoint, currentObjectId } = drawingState;
-    const dragWidth = Math.abs(currentMouseX - startPoint.x);
-    const dragHeight = Math.abs(currentMouseY - startPoint.y);
+    const dragWidth = Math.abs(worldMouseX - startPoint.x);
+    const dragHeight = Math.abs(worldMouseY - startPoint.y);
 
     if (activeTool === ToolType.RECTANGLE) {
       if (dragWidth < CLICK_DRAG_THRESHOLD && dragHeight < CLICK_DRAG_THRESHOLD) {
-        updateObject(currentObjectId, {
-          width: DEFAULT_RECT_WIDTH,
-          height: DEFAULT_RECT_HEIGHT,
-        } as Partial<RectangleObject>);
+        updateObject(currentObjectId, { width: DEFAULT_RECT_WIDTH, height: DEFAULT_RECT_HEIGHT } as Partial<RectangleObject>);
       }
     } else if (activeTool === ToolType.ELLIPSE) {
-      if (dragWidth < CLICK_DRAG_THRESHOLD && dragHeight < CLICK_DRAG_THRESHOLD) {
-        // Click: create default ellipse, startPoint is top-left of bounding box
+       if (dragWidth < CLICK_DRAG_THRESHOLD && dragHeight < CLICK_DRAG_THRESHOLD) {
         const centerX = startPoint.x + DEFAULT_ELLIPSE_RADIUS_X;
         const centerY = startPoint.y + DEFAULT_ELLIPSE_RADIUS_Y;
-        updateObject(currentObjectId, {
-          x: centerX,
-          y: centerY,
-          radiusX: DEFAULT_ELLIPSE_RADIUS_X,
-          radiusY: DEFAULT_ELLIPSE_RADIUS_Y,
-        } as Partial<EllipseObject>);
-      } else {
-        // Drag: dimensions already set in mouseMove
-        // The x,y (center) and radii are already correctly calculated and updated
+        updateObject(currentObjectId, { x: centerX, y: centerY, radiusX: DEFAULT_ELLIPSE_RADIUS_X, radiusY: DEFAULT_ELLIPSE_RADIUS_Y } as Partial<EllipseObject>);
       }
     }
     endDrawing();
   };
 
+  const handleWheel = (event: React.WheelEvent) => {
+    event.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseXOnScreen = event.clientX - rect.left; // Mouse X relative to canvas top-left
+    const mouseYOnScreen = event.clientY - rect.top; // Mouse Y relative to canvas top-left
+
+    const oldZoom = canvasView.zoom;
+    const newZoom = oldZoom * Math.pow(1 - ZOOM_SENSITIVITY, event.deltaY);
+    
+    // Determine world coordinates of mouse point BEFORE zoom
+    const worldMouseXBeforeZoom = (mouseXOnScreen - canvasView.panX) / oldZoom;
+    const worldMouseYBeforeZoom = (mouseYOnScreen - canvasView.panY) / oldZoom;
+
+    // Calculate new pan to keep world point under mouse
+    const newPanX = mouseXOnScreen - worldMouseXBeforeZoom * newZoom;
+    const newPanY = mouseYOnScreen - worldMouseYBeforeZoom * newZoom;
+
+    setCanvasView({ zoom: newZoom, panX: newPanX, panY: newPanY });
+  };
+
   // Drawing logic
   const drawObjects = useCallback((ctx: CanvasRenderingContext2D) => {
-    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-    // TODO: Apply pan and zoom from canvasView.zoom, canvasView.panX, canvasView.panY
-
-    // Example background (can be removed or made configurable)
+    ctx.save(); // Save the default state
+    ctx.clearRect(0, 0, ctx.canvas.width / (window.devicePixelRatio||1) , ctx.canvas.height/ (window.devicePixelRatio||1) ); // Clear considering DPR for actual canvas size
+    
     ctx.fillStyle = '#f0f0f0';
-    ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    ctx.fillRect(0, 0, ctx.canvas.width/ (window.devicePixelRatio||1), ctx.canvas.height/ (window.devicePixelRatio||1));
+
+    // Apply pan and zoom
+    ctx.translate(canvasView.panX, canvasView.panY);
+    ctx.scale(canvasView.zoom, canvasView.zoom);
 
     objects.forEach((obj) => {
       ctx.globalAlpha = obj.opacity;
@@ -325,9 +553,19 @@ const CanvasView: React.FC = () => {
             ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
           }
           if (isSelected) {
-            ctx.strokeStyle = SELECTION_COLOR;
-            ctx.lineWidth = SELECTION_LINE_WIDTH;
-            ctx.strokeRect(rect.x - SELECTION_LINE_WIDTH, rect.y - SELECTION_LINE_WIDTH, rect.width + SELECTION_LINE_WIDTH*2, rect.height + SELECTION_LINE_WIDTH*2);
+            const handles = getHandles(rect);
+            if (handles) {
+              ctx.strokeStyle = SELECTION_COLOR;
+              ctx.lineWidth = SELECTION_LINE_WIDTH / canvasView.zoom;
+              // Draw main bounding box for selection
+              ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+              // Draw handles
+              ctx.fillStyle = SELECTION_COLOR;
+              const handleWorldSize = HANDLE_SIZE / canvasView.zoom;
+              Object.values(handles).forEach(pos => {
+                ctx.fillRect(pos.x - handleWorldSize / 2, pos.y - handleWorldSize / 2, handleWorldSize, handleWorldSize);
+              });
+            }
           }
           break;
         case 'ellipse':
@@ -342,12 +580,21 @@ const CanvasView: React.FC = () => {
             ctx.stroke(); // Stroke the current path (the ellipse)
           }
           if (isSelected) {
-            ctx.strokeStyle = SELECTION_COLOR;
-            ctx.lineWidth = SELECTION_LINE_WIDTH;
-            ctx.beginPath(); // Start a new path for the selection ellipse
-            // Draw ellipse slightly larger for selection outline
-            ctx.ellipse(ellipse.x, ellipse.y, ellipse.radiusX + SELECTION_LINE_WIDTH, ellipse.radiusY + SELECTION_LINE_WIDTH, 0, 0, 2 * Math.PI);
-            ctx.stroke();
+            const handles = getHandles(ellipse);
+            if (handles) {
+              ctx.strokeStyle = SELECTION_COLOR;
+              ctx.lineWidth = SELECTION_LINE_WIDTH / canvasView.zoom;
+              // Draw main bounding box for selection
+              ctx.beginPath();
+              ctx.ellipse(ellipse.x, ellipse.y, ellipse.radiusX, ellipse.radiusY, 0, 0, 2 * Math.PI);
+              ctx.stroke();
+              // Draw handles
+              ctx.fillStyle = SELECTION_COLOR;
+              const handleWorldSize = HANDLE_SIZE / canvasView.zoom;
+              Object.values(handles).forEach(pos => {
+                ctx.fillRect(pos.x - handleWorldSize / 2, pos.y - handleWorldSize / 2, handleWorldSize, handleWorldSize);
+              });
+            }
           }
           break;
         case 'path':
@@ -366,7 +613,7 @@ const CanvasView: React.FC = () => {
               path.points.forEach(p => {
                 ctx.fillStyle = SELECTION_COLOR;
                 ctx.beginPath();
-                ctx.arc(p.x, p.y, (PATH_POINT_SELECTION_RADIUS/2), 0, 2 * Math.PI); // Smaller radius for points when segment is selectable
+                ctx.arc(p.x, p.y, (PATH_POINT_SELECTION_RADIUS/2) / canvasView.zoom, 0, 2 * Math.PI); // Smaller radius for points when segment is selectable
                 ctx.fill();
               });
             }
@@ -386,8 +633,8 @@ const CanvasView: React.FC = () => {
             const textX = text.x;
             const textY = text.y - approxHeight * 0.8; // Approximate top based on baseline
             ctx.strokeStyle = SELECTION_COLOR;
-            ctx.lineWidth = SELECTION_LINE_WIDTH;
-            ctx.strokeRect(textX - 2, textY - 2, textMetrics.width + 4, approxHeight + 4);
+            ctx.lineWidth = SELECTION_LINE_WIDTH / canvasView.zoom;
+            ctx.strokeRect(textX - (2/canvasView.zoom), textY - (2/canvasView.zoom), textMetrics.width + (4/canvasView.zoom), approxHeight + (4/canvasView.zoom));
           }
           break;
         // TODO: Add other object types (ellipse, path, text)
@@ -404,67 +651,93 @@ const CanvasView: React.FC = () => {
         ctx.moveTo(lastPoint.x, lastPoint.y);
         ctx.lineTo(previewLineEndPoint.x, previewLineEndPoint.y);
         ctx.strokeStyle = DEFAULT_PATH_STROKE_COLOR; // Or a specific preview color
-        ctx.lineWidth = DEFAULT_PATH_STROKE_WIDTH;
-        ctx.setLineDash([3, 3]); // Dashed line for preview
+        ctx.lineWidth = DEFAULT_PATH_STROKE_WIDTH / canvasView.zoom; // Adjust preview line for zoom
+        ctx.setLineDash([3 / canvasView.zoom, 3 / canvasView.zoom]); // Dashed line for preview
         ctx.stroke();
         ctx.setLineDash([]); // Reset line dash
       }
     }
+    ctx.restore(); // Restore to default state
   }, [objects, canvasView, activeTool, drawingState.isDrawing, drawingState.currentObjectId, previewLineEndPoint, selectedObjectIds]);
 
-  // Effect for ESC key to end drawing for Pen tool
+  // Global event listeners for Spacebar (Panning) and Escape key
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code === 'Space') {
+        event.preventDefault(); // Prevent page scroll
+        setIsSpacebarDown(true);
+      }
       if (event.key === 'Escape') {
-        if (activeTool === ToolType.PEN && drawingState.isDrawing) {
+        if (drawingState.isPanning) endPanning();
+        else if (drawingState.isResizing) endResizing(); // End resizing on ESC
+        else if (drawingState.isDragging) endDragging();
+        else if (activeTool === ToolType.PEN && drawingState.isDrawing) {
           endDrawing();
-          setPreviewLineEndPoint(null); // Clear preview line as well
+          setPreviewLineEndPoint(null);
+        }
+      }
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'Space') {
+        event.preventDefault();
+        setIsSpacebarDown(false);
+        if (drawingState.isPanning) {
+            endPanning(); // If space is released while panning, end pan.
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [activeTool, drawingState.isDrawing, endDrawing]);
+  }, [activeTool, drawingState, endDrawing, endDragging, endPanning, endResizing]);
 
-  // Effect for canvas setup and resize handling
+  // Effect for canvas setup, resize handling, and initial draw
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (canvas && container) {
       const ctx = canvas.getContext('2d');
       if (ctx) {
-        // Resize canvas to fit container
-        const handleResize = () => {
+        const resizeAndDraw = () => {
           const dpr = window.devicePixelRatio || 1;
-          canvas.width = container.offsetWidth * dpr;
-          canvas.height = container.offsetHeight * dpr;
-          canvas.style.width = container.offsetWidth + 'px';
-          canvas.style.height = container.offsetHeight + 'px';
-          ctx.scale(dpr, dpr);
-          drawObjects(ctx); // Redraw on resize
+          const displayWidth = container.offsetWidth;
+          const displayHeight = container.offsetHeight;
+          if (canvas.width !== displayWidth * dpr || canvas.height !== displayHeight * dpr) {
+            canvas.width = displayWidth * dpr;
+            canvas.height = displayHeight * dpr;
+            canvas.style.width = displayWidth + 'px';
+            canvas.style.height = displayHeight + 'px';
+            ctx.scale(dpr, dpr); // Only set scale once after dpr changes resolution
+          }
+          drawObjects(ctx);
         };
-
-        handleResize(); // Initial draw
-        window.addEventListener('resize', handleResize);
-        return () => window.removeEventListener('resize', handleResize);
+        resizeAndDraw(); 
+        window.addEventListener('resize', resizeAndDraw);
+        return () => window.removeEventListener('resize', resizeAndDraw);
       }
     }
-  }, [drawObjects]); // Re-run effect if drawObjects changes (due to objects or canvasView)
+  }, [drawObjects]); // Only re-run if drawObjects (and its dependencies like objects, canvasView) changes
 
-  // Effect to trigger redraw when previewLineEndPoint changes for pen tool
+  // Effect for Pen tool preview (redraws only when preview point changes)
   useEffect(() => {
-    if (activeTool === ToolType.PEN && drawingState.isDrawing) {
+    if (activeTool === ToolType.PEN && drawingState.isDrawing && previewLineEndPoint) {
         const canvas = canvasRef.current;
         if (canvas) {
             const ctx = canvas.getContext('2d');
-            if (ctx) {
-                drawObjects(ctx);
-            }
+            if (ctx) drawObjects(ctx);
         }
     }
   }, [activeTool, drawingState.isDrawing, previewLineEndPoint, drawObjects]);
+
+  // Dynamic cursor style based on current action
+  let cursorStyle = 'default';
+  if (drawingState.isPanning) cursorStyle = 'grabbing';
+  else if (isSpacebarDown) cursorStyle = 'grab';
+  else if (hoveredHandle) cursorStyle = getCursorForHandle(hoveredHandle);
+  else if (drawingState.isDragging) cursorStyle = 'default';
 
   return (
     <div 
@@ -475,19 +748,22 @@ const CanvasView: React.FC = () => {
         display: 'flex', 
         justifyContent: 'center', 
         alignItems: 'center', 
-        overflow: 'hidden' // Ensure canvas doesn't cause scrollbars
+        overflow: 'hidden', // Ensure canvas doesn't cause scrollbars
+        cursor: cursorStyle,
       }}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onMouseLeave={() => {
-        setPreviewLineEndPoint(null); // Clear preview line if mouse leaves canvas
-        // For shape tools, endDrawing() is appropriate. 
-        // For pen tool, leaving the canvas doesn't necessarily mean ending the path.
-        if (activeTool !== ToolType.PEN && activeTool !== ToolType.TEXT && drawingState.isDrawing) {
-            endDrawing();
-        }
+        setPreviewLineEndPoint(null);
+        setHoveredHandle(null);
+        if(isSpacebarDown) setIsSpacebarDown(false); // Reset spacebar if mouse leaves while pressed
+        if (drawingState.isPanning) endPanning();
+        else if (drawingState.isResizing) endResizing(); // End resizing if mouse leaves canvas
+        else if (drawingState.isDragging) endDragging();
+        else if (activeTool !== ToolType.PEN && activeTool !== ToolType.TEXT && drawingState.isDrawing) endDrawing();
       }}
+      onWheel={handleWheel} // Add wheel event handler for zooming
     >
       <canvas ref={canvasRef} />
     </div>
