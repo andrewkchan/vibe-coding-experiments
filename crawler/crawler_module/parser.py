@@ -83,14 +83,15 @@ class PageParser:
             if body_element is not None:
                 text_content = body_element.text_content()
             else:
-                # Fallback if no body tag, try to get text from the whole document
-                text_content = doc.text_content()
+                # Fallback if no body tag, explicitly set text_content to None
+                text_content = None 
             
-            if text_content:
+            if text_content: # This check will now only apply if body_element was found and had content
                 text_content = ' \n'.join([line.strip() for line in text_content.splitlines() if line.strip()])
                 text_content = text_content.strip()
-            else:
-                text_content = None # Ensure it's None if effectively empty
+                if not text_content: # If stripping results in empty string, set to None
+                    text_content = None
+            # else: text_content is already None if body_element was None or body_element.text_content() was empty/None
 
         except Exception as e:
             logger.error(f"Error during text extraction for {base_url}: {e}")
