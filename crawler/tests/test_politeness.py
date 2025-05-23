@@ -28,12 +28,16 @@ def dummy_config(tmp_path: Path) -> CrawlerConfig:
     )
 
 @pytest.fixture
-def mock_storage_manager() -> MagicMock:
+def mock_storage_manager(tmp_path: Path) -> MagicMock:
     mock = MagicMock(spec=StorageManager)
     mock.conn = MagicMock(spec=sqlite3.Connection)
     # Simulate context manager for cursor
     mock.conn.cursor.return_value.__enter__.return_value = MagicMock(spec=sqlite3.Cursor)
     mock.conn.cursor.return_value.__exit__.return_value = None
+    
+    # Add the db_path attribute that _get_robots_for_domain needs
+    mock.db_path = tmp_path / "test_politeness_temp.db"
+    # No need to create this file for these unit tests, as sqlite3.connect will create it if it doesn't exist.
     return mock
 
 @pytest.fixture
