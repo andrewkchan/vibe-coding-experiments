@@ -62,14 +62,24 @@ class PageParser:
             doc.make_links_absolute(base_url, resolve_base_href=True)
             
             for element, attribute, link, pos in doc.iterlinks():
-                if attribute == 'href': # We are interested in href attributes from any tag (<a>, <link>, etc.)
-                                        # Could be filtered to just <a> if only want navigation links.
-                    # The link is already absolute here due to make_links_absolute
-                    normalized = normalize_url(link)
+                if attribute == 'href':
+                    # Step 1: Check scheme of the (now absolute) link BEFORE normalization
+                    try:
+                        parsed_link = urlparse(link)
+                        if parsed_link.scheme not in ['http', 'https']:
+                            # logger.debug(f"Skipping non-http/s link: {link}")
+                            continue # Skip javascript:, mailto:, ftp:, etc.
+                    except Exception as e:
+                        # logger.warning(f"Could not parse scheme for link {link}: {e}, skipping.")
+                        continue # Skip if parsing scheme fails
+
+                    # Step 2: Normalize if it's an http/https link
+                    normalized = normalize_url(link) # normalize_url will ensure http/https here
                     if normalized:
-                        parsed_normalized = urlparse(normalized)
-                        if parsed_normalized.scheme in ['http', 'https']:
-                            extracted_links.add(normalized)
+                        # Double check scheme after normalization, though normalize_url should preserve it if originally http/s
+                        # parsed_normalized = urlparse(normalized) 
+                        # if parsed_normalized.scheme in ['http', 'https']:
+                        extracted_links.add(normalized)
         except Exception as e:
             logger.error(f"Error during link extraction for {base_url}: {e}")
 
