@@ -5,6 +5,7 @@ from typing import Dict, Optional, Tuple
 
 import aiohttp
 import cchardet # For fast character encoding detection
+from aiohttp.client_reqrep import ClientResponse as AiohttpClientResponse # Correct import
 
 from .config import CrawlerConfig
 
@@ -20,7 +21,7 @@ class FetchResult:
     text_content: Optional[str] = None
     error_message: Optional[str] = None
     is_redirect: bool = False
-    redirect_history: Tuple[aiohttp.helpers. ιστοσελίδα, ...] = field(default_factory=tuple) # type: ignore
+    redirect_history: Tuple[AiohttpClientResponse, ...] = field(default_factory=tuple) # Corrected type hint
 
 class Fetcher:
     def __init__(self, config: CrawlerConfig):
