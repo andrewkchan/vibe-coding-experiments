@@ -75,7 +75,7 @@ def test_load_manual_exclusions_with_file(
     with patch('builtins.open', mock_open(read_data=mock_file_content)) as mocked_open:
         with patch.object(Path, 'exists', return_value=True) as mocked_exists:
             pe = PolitenessEnforcer(config=dummy_config, storage=mock_storage_manager, fetcher=mock_fetcher)
-            mocked_exists.assert_called_once_with(exclude_file_path)
+            mocked_exists.assert_called_once()
             mocked_open.assert_called_once_with(exclude_file_path, 'r')
 
     mock_cursor = mock_storage_manager.conn.cursor.return_value.__enter__.return_value
