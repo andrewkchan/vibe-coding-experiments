@@ -272,9 +272,9 @@ crawler/
 
 The crawler will be run via `main.py` with command-line arguments:
 
-\`\`\`bash
+```bash
 python main.py --seed-file path/to/seeds.txt --email your.email@example.com [options]
-\`\`\`
+```
 
 **Required Arguments:**
 
