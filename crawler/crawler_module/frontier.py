@@ -19,43 +19,43 @@ class FrontierManager:
         self.politeness = politeness
         self.seen_urls: Set[str] = set()  # In-memory set for quick checks during a session
 
+    def _populate_seen_urls_from_db_sync(self) -> Set[str]:
+        """Synchronously loads all URLs from visited_urls and frontier tables."""
+        seen = set()
+        try:
+            with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
+                with conn_threaded.cursor() as cursor:
+                    # Load from visited_urls
+                    cursor.execute("SELECT url FROM visited_urls")
+                    for row in cursor.fetchall():
+                        seen.add(row[0])
+                    
+                    # Load from current frontier (in case of resume)
+                    cursor.execute("SELECT url FROM frontier")
+                    for row in cursor.fetchall():
+                        seen.add(row[0])
+            logger.info(f"DB THREAD: Loaded {len(seen)} URLs for seen_urls set.")
+        except sqlite3.Error as e:
+            logger.error(f"DB THREAD: Error loading for seen_urls set: {e}")
+        return seen
+
     async def initialize_frontier(self):
         """Loads seed URLs and previously saved frontier URLs if resuming."""
-        # Load already visited URLs to populate the seen_urls set for this session
-        # This prevents re-adding URLs that were processed in previous sessions immediately
-        # The database UNIQUE constraint on frontier.url is the ultimate guard.
-        if self.storage.conn:
-            try:
-                cursor = self.storage.conn.cursor()
-                # Load from visited_urls
-                cursor.execute("SELECT url FROM visited_urls")
-                for row in cursor.fetchall():
-                    self.seen_urls.add(row[0])
-                
-                # Load from current frontier (in case of resume)
-                cursor.execute("SELECT url FROM frontier")
-                for row in cursor.fetchall():
-                    self.seen_urls.add(row[0])
-                cursor.close()
-                logger.info(f"Initialized seen_urls with {len(self.seen_urls)} URLs from DB.")
-            except self.storage.conn.Error as e:
-                logger.error(f"Error loading seen URLs from DB: {e}")
+        # Populate seen_urls from DB in a thread
+        self.seen_urls = await asyncio.to_thread(self._populate_seen_urls_from_db_sync)
+        logger.info(f"Initialized seen_urls with {len(self.seen_urls)} URLs from DB.")
 
         if self.config.resume:
-            # Resuming: Frontier is already in DB. We might check its size or status.
-            # For now, we assume StorageManager handles DB state correctly.
-            count = self.count_frontier()
+            # count_frontier is already thread-safe
+            count = await asyncio.to_thread(self.count_frontier) 
             logger.info(f"Resuming crawl. Frontier has {count} URLs.")
             if count == 0:
                  logger.warning("Resuming with an empty frontier. Attempting to load seeds.")
                  await self._load_seeds()
         else:
-            # New crawl: clear existing frontier (if any) and load seeds.
-            # Note: PLAN.md implies we might error if data_dir exists and not resuming.
-            # For now, let's clear and proceed for simplicity in this stage.
             logger.info("Starting new crawl. Clearing any existing frontier and loading seeds.")
-            self._clear_frontier_db() # Ensure a fresh start if not resuming
-            await self._load_seeds()
+            await self._clear_frontier_db() # Already refactored to be thread-safe
+            await self._load_seeds() # add_url within is now thread-safe for DB ops
 
     async def _load_seeds(self):
         """Reads seed URLs from the seed file and adds them to the frontier."""
@@ -75,21 +75,46 @@ class FrontierManager:
         except IOError as e:
             logger.error(f"Error reading seed file {self.config.seed_file}: {e}")
 
-    def _clear_frontier_db(self):
-        if not self.storage.conn:
-            logger.error("Cannot clear frontier, no DB connection.")
-            return
+    def _clear_frontier_db_sync(self):
+        """Synchronous part of clearing frontier DB. To be run in a thread."""
+        # No self.storage.conn check here, as it establishes its own.
+        with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
+            with conn_threaded.cursor() as cursor_obj:
+                cursor_obj.execute("DELETE FROM frontier")
+                conn_threaded.commit()
+                # self.seen_urls.clear() # This should be done in the async part after thread finishes
+                logger.info("Cleared frontier table in database (via thread).")
+    
+    async def _clear_frontier_db(self):
+        await asyncio.to_thread(self._clear_frontier_db_sync)
+        self.seen_urls.clear() # Clear in-memory set after DB operation completes
+
+    def _add_url_sync(self, normalized_url: str, domain: str, depth: int) -> bool:
+        """Synchronous part of adding a URL to DB. To be run in a thread."""
         try:
-            cursor = self.storage.conn.cursor()
-            cursor.execute("DELETE FROM frontier")
-            self.storage.conn.commit()
-            self.seen_urls.clear() # Also clear in-memory set
-            logger.info("Cleared frontier table in database.")
-        except self.storage.conn.Error as e:
-            logger.error(f"Error clearing frontier table: {e}")
-            self.storage.conn.rollback()
-        finally:
-            if cursor: cursor.close()
+            with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
+                with conn_threaded.cursor() as cursor:
+                    # Check if visited first
+                    cursor.execute("SELECT 1 FROM visited_urls WHERE url_sha256 = ?", 
+                                   (self.storage.get_url_sha256(normalized_url),))
+                    if cursor.fetchone():
+                        # logger.debug(f"DB THREAD: URL already visited: {normalized_url}")
+                        return False # Already visited, not added to frontier
+
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score) VALUES (?, ?, ?, ?, ?)",
+                        (normalized_url, domain, depth, int(time.time()), 0)
+                    )
+                    if cursor.rowcount > 0:
+                        conn_threaded.commit()
+                        # logger.debug(f"DB THREAD: Added to frontier: {normalized_url}")
+                        return True # Newly added to frontier
+                    else:
+                        # logger.debug(f"DB THREAD: URL likely already in frontier (IGNORE): {normalized_url}")
+                        return False # Not newly added (already in frontier)
+        except sqlite3.Error as e:
+            logger.error(f"DB THREAD: Error adding URL {normalized_url} to frontier: {e}")
+            return False
 
     async def add_url(self, url: str, depth: int = 0) -> bool:
         """Adds a normalized URL to the frontier if not already seen or invalid domain."""
@@ -98,54 +123,32 @@ class FrontierManager:
             return False
 
         if normalized_url in self.seen_urls:
-            return False
+            return False # Already processed or in frontier (in-memory check)
 
         domain = extract_domain(normalized_url)
         if not domain:
             logger.warning(f"Could not extract domain from URL: {normalized_url}, skipping.")
             return False
         
-        # Use PolitenessEnforcer to check if URL is allowed before even adding to DB seen_urls or frontier
-        # This is an early check. is_url_allowed also checks manual exclusions.
-        if not self.politeness.is_url_allowed(normalized_url):
-            logger.debug(f"URL {normalized_url} disallowed by politeness rules (e.g. manual exclude or robots), not adding.")
-            self.seen_urls.add(normalized_url) # Add to seen so we don't re-check repeatedly
+        if not await self.politeness.is_url_allowed(normalized_url):
+            logger.debug(f"URL {normalized_url} disallowed by politeness, not adding.")
+            self.seen_urls.add(normalized_url) # Mark as seen to avoid re-checking politeness
             return False
 
-        if not self.storage.conn:
-            logger.error("Cannot add URL to frontier, no DB connection.")
+        # Now, try to add to DB in a thread
+        was_added_to_db = await asyncio.to_thread(
+            self._add_url_sync, normalized_url, domain, depth
+        )
+
+        if was_added_to_db:
+            self.seen_urls.add(normalized_url) # Add to in-memory set if successfully added to DB frontier
+            return True
+        else:
+            # If not added to DB (either duplicate in frontier, or visited, or error),
+            # ensure it's in seen_urls to prevent reprocessing this path.
+            self.seen_urls.add(normalized_url)
             return False
 
-        try:
-            cursor = self.storage.conn.cursor()
-            # The UNIQUE constraint on url will prevent duplicates at DB level.
-            # We also check seen_urls for an in-memory speedup.
-            cursor.execute("SELECT 1 FROM visited_urls WHERE url_sha256 = ?", (self.storage.get_url_sha256(normalized_url),))
-            if cursor.fetchone():
-                # logger.debug(f"URL already visited (in DB): {normalized_url}")
-                self.seen_urls.add(normalized_url) # Ensure it's in memory for future checks
-                return False
-
-            cursor.execute(
-                "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score) VALUES (?, ?, ?, ?, ?)",
-                (normalized_url, domain, depth, int(time.time()), 0) # Default priority 0 for now
-            )
-            if cursor.rowcount > 0:
-                self.seen_urls.add(normalized_url)
-                # logger.debug(f"Added to frontier: {normalized_url}")
-                self.storage.conn.commit()
-                return True
-            else:
-                # logger.debug(f"URL likely already in frontier (DB IGNORE): {normalized_url}")
-                self.seen_urls.add(normalized_url) # Ensure it's in memory
-                return False # Not newly added
-        except self.storage.conn.Error as e:
-            logger.error(f"Error adding URL {normalized_url} to frontier: {e}")
-            self.storage.conn.rollback()
-            return False
-        finally:
-            if cursor: cursor.close()
-    
     def _get_db_connection(self): # Helper to get a new connection
         return sqlite3.connect(self.storage.db_path, timeout=10)
 
