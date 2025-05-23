@@ -79,23 +79,23 @@ class PageParser:
         # 2. Extract text content
         text_content: Optional[str] = None
         try:
-            # Clean the HTML document tree in place *after* link extraction is complete.
-            cleaned_doc = self.cleaner.clean_html(doc) 
+            cleaned_doc = self.cleaner.clean_html(doc)
 
-            body_element = cleaned_doc.find('.//body') 
-            if body_element is not None:
-                text_content = body_element.text_content()
+            body_element_cleaned = cleaned_doc.find('.//body')
+            if body_element_cleaned is not None:
+                text_content = body_element_cleaned.text_content()
             else:
-                # Fallback if no body tag, get text from the whole cleaned document
-                # This might happen if cleaner removes body or if HTML was malformed initially.
-                text_content = cleaned_doc.text_content()
+                # If there's no body element even after cleaning (or initially),
+                # we define our page's "text_content" as None.
+                # The title is handled separately.
+                text_content = None
             
-            if text_content:
+            if text_content: # Process only if text_content was derived (i.e., from a body)
                 text_content = ' \n'.join([line.strip() for line in text_content.splitlines() if line.strip()])
                 text_content = text_content.strip()
                 if not text_content: 
                     text_content = None
-            # else: text_content is already None if parsing/cleaning resulted in no text
+            # If text_content was initially set to None (no body), it remains None.
 
         except Exception as e:
             logger.error(f"Error during text extraction for {base_url}: {e}")
