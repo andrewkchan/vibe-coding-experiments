@@ -85,4 +85,16 @@ This document provides a high-level summary of the development process for the e
     *   Instantiate and run the `CrawlerOrchestrator`.
     *   Include basic signal handling (`SIGINT`, `SIGTERM`) to trigger a graceful shutdown of the orchestrator.
 
-This iterative process of planning, implementing features module by module, writing tests, and debugging issues (especially around asynchronous operations and database threading) has brought the project to a runnable state, ready for further testing and refinement. 
+This iterative process of planning, implementing features module by module, writing tests, and debugging issues (especially around asynchronous operations and database threading) has brought the project to a runnable state, ready for further testing and refinement.
+
+## 5. Current Known Test Failures & Debugging Notes (as of last update)
+
+Further test runs have revealed a new set of failures. These are currently being investigated:
+
+*   **`tests/test_politeness.py`**: Multiple tests are failing with `NameError: name 'AsyncMock' is not defined`. This suggests `from unittest.mock import AsyncMock` might be missing or incorrectly scoped in these specific test functions or the test file itself, where `AsyncMock` is used to mock asynchronous methods of `PolitenessEnforcer` dependencies (like `_get_robots_for_domain` in some tests for `get_crawl_delay` or `can_fetch_domain_now`).
+*   **`tests/test_politeness.py`**: Several assertion errors like `assert 0 > 0` or `assert 0 == 2` (e.g., in `test_get_robots_db_cache_stale_then_fetch_success`, `test_record_domain_fetch_attempt_new_domain`). These often indicate that mocked method call counts (`mock_cursor.execute.call_count` or `politeness_enforcer.fetcher.fetch_url.call_count`) are not matching expectations. This could be due to changes in the underlying DB interaction logic (how many times `execute` is now called by threaded helpers) or how mocks are set up/reset for methods that are called multiple times.
+*   **`tests/test_politeness.py::test_get_robots_http_404_https_404`**: Failing with `AssertionError: assert 1 == 2`. This points to an incorrect `call_count` for `politeness_enforcer.fetcher.fetch_url` (expected 2 calls, got 1).
+*   **`tests/test_politeness.py::test_is_url_allowed_manually_excluded`**: Failing with `AssertionError: assert True is False`. This test expects `is_url_allowed` to return `False` for a manually excluded domain. The failure means it's returning `True`. This could be an issue with how the manual exclusion is checked in `is_url_allowed` or how the DB state is mocked/verified for that test.
+*   **`tests/test_utils.py`**: Several `AssertionError` failures in `test_normalize_url` related to trailing slashes (e.g., `assert 'https://example.com:80/' == 'https://example.com:80'`) and one in `test_extract_domain` for an FTP URL (`assert None == 'example.org'`). These indicate that the `normalize_url` and `extract_domain` functions are not producing the exact expected output for these specific test cases, likely around handling of trailing slashes or schemes other than http/https.
+
+Addressing these failures will be the next focus. 
