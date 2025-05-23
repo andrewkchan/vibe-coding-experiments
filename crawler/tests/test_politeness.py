@@ -140,9 +140,7 @@ async def test_get_robots_from_memory_cache(politeness_enforcer: PolitenessEnfor
 @pytest.mark.asyncio
 async def test_get_robots_from_db_cache_fresh(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "dbcached.com"
-    # Original robots_text was: "User-agent: TestCrawler\nDisallow: /private"
-    # Temporary change for debugging user-agent matching (and now DB interaction):
-    robots_text = "User-agent: *\nDisallow: /private" # Test with wildcard agent
+    robots_text = "User-agent: TestCrawler\nDisallow: /private" # Reverted to specific agent
     future_expiry = int(time.time()) + DEFAULT_ROBOTS_TXT_TTL
 
     # Mock the database interaction within the threaded function
@@ -170,6 +168,7 @@ async def test_get_robots_from_db_cache_fresh(politeness_enforcer: PolitenessEnf
         mock_db_cursor_instance.close.assert_called_once()
 
     assert rerp is not None
+    # dummy_config.user_agent is "TestCrawler/1.0 (pytest)"
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/private") is False
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/public") is True
     politeness_enforcer.fetcher.fetch_url.assert_not_called() 
