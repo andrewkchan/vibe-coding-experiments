@@ -51,6 +51,18 @@ async def politeness_enforcer(
     pe = PolitenessEnforcer(config=dummy_config, storage=mock_storage_manager, fetcher=mock_fetcher)
     return pe
 
+@pytest.fixture
+def storage_manager_for_exclusion_test(dummy_config: CrawlerConfig) -> StorageManager:
+    """Provides a real StorageManager instance using a temporary DB path from dummy_config."""
+    # Ensure the data_dir from dummy_config exists for StorageManager init
+    dummy_config.data_dir.mkdir(parents=True, exist_ok=True)
+    # Initialize schema if StorageManager doesn't create tables on its own path yet
+    # Our StorageManager._init_db does create tables.
+    sm = StorageManager(config=dummy_config)
+    # We don't yield and close here, as PE will use the path. 
+    # The db is cleaned up by tmp_path fixture of dummy_config.
+    return sm
+
 # --- Tests for _load_manual_exclusions --- 
 def test_load_manual_exclusions_no_file(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     dummy_config.exclude_file = None
@@ -63,32 +75,47 @@ def test_load_manual_exclusions_no_file(politeness_enforcer: PolitenessEnforcer,
 
 def test_load_manual_exclusions_with_file(
     dummy_config: CrawlerConfig, 
-    mock_storage_manager: MagicMock, 
-    mock_fetcher: MagicMock # Fetcher needed for PE init
+    storage_manager_for_exclusion_test: StorageManager, # Use the real SM for its db_path
+    mock_fetcher: MagicMock, # Still needed for PE constructor
+    tmp_path: Path # For creating the exclude file
 ):
-    exclude_file_path = dummy_config.data_dir / "excludes.txt"
+    exclude_file_path = tmp_path / "custom_excludes.txt" # Ensure it's in a fresh temp spot
     dummy_config.exclude_file = exclude_file_path
     
     mock_file_content = "excluded1.com\n#comment\nexcluded2.com\n   excluded3.com  \n"
     
-    # We need to re-init PE for this test as _load_manual_exclusions is in __init__
-    with patch('builtins.open', mock_open(read_data=mock_file_content)) as mocked_open:
-        with patch.object(Path, 'exists', return_value=True) as mocked_exists:
-            pe = PolitenessEnforcer(config=dummy_config, storage=mock_storage_manager, fetcher=mock_fetcher)
-            mocked_exists.assert_called_once()
-            mocked_open.assert_called_once_with(exclude_file_path, 'r')
+    with open(exclude_file_path, 'w') as f:
+        f.write(mock_file_content)
 
-    mock_cursor = mock_storage_manager.conn.cursor.return_value.__enter__.return_value
+    # PolitenessEnforcer will use storage_manager_for_exclusion_test.db_path
+    # to connect and write to the actual temp DB.
+    pe = PolitenessEnforcer(config=dummy_config, storage=storage_manager_for_exclusion_test, fetcher=mock_fetcher)
     
-    # Check INSERT OR IGNORE and UPDATE calls for each domain
-    expected_domains = ["excluded1.com", "excluded2.com", "excluded3.com"]
-    assert mock_cursor.execute.call_count == len(expected_domains) * 2
-    
-    for domain in expected_domains:
-        mock_cursor.execute.assert_any_call("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
-        mock_cursor.execute.assert_any_call("UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?", (domain,))
-    
-    mock_storage_manager.conn.commit.assert_called_once()
+    # Now, connect to the DB created/used by PE and verify content
+    conn = None
+    cursor = None
+    try:
+        db_path_to_check = storage_manager_for_exclusion_test.db_path
+        assert db_path_to_check.exists(), "Database file should have been created by StorageManager init used by PE"
+        conn = sqlite3.connect(db_path_to_check)
+        cursor = conn.cursor()
+        
+        expected_domains = ["excluded1.com", "excluded2.com", "excluded3.com"]
+        for domain in expected_domains:
+            cursor.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
+            row = cursor.fetchone()
+            assert row is not None, f"Domain {domain} should be in domain_metadata"
+            assert row[0] == 1, f"Domain {domain} should be marked as manually excluded"
+        
+        # Check that other domains aren't marked (optional, but good)
+        cursor.execute("SELECT COUNT(*) FROM domain_metadata WHERE is_manually_excluded = 1")
+        count = cursor.fetchone()[0]
+        assert count == len(expected_domains)
+
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+        if exclude_file_path.exists(): exclude_file_path.unlink()
 
 # --- Tests for _get_robots_for_domain (async) --- 
 @pytest.mark.asyncio

@@ -29,32 +29,33 @@ class PolitenessEnforcer:
     def _load_manual_exclusions(self):
         """Loads manually excluded domains from the config file into the DB."""
         if self.config.exclude_file and self.config.exclude_file.exists():
-            if not self.storage.conn:
-                logger.error("Cannot load manual exclusions, no DB connection.")
-                return
+            db_path = self.storage.db_path # Get path from storage
+            conn_init_thread = None
+            cursor_init = None
             try:
-                # This is a synchronous DB operation. Consider to_thread if it becomes a bottleneck.
-                cursor = self.storage.conn.cursor()
-                with open(self.config.exclude_file, 'r') as f:
-                    count = 0
-                    for line in f:
-                        domain_to_exclude = line.strip().lower()
-                        if domain_to_exclude and not domain_to_exclude.startswith("#"):
-                            cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain_to_exclude,))
-                            cursor.execute(
-                                "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?",
-                                (domain_to_exclude,)
-                            )
-                            count += 1
-                    self.storage.conn.commit()
-                    logger.info(f"Loaded and marked {count} domains as manually excluded from {self.config.exclude_file}")
-            except IOError as e:
-                logger.error(f"Error reading exclude file {self.config.exclude_file}: {e}")
-            except self.storage.conn.Error as e:
+                with sqlite3.connect(db_path, timeout=10) as conn_init_thread:
+                    cursor_init = conn_init_thread.cursor()
+                    try:
+                        with open(self.config.exclude_file, 'r') as f:
+                            count = 0
+                            for line in f:
+                                domain_to_exclude = line.strip().lower()
+                                if domain_to_exclude and not domain_to_exclude.startswith("#"):
+                                    cursor_init.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain_to_exclude,))
+                                    cursor_init.execute(
+                                        "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?",
+                                        (domain_to_exclude,)
+                                    )
+                                    count += 1
+                            conn_init_thread.commit() # Commit changes
+                            logger.info(f"Loaded and marked {count} domains as manually excluded from {self.config.exclude_file}")
+                    except IOError as e:
+                        logger.error(f"Error reading exclude file {self.config.exclude_file}: {e}")
+                    finally:
+                        if cursor_init: cursor_init.close()
+            except sqlite3.Error as e:
                 logger.error(f"DB error loading manual exclusions: {e}")
-                if self.storage.conn: self.storage.conn.rollback()
-            finally:
-                if 'cursor' in locals() and cursor: cursor.close() # Ensure cursor is defined before closing
+                # Rollback is implicitly handled by `with sqlite3.connect` if an error occurs before commit
         else:
             logger.info("No manual exclude file specified or found.")
 
