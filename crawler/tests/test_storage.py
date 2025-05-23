@@ -4,6 +4,9 @@ import sqlite3
 import shutil
 import logging
 from dataclasses import dataclass
+import aiofiles # For testing async file save
+import time
+import hashlib
 
 from crawler_module.storage import StorageManager, DB_SCHEMA_VERSION
 # Adjust the import path if CrawlerConfig is in a different location or make a simpler test double
@@ -109,4 +112,131 @@ def test_storage_manager_reinitialization(dummy_config: CrawlerConfig):
 
     assert db_path1 == db_path2
     assert db_path1.exists()
-    logger.info("StorageManager re-initialization test passed.") 
+    logger.info("StorageManager re-initialization test passed.")
+
+@pytest.mark.asyncio
+async def test_save_content_to_file(storage_manager: StorageManager, tmp_path: Path):
+    """Test saving text content to a file asynchronously."""
+    # storage_manager fixture already creates content_dir inside its own temp_test_dir
+    # Ensure the content_dir used by the method is the one we expect from the fixture
+    assert storage_manager.content_dir.exists()
+
+    url_hash = "test_hash_123"
+    test_text = "This is some test content.\nWith multiple lines."
+    
+    file_path = await storage_manager.save_content_to_file(url_hash, test_text)
+    assert file_path is not None
+    assert file_path.name == f"{url_hash}.txt"
+    assert file_path.parent == storage_manager.content_dir
+    assert file_path.exists()
+
+    async with aiofiles.open(file_path, mode='r', encoding='utf-8') as f:
+        saved_content = await f.read()
+    assert saved_content == test_text
+
+@pytest.mark.asyncio
+async def test_save_content_to_file_empty_content(storage_manager: StorageManager):
+    """Test that empty content is not saved."""
+    url_hash = "empty_content_hash"
+    file_path = await storage_manager.save_content_to_file(url_hash, "")
+    assert file_path is None
+    assert not (storage_manager.content_dir / f"{url_hash}.txt").exists()
+
+    file_path_none = await storage_manager.save_content_to_file(url_hash, None) # type: ignore
+    assert file_path_none is None
+
+@pytest.mark.asyncio
+async def test_save_content_to_file_io_error(storage_manager: StorageManager, monkeypatch):
+    """Test handling of IOError during file save."""
+    url_hash = "io_error_hash"
+    test_text = "Some content"
+
+    # Mock aiofiles.open to raise an IOError
+    async def mock_aio_open(*args, **kwargs):
+        raise IOError("Simulated write error")
+
+    monkeypatch.setattr(aiofiles, "open", mock_aio_open)
+
+    file_path = await storage_manager.save_content_to_file(url_hash, test_text)
+    assert file_path is None
+
+def test_add_visited_page(storage_manager: StorageManager, dummy_config: CrawlerConfig):
+    """Test adding a visited page record to the database."""
+    url = "http://example.com/visitedpage"
+    domain = "example.com"
+    status_code = 200
+    crawled_timestamp = int(time.time())
+    content_type = "text/html"
+    text_content = "<html><body>Visited!</body></html>"
+    # Simulate saving content and getting a path
+    # In a real scenario, this path would come from save_content_to_file
+    url_hash_for_file = storage_manager.get_url_sha256(url)
+    # Assume content_dir relative to data_dir for storage path consistency in DB
+    relative_content_path = Path("content") / f"{url_hash_for_file}.txt"
+    content_storage_path_str = str(relative_content_path)
+
+    storage_manager.add_visited_page(
+        url=url,
+        domain=domain,
+        status_code=status_code,
+        crawled_timestamp=crawled_timestamp,
+        content_type=content_type,
+        content_text=text_content, # To generate content_hash
+        content_storage_path_str=content_storage_path_str,
+        redirected_to_url=None
+    )
+
+    # Verify the record in the database
+    conn = storage_manager.conn
+    assert conn is not None
+    cursor = conn.cursor()
+    expected_url_sha256 = storage_manager.get_url_sha256(url)
+    expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
+
+    cursor.execute("SELECT * FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
+    row = cursor.fetchone()
+    cursor.close()
+
+    assert row is not None
+    assert row[0] == expected_url_sha256
+    assert row[1] == url
+    assert row[2] == domain
+    assert row[3] == crawled_timestamp
+    assert row[4] == status_code
+    assert row[5] == content_type
+    assert row[6] == expected_content_hash
+    assert row[7] == content_storage_path_str
+    assert row[8] is None # redirected_to_url
+
+    logger.info("add_visited_page test passed.")
+
+def test_add_visited_page_no_content(storage_manager: StorageManager):
+    """Test adding a visited page with no text content (e.g., redirect or non-HTML)."""
+    url = "http://example.com/redirect"
+    domain = "example.com"
+    status_code = 301
+    crawled_timestamp = int(time.time())
+    redirected_to = "http://example.com/final_destination"
+
+    storage_manager.add_visited_page(
+        url=url,
+        domain=domain,
+        status_code=status_code,
+        crawled_timestamp=crawled_timestamp,
+        redirected_to_url=redirected_to
+        # No content_type, content_text, or content_storage_path_str
+    )
+
+    conn = storage_manager.conn
+    assert conn is not None
+    cursor = conn.cursor()
+    expected_url_sha256 = storage_manager.get_url_sha256(url)
+    cursor.execute("SELECT content_hash, content_storage_path, redirected_to_url FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
+    row = cursor.fetchone()
+    cursor.close()
+
+    assert row is not None
+    assert row[0] is None # content_hash
+    assert row[1] is None # content_storage_path
+    assert row[2] == redirected_to
+    logger.info("add_visited_page_no_content test passed.") 
