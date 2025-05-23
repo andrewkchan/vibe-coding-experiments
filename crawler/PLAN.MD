@@ -225,7 +225,7 @@ graph TD
 
 ## 7. Proposed Directory Structure (within `crawler/`)
 
-\`\`\`
+```
 crawler/
 ├── main.py               # Main script to run the crawler
 ├── crawler_module/       # Core crawler logic
@@ -246,7 +246,7 @@ crawler/
     └── content/
         └── <url_sha256_hex>.txt
         └── ...
-\`\`\`
+```
 
 ## 8. Dependencies
 
