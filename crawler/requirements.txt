@@ -2,4 +2,8 @@ aiohttp
 lxml
 robotexclusionrulesparser
 aiofiles
-cchardet 
+cchardet
+tldextract
+pytest
+pytest-asyncio
+httpx 
