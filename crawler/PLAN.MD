@@ -71,7 +71,7 @@ graph TD
     subgraph User Input
         SeedFile[Seed File]
         ExcludeList[Exclude List - Optional]
-        Config[Configuration (email, limits, etc.)]
+        Config["Configuration (email, limits, etc.)"]
     end
 
     subgraph Crawler Core
