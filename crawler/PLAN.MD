@@ -77,16 +77,16 @@ graph TD
     subgraph Crawler Core
         Main[Main Controller]
         Frontier[Frontier Manager]
-        Fetcher[Fetcher (aiohttp)]
-        RobotsMgr[Robots.txt Manager]
-        Parser[Parser (BeautifulSoup/lxml)]
+        Fetcher["Fetcher - aiohttp"]
+        RobotsMgr["Robots.txt Manager"]
+        Parser["Parser - BeautifulSoup/lxml"]
         Storage[Storage Manager]
         Politeness[Politeness Enforcer]
     end
 
     subgraph Data Stores
-        SQLiteDB[SQLite Database (crawler_state.db)]
-        ContentFS[File System (crawler_data/content/)]
+        SQLiteDB["SQLite Database - crawler_state.db"]
+        ContentFS["File System - crawler_data/content/"]
     end
 
     subgraph External Services
@@ -125,9 +125,9 @@ graph TD
     Politeness --> Fetcher
     Politeness --> Frontier
 
-    SQLiteDB -.-> Main  # For resumption
-    ContentFS -.-> User # For inspection via external tools
-    SQLiteDB -.-> User  # For inspection via external tools
+    SQLiteDB -.-> Main
+    ContentFS -.-> User
+    SQLiteDB -.-> User
 ```
 
 ## 3. Key Data Structures and Storage
