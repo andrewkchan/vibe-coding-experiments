@@ -152,33 +152,33 @@ class StorageManager:
         content_storage_path_str: str | None = None, # String representation of Path
         redirected_to_url: str | None = None
     ):
-        """Adds a record of a visited page to the database."""
-        if not self.conn:
-            logger.error("Cannot add visited page, no DB connection.")
-            return
-
+        """Adds a record of a visited page to the database.
+           This method is expected to be called via asyncio.to_thread if in an async context.
+        """
+        # This method will be run in a separate thread by asyncio.to_thread,
+        # so it must establish its own database connection.
+        
         url_sha256 = self.get_url_sha256(url)
         content_hash: str | None = None
         if content_text:
             content_hash = hashlib.sha256(content_text.encode('utf-8')).hexdigest()
 
         try:
-            # Use asyncio.to_thread for DB operations if this method becomes async
-            # For now, assuming it's called from a context that can handle sync DB.
-            with self.conn as conn: # Context manager for cursor and commit/rollback
-                cursor = conn.cursor()
-                cursor.execute("""
-                INSERT OR REPLACE INTO visited_urls 
-                (url_sha256, url, domain, crawled_timestamp, http_status_code, content_type, content_hash, content_storage_path, redirected_to_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    url_sha256, url, domain, crawled_timestamp, status_code, 
-                    content_type, content_hash, content_storage_path_str, redirected_to_url
-                ))
-            logger.info(f"Recorded visited URL: {url} (Status: {status_code})")
+            with sqlite3.connect(self.db_path, timeout=10) as conn_threaded: # New connection
+                with conn_threaded.cursor() as cursor: # New cursor from this connection
+                    cursor.execute("""
+                    INSERT OR REPLACE INTO visited_urls 
+                    (url_sha256, url, domain, crawled_timestamp, http_status_code, content_type, content_hash, content_storage_path, redirected_to_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        url_sha256, url, domain, crawled_timestamp, status_code, 
+                        content_type, content_hash, content_storage_path_str, redirected_to_url
+                    ))
+                    conn_threaded.commit() # Explicit commit needed with sqlite3 connection, not just context manager for cursor
+                logger.info(f"Recorded visited URL: {url} (Status: {status_code})")
         except sqlite3.Error as e:
             logger.error(f"DB error adding visited page {url}: {e}")
-            # Rollback handled by with statement
+            # No explicit rollback needed, as `with` statement handles errors for connection.
 
     def close(self):
         """Closes the database connection."""
