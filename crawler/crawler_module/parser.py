@@ -63,22 +63,15 @@ class PageParser:
             
             for element, attribute, link, pos in doc.iterlinks():
                 if attribute == 'href':
-                    # Step 1: Check scheme of the (now absolute) link BEFORE normalization
                     try:
                         parsed_link = urlparse(link)
                         if parsed_link.scheme not in ['http', 'https']:
-                            # logger.debug(f"Skipping non-http/s link: {link}")
-                            continue # Skip javascript:, mailto:, ftp:, etc.
+                            continue 
                     except Exception as e:
-                        # logger.warning(f"Could not parse scheme for link {link}: {e}, skipping.")
-                        continue # Skip if parsing scheme fails
+                        continue 
 
-                    # Step 2: Normalize if it's an http/https link
-                    normalized = normalize_url(link) # normalize_url will ensure http/https here
+                    normalized = normalize_url(link) 
                     if normalized:
-                        # Double check scheme after normalization, though normalize_url should preserve it if originally http/s
-                        # parsed_normalized = urlparse(normalized) 
-                        # if parsed_normalized.scheme in ['http', 'https']:
                         extracted_links.add(normalized)
         except Exception as e:
             logger.error(f"Error during link extraction for {base_url}: {e}")
@@ -86,22 +79,23 @@ class PageParser:
         # 2. Extract text content
         text_content: Optional[str] = None
         try:
-            # Clean the HTML first (optional, but can improve text quality)
-            # cleaned_doc = self.cleaner.clean_html(doc) # This modifies the doc, be careful if doc is used later
-            # For simple text, can just use text_content() on the body or whole doc
-            body_element = doc.find('.//body')
+            # Clean the HTML document tree in place *after* link extraction is complete.
+            cleaned_doc = self.cleaner.clean_html(doc) 
+
+            body_element = cleaned_doc.find('.//body') 
             if body_element is not None:
                 text_content = body_element.text_content()
             else:
-                # Fallback if no body tag, explicitly set text_content to None
-                text_content = None 
+                # Fallback if no body tag, get text from the whole cleaned document
+                # This might happen if cleaner removes body or if HTML was malformed initially.
+                text_content = cleaned_doc.text_content()
             
-            if text_content: # This check will now only apply if body_element was found and had content
+            if text_content:
                 text_content = ' \n'.join([line.strip() for line in text_content.splitlines() if line.strip()])
                 text_content = text_content.strip()
-                if not text_content: # If stripping results in empty string, set to None
+                if not text_content: 
                     text_content = None
-            # else: text_content is already None if body_element was None or body_element.text_content() was empty/None
+            # else: text_content is already None if parsing/cleaning resulted in no text
 
         except Exception as e:
             logger.error(f"Error during text extraction for {base_url}: {e}")
