@@ -2,6 +2,8 @@ import logging
 import time
 from pathlib import Path
 from typing import Set
+import asyncio
+import sqlite3
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -167,73 +169,67 @@ class FrontierManager:
             logger.error("Cannot get next URL, no DB connection.")
             return None
 
-        # In a more advanced system, we might fetch a batch of candidates
-        # and use a more sophisticated priority queue that considers domain diversity and politeness.
-        # For now, we iterate and take the first compliant URL.
-        # The ORDER BY clause can be adjusted for different prioritization strategies.
-        # e.g., ORDER BY priority_score DESC, added_timestamp ASC
-        
-        # How many candidates to check from DB before giving up for this attempt.
-        # This prevents stalling if the top N urls are all from domains waiting for cooldown.
-        candidate_check_limit = self.config.max_workers * 5 # Check a few per worker
-        
+        candidate_check_limit = self.config.max_workers * 5
         selected_url_info = None
-        cursor = None # Ensure cursor is defined for finally block
+        # cursor = None # No longer need to define here, will be in a thread or context managed
 
         try:
-            cursor = self.storage.conn.cursor()
-            # Fetch a batch of candidates. ORDER BY added_timestamp for FIFO within available domains.
-            # A more complex query could pre-filter by domain last_fetch_time if it were easily joinable.
-            cursor.execute(
-                "SELECT id, url, domain FROM frontier ORDER BY added_timestamp ASC LIMIT ?", 
-                (candidate_check_limit,)
-            )
-            candidates = cursor.fetchall()
+            # The database query itself is synchronous.
+            # We get a list of candidates first, then process them asynchronously regarding politeness.
+            def _get_candidates_sync():
+                with self.storage.conn.cursor() as cursor_obj: # type: ignore
+                    # Fetch a batch of candidates.
+                    cursor_obj.execute(
+                        "SELECT id, url, domain FROM frontier ORDER BY added_timestamp ASC LIMIT ?", 
+                        (candidate_check_limit,)
+                    )
+                    return cursor_obj.fetchall()
+            
+            candidates = await asyncio.to_thread(_get_candidates_sync)
 
             if not candidates:
                 logger.info("Frontier is empty based on current query.")
                 return None
 
             for url_id, url, domain in candidates:
-                # Check 1: Is the URL allowed by robots.txt and not manually excluded?
-                # This call might trigger a robots.txt fetch if not cached by PolitenessEnforcer.
-                # In a fully async model, this would be an awaitable call.
-                if not self.politeness.is_url_allowed(url):
+                # Politeness checks are now async
+                if not await self.politeness.is_url_allowed(url):
                     logger.debug(f"URL {url} disallowed by politeness rules. Removing from frontier.")
-                    # If disallowed, remove from frontier to prevent re-checking.
-                    cursor.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
-                    self.storage.conn.commit() # Commit removal of bad URL
-                    self.seen_urls.add(url) # Ensure it is marked as seen to avoid re-adding
-                    continue # Try next candidate
+                    def _delete_disallowed_url_sync():
+                        with self.storage.conn.cursor() as cursor_obj: # type: ignore
+                            cursor_obj.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
+                            self.storage.conn.commit() # type: ignore
+                    await asyncio.to_thread(_delete_disallowed_url_sync)
+                    self.seen_urls.add(url) 
+                    continue 
 
-                # Check 2: Can we fetch from this domain now (respecting crawl delay)?
-                if self.politeness.can_fetch_domain_now(domain):
-                    # This URL is good to go!
-                    self.politeness.record_domain_fetch_attempt(domain) # Important: update last fetch time
+                if await self.politeness.can_fetch_domain_now(domain):
+                    await self.politeness.record_domain_fetch_attempt(domain)
                     
-                    # Delete the URL from frontier as it's being handed out
-                    cursor.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
-                    self.storage.conn.commit() 
+                    def _delete_selected_url_sync():
+                        with self.storage.conn.cursor() as cursor_obj: # type: ignore
+                            cursor_obj.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
+                            self.storage.conn.commit() # type: ignore
+                    await asyncio.to_thread(_delete_selected_url_sync)
                     
                     logger.debug(f"Retrieved from frontier: {url} (ID: {url_id}) for domain {domain}")
                     selected_url_info = (url, domain, url_id)
-                    break # Found a suitable URL
+                    break 
                 else:
-                    # logger.debug(f"Domain {domain} (for URL {url}) not ready due to crawl delay.")
-                    pass # Keep in frontier, try another candidate
+                    pass 
             
             if not selected_url_info:
                 logger.debug(f"No suitable URL found in the first {len(candidates)} candidates that respects politeness rules now.")
-                # This might mean all available domains are on cooldown.
 
-        except self.storage.conn.Error as e:
-            logger.error(f"Error getting next URL from frontier: {e}")
-            if self.storage.conn: self.storage.conn.rollback()
-            return None # Ensure rollback on error before returning
-        except Exception as e: # Catch other unexpected errors from politeness checks etc.
+        except sqlite3.Error as e: # type: ignore
+            logger.error(f"DB Error getting next URL from frontier: {e}", exc_info=True)
+            # Rollback might not be strictly needed if commits are granular and in threads,
+            # but doesn't hurt if self.storage.conn supports it broadly.
+            # if self.storage.conn and hasattr(self.storage.conn, 'rollback'): self.storage.conn.rollback()
+            return None 
+        except Exception as e: 
             logger.error(f"Unexpected error during get_next_url: {e}", exc_info=True)
             return None
-        finally:
-            if cursor: cursor.close()
+        # No finally block for cursor as it's managed within the _get_candidates_sync thread
         
         return selected_url_info 

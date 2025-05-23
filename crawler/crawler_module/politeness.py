@@ -3,11 +3,13 @@ import time
 from pathlib import Path
 from urllib.parse import urljoin
 from robotexclusionrulesparser import RobotExclusionRulesParser # type: ignore
-import httpx # For synchronous robots.txt fetching for now
+import asyncio # Added for asyncio.to_thread
+import sqlite3 # For type hinting in db access functions
 
 from .config import CrawlerConfig
 from .storage import StorageManager
-from .utils import extract_domain 
+from .utils import extract_domain
+from .fetcher import Fetcher, FetchResult # Added Fetcher import
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +17,13 @@ DEFAULT_ROBOTS_TXT_TTL = 24 * 60 * 60  # 24 hours in seconds
 MIN_CRAWL_DELAY_SECONDS = 70 # Our project's default minimum
 
 class PolitenessEnforcer:
-    def __init__(self, config: CrawlerConfig, storage: StorageManager):
+    def __init__(self, config: CrawlerConfig, storage: StorageManager, fetcher: Fetcher):
         self.config = config
         self.storage = storage
+        self.fetcher = fetcher # Added fetcher instance
         self.robots_parsers: dict[str, RobotExclusionRulesParser] = {} # Cache for parsed robots.txt
+        # _load_manual_exclusions is synchronous and uses DB, could be called in an executor if it becomes slow
+        # For now, direct call is fine as it's part of init.
         self._load_manual_exclusions()
 
     def _load_manual_exclusions(self):
@@ -28,13 +33,13 @@ class PolitenessEnforcer:
                 logger.error("Cannot load manual exclusions, no DB connection.")
                 return
             try:
+                # This is a synchronous DB operation. Consider to_thread if it becomes a bottleneck.
                 cursor = self.storage.conn.cursor()
                 with open(self.config.exclude_file, 'r') as f:
                     count = 0
                     for line in f:
                         domain_to_exclude = line.strip().lower()
                         if domain_to_exclude and not domain_to_exclude.startswith("#"):
-                            # Ensure domain exists in domain_metadata or insert it
                             cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain_to_exclude,))
                             cursor.execute(
                                 "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?",
@@ -49,132 +54,133 @@ class PolitenessEnforcer:
                 logger.error(f"DB error loading manual exclusions: {e}")
                 if self.storage.conn: self.storage.conn.rollback()
             finally:
-                if cursor: cursor.close()
+                if 'cursor' in locals() and cursor: cursor.close() # Ensure cursor is defined before closing
         else:
             logger.info("No manual exclude file specified or found.")
 
-    def _get_robots_for_domain(self, domain: str) -> RobotExclusionRulesParser | None:
-        """Fetches, parses, and caches robots.txt for a domain."""
+    async def _get_robots_for_domain(self, domain: str) -> RobotExclusionRulesParser | None:
+        """Fetches (async), parses, and caches robots.txt for a domain."""
+        # In-memory cache check (remains synchronous)
         if domain in self.robots_parsers:
-            # TODO: Check TTL from storage before returning cached parser
-            # For now, if in memory, assume it's fresh enough for this session part
-            return self.robots_parsers[domain]
-
-        if not self.storage.conn:
-            logger.error(f"Cannot get robots.txt for {domain}, no DB connection.")
-            return None
+             # Simple in-memory check, could add TTL to this dict too
+             # Check if DB has a more recent version or if TTL expired.
+             # This part needs careful thought for consistency between in-memory and DB cache.
+             # For now, if in-memory, let's assume it might be stale and re-evaluate against DB.
+             pass # Let it proceed to DB check
 
         rerp = RobotExclusionRulesParser()
-        rerp.user_agent = self.config.user_agent # Set our user agent for the parser
-        robots_url = f"http://{domain}/robots.txt" # Try HTTP first
-        # In a full async system, this fetching would use the async Fetcher
+        rerp.user_agent = self.config.user_agent
         
         robots_content: str | None = None
-        fetched_timestamp = int(time.time())
-        expires_timestamp = fetched_timestamp + DEFAULT_ROBOTS_TXT_TTL
-        
-        # 1. Try to load from DB cache if not expired
-        try:
-            cursor = self.storage.conn.cursor()
-            cursor.execute(
-                "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?", 
-                (domain,)
-            )
-            row = cursor.fetchone()
-            if row and row[0] and row[1] and row[1] > fetched_timestamp:
-                logger.debug(f"Using cached robots.txt for {domain} from DB.")
-                robots_content = row[0]
-                expires_timestamp = row[1] # Keep original expiry
-            cursor.close()
-        except self.storage.conn.Error as e:
-            logger.warning(f"DB error fetching cached robots.txt for {domain}: {e}")
-            if cursor: cursor.close()
+        current_time = int(time.time())
+        # expires_timestamp = current_time + DEFAULT_ROBOTS_TXT_TTL # Default, might be overridden by DB
 
-        # 2. If not in DB cache or expired, fetch it
-        if robots_content is None:
-            logger.info(f"Fetching robots.txt for {domain} from {robots_url}")
+        # 1. Try to load from DB cache if not expired (using asyncio.to_thread for DB access)
+        db_row = None
+        if self.storage.conn:
             try:
-                # Using httpx for a simple synchronous GET for now.
-                # This will be replaced by an async call to our Fetcher module later.
-                with httpx.Client(follow_redirects=True, timeout=10.0) as client:
-                    try:
-                        response = client.get(robots_url, headers={"User-Agent": self.config.user_agent})
-                        if response.status_code == 200:
-                            robots_content = response.text
-                        elif response.status_code == 404:
-                            logger.debug(f"robots.txt not found (404) for {domain}. Assuming allow all.")
-                            robots_content = "" # Empty content means allow all for parser
-                        else:
-                            logger.warning(f"Failed to fetch robots.txt for {domain}. Status: {response.status_code}. Assuming allow all.")
-                            robots_content = "" 
-                    except httpx.RequestError as e:
-                        logger.warning(f"HTTP request error fetching robots.txt for {domain}: {e}. Assuming allow all.")
-                        robots_content = ""
-                    
-                    # Try HTTPS if HTTP failed and wasn't just a 404 or similar
-                    if robots_content is None or (response.status_code != 200 and response.status_code != 404):
-                        robots_url_https = f"https://{domain}/robots.txt"
-                        logger.info(f"Retrying robots.txt for {domain} with HTTPS: {robots_url_https}")
-                        try:
-                            response_https = client.get(robots_url_https, headers={"User-Agent": self.config.user_agent})
-                            if response_https.status_code == 200:
-                                robots_content = response_https.text
-                            elif response_https.status_code == 404:
-                                logger.debug(f"robots.txt not found (404) via HTTPS for {domain}. Assuming allow all.")
-                                robots_content = "" 
-                            else:
-                                logger.warning(f"Failed to fetch robots.txt via HTTPS for {domain}. Status: {response_https.status_code}. Assuming allow all.")
-                                robots_content = ""
-                        except httpx.RequestError as e:
-                            logger.warning(f"HTTP request error fetching robots.txt via HTTPS for {domain}: {e}. Assuming allow all.")
-                            robots_content = ""
+                def _db_get_cached_robots_sync():
+                    # logger.debug(f"DB THREAD: Getting cached robots for {domain}")
+                    # Create new cursor inside the thread
+                    with self.storage.conn.cursor() as db_cursor: # type: ignore
+                        db_cursor.execute(
+                            "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?", 
+                            (domain,)
+                        )
+                        return db_cursor.fetchone()
+                db_row = await asyncio.to_thread(_db_get_cached_robots_sync)
+            except sqlite3.Error as e:
+                 logger.warning(f"DB error fetching cached robots.txt for {domain}: {e}")
 
-                # Update DB with fetched content (even if empty for 404s)
-                if robots_content is not None and self.storage.conn:
-                    cursor = self.storage.conn.cursor()
-                    cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
-                    cursor.execute(
-                        "UPDATE domain_metadata SET robots_txt_content = ?, robots_txt_fetched_timestamp = ?, robots_txt_expires_timestamp = ? WHERE domain = ?",
-                        (robots_content, fetched_timestamp, expires_timestamp, domain)
-                    )
-                    self.storage.conn.commit()
-                    logger.debug(f"Cached robots.txt for {domain} in DB.")
-                    if cursor: cursor.close()
+        if db_row and db_row[0] is not None and db_row[1] is not None and db_row[1] > current_time:
+            logger.debug(f"Using cached robots.txt for {domain} from DB (expires: {db_row[1]}).")
+            robots_content = db_row[0]
+            # If we load from DB, use its expiry. The in-memory RERP should be updated.
+            if domain in self.robots_parsers and self.robots_parsers[domain].source_content == robots_content:
+                logger.debug(f"In-memory robots_parser for {domain} matches fresh DB cache. Reusing parser.")
+                return self.robots_parsers[domain]
+        elif domain in self.robots_parsers:
+            # If DB cache is stale or missing, but we have an in-memory one, it might be okay for a short while
+            # or if fetches are failing. This logic could be more complex regarding TTLs for in-memory too.
+            # For now, if DB is not fresh, we re-fetch. If re-fetch fails, the old in-memory one is better than nothing.
+            logger.debug(f"DB cache for {domain} is stale or missing. Will attempt re-fetch.")
 
-            except Exception as e:
-                logger.error(f"Unexpected error fetching robots.txt for {domain}: {e}")
-                robots_content = "" # Fallback to allow all on unexpected error
-        
+        # 2. If not in valid DB cache, fetch it asynchronously
+        if robots_content is None:
+            fetched_timestamp = int(time.time()) # Reset timestamp for new fetch
+            expires_timestamp = fetched_timestamp + DEFAULT_ROBOTS_TXT_TTL
+
+            robots_url_http = f"http://{domain}/robots.txt"
+            robots_url_https = f"https://{domain}/robots.txt"
+            
+            logger.info(f"Attempting to fetch robots.txt for {domain} (HTTP first)")
+            fetch_result_http: FetchResult = await self.fetcher.fetch_url(robots_url_http, is_robots_txt=True)
+
+            if fetch_result_http.status_code == 200 and fetch_result_http.text_content is not None:
+                robots_content = fetch_result_http.text_content
+            elif fetch_result_http.status_code == 404:
+                logger.debug(f"robots.txt not found (404) via HTTP for {domain}. Assuming allow all.")
+                robots_content = ""
+            else: 
+                logger.info(f"HTTP fetch for robots.txt failed for {domain} (status: {fetch_result_http.status_code}). Trying HTTPS.")
+                fetch_result_https: FetchResult = await self.fetcher.fetch_url(robots_url_https, is_robots_txt=True)
+                if fetch_result_https.status_code == 200 and fetch_result_https.text_content is not None:
+                    robots_content = fetch_result_https.text_content
+                elif fetch_result_https.status_code == 404:
+                    logger.debug(f"robots.txt not found (404) via HTTPS for {domain}. Assuming allow all.")
+                    robots_content = ""
+                else:
+                    logger.warning(f"Failed to fetch robots.txt for {domain} via HTTP (status: {fetch_result_http.status_code}, error: {fetch_result_http.error_message}) and HTTPS (status: {fetch_result_https.status_code}, error: {fetch_result_https.error_message}). Assuming allow all.")
+                    robots_content = ""
+            
+            if self.storage.conn:
+                try:
+                    def _db_update_robots_cache_sync():
+                        with self.storage.conn.cursor() as db_cursor: # type: ignore
+                            db_cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
+                            db_cursor.execute(
+                                "UPDATE domain_metadata SET robots_txt_content = ?, robots_txt_fetched_timestamp = ?, robots_txt_expires_timestamp = ? WHERE domain = ?",
+                                (robots_content, fetched_timestamp, expires_timestamp, domain)
+                            )
+                            self.storage.conn.commit() # type: ignore
+                            logger.debug(f"Cached robots.txt for {domain} in DB.")
+                    await asyncio.to_thread(_db_update_robots_cache_sync)
+                except sqlite3.Error as e:
+                    logger.error(f"DB error caching robots.txt for {domain}: {e}")
+
         if robots_content is not None:
             rerp.parse(robots_content)
-        else: # Should not happen if fallback works, but as a safeguard
-            rerp.parse("") # Default to allow all if content is truly None
+            rerp.source_content = robots_content # Store source for later comparison
+        else:
+            rerp.parse("") 
+            rerp.source_content = ""
         
         self.robots_parsers[domain] = rerp
         return rerp
 
-    def is_url_allowed(self, url: str) -> bool:
+    async def is_url_allowed(self, url: str) -> bool:
         """Checks if a URL is allowed by robots.txt and not manually excluded."""
         domain = extract_domain(url)
         if not domain:
             logger.warning(f"Could not extract domain for URL: {url} for robots check. Allowing.")
-            return True # Or False, depending on strictness. Allowing is safer for not missing pages.
+            return True
 
-        # 1. Check manual exclusion first
+        # 1. Check manual exclusion first (DB access in thread)
         if self.storage.conn:
             try:
-                cursor = self.storage.conn.cursor()
-                cursor.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
-                row = cursor.fetchone()
-                if cursor: cursor.close()
+                def _db_check_manual_exclusion_sync():
+                    with self.storage.conn.cursor() as cursor_obj: # type: ignore
+                        cursor_obj.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
+                        return cursor_obj.fetchone()
+                row = await asyncio.to_thread(_db_check_manual_exclusion_sync)
                 if row and row[0] == 1:
                     logger.debug(f"URL {url} from manually excluded domain: {domain}")
                     return False
-            except self.storage.conn.Error as e:
+            except sqlite3.Error as e:
                 logger.warning(f"DB error checking manual exclusion for {domain}: {e}")
 
-        # 2. Check robots.txt
-        rerp = self._get_robots_for_domain(domain)
+        # 2. Check robots.txt (already async)
+        rerp = await self._get_robots_for_domain(domain)
         if rerp:
             is_allowed = rerp.is_allowed(self.config.user_agent, url)
             if not is_allowed:
@@ -182,22 +188,20 @@ class PolitenessEnforcer:
             return is_allowed
         
         logger.warning(f"No robots.txt parser available for {domain}. Allowing URL: {url}")
-        return True # Default to allow if robots.txt processing failed severely
+        return True
 
-    def get_crawl_delay(self, domain: str) -> float:
+    async def get_crawl_delay(self, domain: str) -> float:
         """Gets the crawl delay for a domain (from robots.txt or default)."""
-        rerp = self._get_robots_for_domain(domain)
+        rerp = await self._get_robots_for_domain(domain)
         delay = None
         if rerp:
-            # robotexclusionrulesparser uses get_crawl_delay, expects user_agent
-            # It can return None if no specific delay for our agent, or a float
             agent_delay = rerp.get_crawl_delay(self.config.user_agent)
             if agent_delay is not None:
                 delay = float(agent_delay)
                 logger.debug(f"Using {delay}s crawl delay from robots.txt for {domain} (agent: {self.config.user_agent})")
         
-        if delay is None: # No specific delay, or no delay for our agent, or generic delay
-            if rerp and rerp.get_crawl_delay("*") is not None: # Check for wildcard agent delay
+        if delay is None:
+            if rerp and rerp.get_crawl_delay("*") is not None:
                  wildcard_delay = rerp.get_crawl_delay("*")
                  if wildcard_delay is not None:
                     delay = float(wildcard_delay)
@@ -207,52 +211,50 @@ class PolitenessEnforcer:
             logger.debug(f"No crawl delay specified in robots.txt for {domain}. Using default: {MIN_CRAWL_DELAY_SECONDS}s")
             return float(MIN_CRAWL_DELAY_SECONDS)
         
-        return max(float(delay), float(MIN_CRAWL_DELAY_SECONDS)) # Ensure our minimum is respected
+        return max(float(delay), float(MIN_CRAWL_DELAY_SECONDS))
 
-    def can_fetch_domain_now(self, domain: str) -> bool:
+    async def can_fetch_domain_now(self, domain: str) -> bool:
         """Checks if the domain can be fetched based on last fetch time and crawl delay."""
         if not self.storage.conn:
             logger.error("Cannot check fetch_domain_now, no DB connection.")
-            return False # Safer to not fetch
+            return False
 
+        last_fetch_time = 0
         try:
-            cursor = self.storage.conn.cursor()
-            cursor.execute("SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,))
-            row = cursor.fetchone()
-            if cursor: cursor.close()
-
-            last_fetch_time = 0
+            def _db_get_last_fetch_sync():
+                with self.storage.conn.cursor() as cursor_obj: # type: ignore
+                    cursor_obj.execute("SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,))
+                    return cursor_obj.fetchone()
+            row = await asyncio.to_thread(_db_get_last_fetch_sync)
             if row and row[0] is not None:
                 last_fetch_time = row[0]
-            
-            crawl_delay = self.get_crawl_delay(domain)
-            current_time = int(time.time())
-            
-            if current_time >= last_fetch_time + crawl_delay:
-                return True
-            else:
-                # logger.debug(f"Domain {domain} cannot be fetched yet. Last fetch: {last_fetch_time}, delay: {crawl_delay}, current: {current_time}")
-                return False
-        except self.storage.conn.Error as e:
+        except sqlite3.Error as e:
             logger.error(f"DB error checking can_fetch_domain_now for {domain}: {e}")
-            return False # Safer to not fetch
+            return False 
+            
+        crawl_delay = await self.get_crawl_delay(domain) # Now async
+        current_time = int(time.time())
+        
+        if current_time >= last_fetch_time + crawl_delay:
+            return True
+        else:
+            return False
 
-    def record_domain_fetch_attempt(self, domain: str):
+    async def record_domain_fetch_attempt(self, domain: str):
         """Records that we are about to fetch (or have fetched) from a domain."""
         if not self.storage.conn:
             logger.error("Cannot record domain fetch, no DB connection.")
             return
         try:
             current_time = int(time.time())
-            cursor = self.storage.conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
-                           (domain, current_time))
-            cursor.execute("UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
-                           (current_time, domain))
-            self.storage.conn.commit()
-            # logger.debug(f"Recorded fetch attempt for domain {domain} at {current_time}")
-        except self.storage.conn.Error as e:
+            def _db_record_fetch_sync():
+                with self.storage.conn.cursor() as cursor_obj: # type: ignore
+                    cursor_obj.execute("INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
+                                   (domain, current_time))
+                    cursor_obj.execute("UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
+                                   (current_time, domain))
+                    self.storage.conn.commit() # type: ignore
+            await asyncio.to_thread(_db_record_fetch_sync)
+        except sqlite3.Error as e:
             logger.error(f"DB error recording fetch attempt for {domain}: {e}")
-            if self.storage.conn: self.storage.conn.rollback()
-        finally:
-            if cursor: cursor.close() 
+            # No rollback needed for SELECT usually, and commit is in the thread 
