@@ -76,18 +76,20 @@ class PolitenessEnforcer:
         # expires_timestamp = current_time + DEFAULT_ROBOTS_TXT_TTL # Default, might be overridden by DB
 
         # 1. Try to load from DB cache if not expired (using asyncio.to_thread for DB access)
-        db_row = None
         db_path = self.storage.db_path
 
         try:
             def _db_get_cached_robots_sync_threaded():
                 with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    with conn_threaded.cursor() as db_cursor:
-                        db_cursor.execute(
+                    cursor = conn_threaded.cursor()
+                    try:
+                        cursor.execute(
                             "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?", 
                             (domain,)
                         )
-                        return db_cursor.fetchone()
+                        return cursor.fetchone()
+                    finally:
+                        cursor.close()
             db_row = await asyncio.to_thread(_db_get_cached_robots_sync_threaded)
         except sqlite3.Error as e:
             logger.warning(f"DB error fetching cached robots.txt for {domain}: {e}")
@@ -137,14 +139,17 @@ class PolitenessEnforcer:
                 try:
                     def _db_update_robots_cache_sync_threaded():
                         with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                            with conn_threaded.cursor() as db_cursor:
-                                db_cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
-                                db_cursor.execute(
+                            cursor = conn_threaded.cursor()
+                            try:
+                                cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
+                                cursor.execute(
                                     "UPDATE domain_metadata SET robots_txt_content = ?, robots_txt_fetched_timestamp = ?, robots_txt_expires_timestamp = ? WHERE domain = ?",
                                     (robots_content, fetched_timestamp, expires_timestamp, domain)
                                 )
                                 conn_threaded.commit()
                                 logger.debug(f"Cached robots.txt for {domain} in DB.")
+                            finally:
+                                cursor.close()
                     await asyncio.to_thread(_db_update_robots_cache_sync_threaded)
                 except sqlite3.Error as e:
                     logger.error(f"DB error caching robots.txt for {domain}: {e}")
@@ -171,9 +176,12 @@ class PolitenessEnforcer:
         try:
             def _db_check_manual_exclusion_sync_threaded():
                 with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    with conn_threaded.cursor() as cursor_obj:
-                        cursor_obj.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
-                        return cursor_obj.fetchone()
+                    cursor = conn_threaded.cursor()
+                    try:
+                        cursor.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
+                        return cursor.fetchone()
+                    finally:
+                        cursor.close()
             row = await asyncio.to_thread(_db_check_manual_exclusion_sync_threaded)
             if row and row[0] == 1:
                 logger.debug(f"URL {url} from manually excluded domain: {domain}")
@@ -226,9 +234,12 @@ class PolitenessEnforcer:
         try:
             def _db_get_last_fetch_sync_threaded():
                 with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    with conn_threaded.cursor() as cursor_obj:
-                        cursor_obj.execute("SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,))
-                        return cursor_obj.fetchone()
+                    cursor = conn_threaded.cursor()
+                    try:
+                        cursor.execute("SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,))
+                        return cursor.fetchone()
+                    finally:
+                        cursor.close()
             row = await asyncio.to_thread(_db_get_last_fetch_sync_threaded)
             if row and row[0] is not None:
                 last_fetch_time = row[0]
@@ -254,12 +265,15 @@ class PolitenessEnforcer:
             current_time = int(time.time())
             def _db_record_fetch_sync_threaded():
                 with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    with conn_threaded.cursor() as cursor_obj:
-                        cursor_obj.execute("INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
+                    cursor = conn_threaded.cursor()
+                    try:
+                        cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
                                        (domain, current_time))
-                        cursor_obj.execute("UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
+                        cursor.execute("UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
                                        (current_time, domain))
                         conn_threaded.commit()
+                    finally:
+                        cursor.close()
             await asyncio.to_thread(_db_record_fetch_sync_threaded)
         except sqlite3.Error as e:
             logger.error(f"DB error recording fetch attempt for {domain}: {e}")

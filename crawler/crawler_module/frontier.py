@@ -24,7 +24,8 @@ class FrontierManager:
         seen = set()
         try:
             with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
-                with conn_threaded.cursor() as cursor:
+                cursor = conn_threaded.cursor()
+                try:
                     # Load from visited_urls
                     cursor.execute("SELECT url FROM visited_urls")
                     for row in cursor.fetchall():
@@ -34,6 +35,8 @@ class FrontierManager:
                     cursor.execute("SELECT url FROM frontier")
                     for row in cursor.fetchall():
                         seen.add(row[0])
+                finally:
+                    cursor.close()
             logger.info(f"DB THREAD: Loaded {len(seen)} URLs for seen_urls set.")
         except sqlite3.Error as e:
             logger.error(f"DB THREAD: Error loading for seen_urls set: {e}")
@@ -77,13 +80,14 @@ class FrontierManager:
 
     def _clear_frontier_db_sync(self):
         """Synchronous part of clearing frontier DB. To be run in a thread."""
-        # No self.storage.conn check here, as it establishes its own.
         with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
-            with conn_threaded.cursor() as cursor_obj:
-                cursor_obj.execute("DELETE FROM frontier")
-                conn_threaded.commit()
-                # self.seen_urls.clear() # This should be done in the async part after thread finishes
+            cursor = conn_threaded.cursor()
+            try:
+                cursor.execute("DELETE FROM frontier")
+                conn_threaded.commit() # Explicit commit for DELETE
                 logger.info("Cleared frontier table in database (via thread).")
+            finally:
+                cursor.close()
     
     async def _clear_frontier_db(self):
         await asyncio.to_thread(self._clear_frontier_db_sync)
@@ -93,25 +97,24 @@ class FrontierManager:
         """Synchronous part of adding a URL to DB. To be run in a thread."""
         try:
             with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
-                with conn_threaded.cursor() as cursor:
-                    # Check if visited first
+                cursor = conn_threaded.cursor()
+                try:
                     cursor.execute("SELECT 1 FROM visited_urls WHERE url_sha256 = ?", 
                                    (self.storage.get_url_sha256(normalized_url),))
                     if cursor.fetchone():
-                        # logger.debug(f"DB THREAD: URL already visited: {normalized_url}")
-                        return False # Already visited, not added to frontier
+                        return False 
 
                     cursor.execute(
                         "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score) VALUES (?, ?, ?, ?, ?)",
                         (normalized_url, domain, depth, int(time.time()), 0)
                     )
                     if cursor.rowcount > 0:
-                        conn_threaded.commit()
-                        # logger.debug(f"DB THREAD: Added to frontier: {normalized_url}")
-                        return True # Newly added to frontier
+                        conn_threaded.commit() # Explicit commit for INSERT
+                        return True 
                     else:
-                        # logger.debug(f"DB THREAD: URL likely already in frontier (IGNORE): {normalized_url}")
-                        return False # Not newly added (already in frontier)
+                        return False 
+                finally:
+                    cursor.close()
         except sqlite3.Error as e:
             logger.error(f"DB THREAD: Error adding URL {normalized_url} to frontier: {e}")
             return False
@@ -184,12 +187,15 @@ class FrontierManager:
         try:
             def _get_candidates_sync_threaded():
                 with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
-                    with conn_threaded.cursor() as cursor_obj:
-                        cursor_obj.execute(
+                    cursor = conn_threaded.cursor()
+                    try:
+                        cursor.execute(
                             "SELECT id, url, domain FROM frontier ORDER BY added_timestamp ASC LIMIT ?", 
                             (candidate_check_limit,)
                         )
-                        return cursor_obj.fetchall()
+                        return cursor.fetchall()
+                    finally:
+                        cursor.close()
             
             candidates = await asyncio.to_thread(_get_candidates_sync_threaded)
 
@@ -202,9 +208,12 @@ class FrontierManager:
                     logger.debug(f"URL {url} disallowed by politeness rules. Removing from frontier.")
                     def _delete_disallowed_url_sync_threaded():
                         with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
-                            with conn_threaded.cursor() as cursor_obj:
-                                cursor_obj.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
+                            cursor = conn_threaded.cursor()
+                            try:
+                                cursor.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
                                 conn_threaded.commit()
+                            finally:
+                                cursor.close()
                     await asyncio.to_thread(_delete_disallowed_url_sync_threaded)
                     self.seen_urls.add(url) 
                     continue 
@@ -214,9 +223,12 @@ class FrontierManager:
                     
                     def _delete_selected_url_sync_threaded():
                         with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
-                            with conn_threaded.cursor() as cursor_obj:
-                                cursor_obj.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
+                            cursor = conn_threaded.cursor()
+                            try:
+                                cursor.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
                                 conn_threaded.commit()
+                            finally:
+                                cursor.close()
                     await asyncio.to_thread(_delete_selected_url_sync_threaded)
                     
                     logger.debug(f"Retrieved from frontier: {url} (ID: {url_id}) for domain {domain}")
