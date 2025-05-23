@@ -2,7 +2,7 @@ aiohttp
 lxml
 robotexclusionrulesparser
 aiofiles
-cchardet
+cchardet==2.2.0a2
 tldextract
 pytest
 pytest-asyncio
