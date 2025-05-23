@@ -140,24 +140,40 @@ async def test_get_robots_from_memory_cache(politeness_enforcer: PolitenessEnfor
 @pytest.mark.asyncio
 async def test_get_robots_from_db_cache_fresh(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "dbcached.com"
-    # Original: robots_text = "User-agent: TestCrawler\nDisallow: /private"
-    # Temporary change for debugging user-agent matching:
+    # Original robots_text was: "User-agent: TestCrawler\nDisallow: /private"
+    # Temporary change for debugging user-agent matching (and now DB interaction):
     robots_text = "User-agent: *\nDisallow: /private" # Test with wildcard agent
     future_expiry = int(time.time()) + DEFAULT_ROBOTS_TXT_TTL
 
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    mock_cursor.fetchone.return_value = (robots_text, future_expiry)
+    # Mock the database interaction within the threaded function
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_cursor_instance.fetchone.return_value = (robots_text, future_expiry)
     
-    # Ensure no in-memory RERP for this domain from a previous test run within the same session if PE isn't reset
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance 
+    mock_db_conn_instance.__exit__.return_value = None
+
     if domain in politeness_enforcer.robots_parsers:
         del politeness_enforcer.robots_parsers[domain]
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        rerp = await politeness_enforcer._get_robots_for_domain(domain)
+        
+        mock_sqlite_connect.assert_called_once_with(politeness_enforcer.storage.db_path, timeout=10)
+        mock_db_conn_instance.cursor.assert_called_once()
+        mock_db_cursor_instance.execute.assert_called_once_with(
+            "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?",
+            (domain,)
+        )
+        mock_db_cursor_instance.fetchone.assert_called_once()
+        mock_db_cursor_instance.close.assert_called_once()
+
     assert rerp is not None
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/private") is False
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/public") is True
     politeness_enforcer.fetcher.fetch_url.assert_not_called() 
-    assert domain in politeness_enforcer.robots_parsers 
+    assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
 async def test_get_robots_db_cache_stale_then_fetch_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
