@@ -313,3 +313,13 @@ python main.py --seed-file path/to/seeds.txt --email your.email@example.com [opt
 *   **Focused Scope:** Avoids advanced features like distributed crawling, JavaScript rendering, or complex anti-bot measure bypasses.
 *   **Step-by-Step Implementation:** The project can be built and tested incrementally (e.g., fetcher first, then parser, then storage, etc.).
 *   **Direct Inspection:** Using SQLite and flat text files allows for easy examination of the crawler's state and output. 
+
+## 12. Addendum: Performance Target Realism (Post-Initial Discussion)
+
+Following a discussion on the initial performance target of 50 million pages in 24 hours, and considering historical benchmarks (e.g., Michael Nielsen's 2012 crawl achieving ~7.5 million URLs per machine per 24 hours with Python, lxml, and a 70-second politeness delay), a more realistic initial expectation for this single-machine `asyncio`-based Python crawler is in the range of **5-15 million pages in 24 hours**.
+
+The 50 million page target remains an ambitious stretch goal. Achieving it would likely require:
+*   An exceptionally broad and high-quality seed list of domains to sustain the necessary crawl diversity given the 70-second per-domain delay.
+*   Favorable network conditions and highly optimized system performance (CPU for parsing, I/O for storage).
+
+The project will proceed with the current architecture, aiming for high performance, and actual throughput will be measured and optimized iteratively. The initial 5-15M pages/24h range serves as a more grounded baseline for success. 

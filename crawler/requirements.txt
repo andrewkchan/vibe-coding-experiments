@@ -1,0 +1,5 @@
+aiohttp
+lxml
+robotexclusionrulesparser
+aiofiles
+cchardet 
