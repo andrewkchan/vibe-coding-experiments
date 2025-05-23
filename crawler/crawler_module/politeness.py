@@ -69,7 +69,8 @@ class PolitenessEnforcer:
         # If a fetch is needed, the new RERP is put into robots_parsers.
 
         rerp = RobotExclusionRulesParser()
-        rerp.user_agent = self.config.user_agent
+        # Do NOT set rerp.user_agent here. is_allowed will take it as a parameter.
+        # rerp.user_agent = self.config.user_agent 
         robots_content: str | None = None
         
         db_path = self.storage.db_path
