@@ -87,14 +87,25 @@ This document provides a high-level summary of the development process for the e
 
 This iterative process of planning, implementing features module by module, writing tests, and debugging issues (especially around asynchronous operations and database threading) has brought the project to a runnable state, ready for further testing and refinement.
 
-## 5. Current Known Test Failures & Debugging Notes (as of last update)
+## 5. Test Suite Refinement and Bug Resolution (Session Post-Summary)
 
-Further test runs have revealed a new set of failures. These are currently being investigated:
+Following the previous summary, a dedicated debugging session was undertaken to address the listed test failures. All previously reported test failures have now been resolved. Key fixes included:
 
-*   **`tests/test_politeness.py`**: Multiple tests are failing with `NameError: name 'AsyncMock' is not defined`. This suggests `from unittest.mock import AsyncMock` might be missing or incorrectly scoped in these specific test functions or the test file itself, where `AsyncMock` is used to mock asynchronous methods of `PolitenessEnforcer` dependencies (like `_get_robots_for_domain` in some tests for `get_crawl_delay` or `can_fetch_domain_now`).
-*   **`tests/test_politeness.py`**: Several assertion errors like `assert 0 > 0` or `assert 0 == 2` (e.g., in `test_get_robots_db_cache_stale_then_fetch_success`, `test_record_domain_fetch_attempt_new_domain`). These often indicate that mocked method call counts (`mock_cursor.execute.call_count` or `politeness_enforcer.fetcher.fetch_url.call_count`) are not matching expectations. This could be due to changes in the underlying DB interaction logic (how many times `execute` is now called by threaded helpers) or how mocks are set up/reset for methods that are called multiple times.
-*   **`tests/test_politeness.py::test_get_robots_http_404_https_404`**: Failing with `AssertionError: assert 1 == 2`. This points to an incorrect `call_count` for `politeness_enforcer.fetcher.fetch_url` (expected 2 calls, got 1).
-*   **`tests/test_politeness.py::test_is_url_allowed_manually_excluded`**: Failing with `AssertionError: assert True is False`. This test expects `is_url_allowed` to return `False` for a manually excluded domain. The failure means it's returning `True`. This could be an issue with how the manual exclusion is checked in `is_url_allowed` or how the DB state is mocked/verified for that test.
-*   **`tests/test_utils.py`**: Several `AssertionError` failures in `test_normalize_url` related to trailing slashes (e.g., `assert 'https://example.com:80/' == 'https://example.com:80'`) and one in `test_extract_domain` for an FTP URL (`assert None == 'example.org'`). These indicate that the `normalize_url` and `extract_domain` functions are not producing the exact expected output for these specific test cases, likely around handling of trailing slashes or schemes other than http/https.
+*   **`tests/test_politeness.py` - `NameError` Resolution**:
+    *   Added the missing `from unittest.mock import AsyncMock` import to resolve `NameError: name 'AsyncMock' is not defined` in multiple tests.
 
-Addressing these failures will be the next focus. 
+*   **`tests/test_politeness.py` - `AssertionError` Fixes (Threaded DB Mocking)**:
+    *   The primary cause for many `AssertionError`s (e.g., `assert 0 > 0`, `assert 0 == 2`, `assert True is False`) in tests for `_get_robots_for_domain`, `is_url_allowed`, `can_fetch_domain_now`, and `record_domain_fetch_attempt` was identified as incorrect mocking of database operations that occur in separate threads via `asyncio.to_thread`.
+    *   Affected tests were refactored to correctly use `unittest.mock.patch('sqlite3.connect')`. This ensures that a mock connection and cursor are injected into the context of the threaded database function, allowing test assertions to accurately verify database interactions (e.g., `fetchone()` return values, `execute()` call counts and parameters, `commit()` calls).
+
+*   **`crawler_module/politeness.py` - Logic and String Literal Fixes**:
+    *   Corrected the logic in `_get_robots_for_domain` to ensure that an HTTPS fallback fetch for `robots.txt` is attempted if the initial HTTP attempt results in a 404 error (or any other non-200 status). This fixed `test_get_robots_http_404_https_404` which was failing due to an incorrect fetcher call count.
+    *   Ensured that robot rule string literals (e.g., `robots_text`, `robots_text_https`) in `tests/test_politeness.py` used correct newline characters (`\n`) instead of potentially over-escaped versions (`\\n`), which could affect parser behavior and lead to assertion failures like in `test_get_robots_http_fail_then_https_success`.
+    *   Removed potentially misleading `if not self.storage.conn:` checks from `can_fetch_domain_now` and `record_domain_fetch_attempt` as the threaded helper functions within them establish their own database connections.
+
+*   **`crawler_module/utils.py` - Normalization and Extraction Fixes**:
+    *   Refined the `normalize_url` function to correctly handle scheme lowercasing (e.g., `HTTP://` to `http://`), defaulting of schemeless URLs, and removal of trailing slashes (e.g., `http://example.com/` to `http://example.com`) to match test expectations.
+    *   Updated the `extract_domain` function to only prepend `http://` if no scheme is already present. This allows `tldextract` to correctly process URLs with non-HTTP schemes (e.g., `ftp://`) instead of mangling them.
+    *   These changes resolved the `AssertionError` failures previously noted in `tests/test_utils.py`.
+
+With these changes, all unit tests are currently passing, indicating a more stable and correctly functioning set of core modules for the crawler. 
