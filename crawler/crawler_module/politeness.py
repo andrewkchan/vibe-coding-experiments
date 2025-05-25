@@ -122,21 +122,29 @@ class PolitenessEnforcer:
         if robots_content is None:
             fetched_timestamp = int(time.time())
             expires_timestamp = fetched_timestamp + DEFAULT_ROBOTS_TXT_TTL
-            # ... (actual fetching logic as before) ...
-            # ... (DB update after fetch as before) ...
-            # This part (fetching and DB update) is unchanged from previous correct version.
+            
             robots_url_http = f"http://{domain}/robots.txt"
             robots_url_https = f"https://{domain}/robots.txt"
             logger.info(f"Attempting to fetch robots.txt for {domain} (HTTP first)")
             fetch_result_http: FetchResult = await self.fetcher.fetch_url(robots_url_http, is_robots_txt=True)
 
+            robots_content_found = False
             if fetch_result_http.status_code == 200 and fetch_result_http.text_content is not None:
                 robots_content = fetch_result_http.text_content
-            elif fetch_result_http.status_code == 404:
-                logger.debug(f"robots.txt not found (404) via HTTP for {domain}. Assuming allow all.")
-                robots_content = ""
-            else: 
-                logger.info(f"HTTP fetch for robots.txt failed for {domain} (status: {fetch_result_http.status_code}). Trying HTTPS.")
+                robots_content_found = True
+            
+            if not robots_content_found: # If HTTP didn't succeed with 200
+                if fetch_result_http.status_code == 404:
+                    logger.debug(f"robots.txt not found (404) via HTTP for {domain}. Trying HTTPS.")
+                # else: # Other HTTP errors (non-200, non-404)
+                # It was previously: else: logger.info(f"HTTP fetch for ...")
+                # This implies if it *was* a 404, it wouldn't log the "Trying HTTPS" part this way.
+                # The original was: elif http_status == 404 { set content="" } else { try https }
+                # New logic: if http_status != 200 { log reason; try https }
+                # So, the logging needs to be general for any non-200 HTTP attempt before HTTPS.
+                else: # Covers 404 and other non-200 errors from HTTP attempt
+                    logger.info(f"HTTP fetch for robots.txt did not yield content for {domain} (status: {fetch_result_http.status_code}). Trying HTTPS.")
+
                 fetch_result_https: FetchResult = await self.fetcher.fetch_url(robots_url_https, is_robots_txt=True)
                 if fetch_result_https.status_code == 200 and fetch_result_https.text_content is not None:
                     robots_content = fetch_result_https.text_content
@@ -144,10 +152,15 @@ class PolitenessEnforcer:
                     logger.debug(f"robots.txt not found (404) via HTTPS for {domain}. Assuming allow all.")
                     robots_content = ""
                 else:
-                    logger.warning(f"Failed to fetch robots.txt for {domain} ... Assuming allow all.")
+                    logger.warning(f"Failed to fetch robots.txt for {domain} via HTTPS as well (status: {fetch_result_https.status_code}). Assuming allow all.")
                     robots_content = ""
             
-            if robots_content is not None: # Check if content was actually obtained or defaulted to empty
+            # Ensure robots_content has a default value if all attempts failed to set it
+            if robots_content is None: 
+                 logger.warning(f"Robots content was unexpectedly None for {domain} after fetch attempts. Defaulting to allow (empty rules).")
+                 robots_content = ""
+            
+            if robots_content is not None: # robots_content will always be a string here
                 try:
                     def _db_update_robots_cache_sync_threaded():
                         with sqlite3.connect(db_path, timeout=10) as conn_threaded:

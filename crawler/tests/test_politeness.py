@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 import time
 import sqlite3
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, mock_open, patch, AsyncMock
 
 from crawler_module.politeness import PolitenessEnforcer, DEFAULT_ROBOTS_TXT_TTL, MIN_CRAWL_DELAY_SECONDS
 from crawler_module.config import CrawlerConfig
@@ -181,9 +181,16 @@ async def test_get_robots_db_cache_stale_then_fetch_success(politeness_enforcer:
     past_expiry = int(time.time()) - 1000
     new_robots_text = "User-agent: *\nDisallow: /new"
 
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    # Simulate DB having stale data initially
-    mock_cursor.fetchone.return_value = (stale_robots_text, past_expiry) 
+    # Mock the database interaction within the threaded function
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    # Simulate DB having stale data initially for the _db_get_cached_robots_sync_threaded call
+    mock_db_cursor_instance.fetchone.return_value = (stale_robots_text, past_expiry)
+    
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    # Simulate context manager behavior for 'with sqlite3.connect(...)'
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
 
     # Mock fetcher to return new robots.txt
     politeness_enforcer.fetcher.fetch_url.return_value = FetchResult(
@@ -192,8 +199,21 @@ async def test_get_robots_db_cache_stale_then_fetch_success(politeness_enforcer:
         status_code=200,
         text_content=new_robots_text
     )
+    
+    if domain in politeness_enforcer.robots_parsers:
+        del politeness_enforcer.robots_parsers[domain]
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        rerp = await politeness_enforcer._get_robots_for_domain(domain)
+
+        # Assertions for the first DB call (get cache)
+        mock_sqlite_connect.assert_any_call(politeness_enforcer.storage.db_path, timeout=10)
+        
+        # There will be two calls to cursor(): one for get, one for update.
+        # We care about the execute calls on the cursor instances.
+        # fetchone is called by _db_get_cached_robots_sync_threaded
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
     assert rerp is not None
     # Check if it's using the new rules
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/new") is False
@@ -201,21 +221,39 @@ async def test_get_robots_db_cache_stale_then_fetch_success(politeness_enforcer:
     
     politeness_enforcer.fetcher.fetch_url.assert_called_once_with(f"http://{domain}/robots.txt", is_robots_txt=True)
     
-    # Check if DB was updated (execute called for INSERT/IGNORE then UPDATE)
-    update_calls = [call for call in mock_cursor.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
-    args, _ = update_calls[0]
+    # Check if DB was updated (execute called for INSERT/IGNORE then UPDATE by _db_update_robots_cache_sync_threaded)
+    # mock_db_cursor_instance was used for both the read and the write operations due to the single mock_db_conn_instance.
+    # We need to check all execute calls on this cursor.
+    
+    # The first execute call is from _db_get_cached_robots_sync_threaded
+    # The next two execute calls are from _db_update_robots_cache_sync_threaded
+    assert mock_db_cursor_instance.execute.call_count >= 3 # SELECT, INSERT OR IGNORE, UPDATE
+    
+    update_calls = [call for call in mock_db_cursor_instance.execute.call_args_list 
+                    if "UPDATE domain_metadata" in call[0][0]]
+    assert len(update_calls) > 0, "UPDATE domain_metadata call was not found"
+    
+    args, _ = update_calls[0] # First UPDATE call
     assert args[1][0] == new_robots_text # Check content being updated
     assert args[1][3] == domain # Check domain being updated
-    politeness_enforcer.storage.conn.commit.assert_called() 
+    
+    # Ensure commit was called on the connection instance used by the update thread
+    mock_db_conn_instance.commit.assert_called_once()
+    assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
 async def test_get_robots_no_cache_fetch_http_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "newfetch.com"
-    robots_text = "User-agent: *\nAllow: /"
+    robots_text = "User-agent: *\\nAllow: /"
 
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    mock_cursor.fetchone.return_value = None # No DB cache
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_cursor_instance.fetchone.return_value = None # No DB cache for _db_get_cached_robots_sync_threaded
+
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
+    
     politeness_enforcer.robots_parsers.pop(domain, None) # Ensure no memory cache
 
     politeness_enforcer.fetcher.fetch_url.return_value = FetchResult(
@@ -225,41 +263,61 @@ async def test_get_robots_no_cache_fetch_http_success(politeness_enforcer: Polit
         text_content=robots_text
     )
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        rerp = await politeness_enforcer._get_robots_for_domain(domain)
+
+        mock_sqlite_connect.assert_any_call(politeness_enforcer.storage.db_path, timeout=10)
+        # fetchone from _db_get_cached_robots_sync_threaded
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
+
     assert rerp is not None
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/anypage") is True
     politeness_enforcer.fetcher.fetch_url.assert_called_once_with(f"http://{domain}/robots.txt", is_robots_txt=True)
-    # Check DB update
-    update_calls = [call for call in mock_cursor.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
+    
+    # Check DB update by _db_update_robots_cache_sync_threaded
+    update_calls = [call for call in mock_db_cursor_instance.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
+    assert len(update_calls) > 0, "UPDATE domain_metadata call was not found"
+    args, _ = update_calls[0]
+    assert args[1][0] == robots_text
+    mock_db_conn_instance.commit.assert_called_once()
+    assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
 async def test_get_robots_http_fail_then_https_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "httpsfallback.com"
-    robots_text_https = "User-agent: *\nDisallow: /onlyhttps"
+    robots_text_https = "User-agent: *\\nDisallow: /onlyhttps"
 
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    mock_cursor.fetchone.return_value = None # No DB cache
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_cursor_instance.fetchone.return_value = None # No DB cache
+
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
+
     politeness_enforcer.robots_parsers.pop(domain, None) # Ensure no memory cache
 
-    # Simulate HTTP fetch failure (e.g., connection error or 500)
     fetch_result_http = FetchResult(
         initial_url=f"http://{domain}/robots.txt",
         final_url=f"http://{domain}/robots.txt",
-        status_code=500, # Or a connection error status if we define one
+        status_code=500,
         error_message="HTTP fetch failed"
     )
-    # Simulate HTTPS fetch success
     fetch_result_https = FetchResult(
         initial_url=f"https://{domain}/robots.txt",
         final_url=f"https://{domain}/robots.txt",
         status_code=200,
         text_content=robots_text_https
     )
-
     politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_result_http, fetch_result_https]
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        rerp = await politeness_enforcer._get_robots_for_domain(domain)
+        mock_sqlite_connect.assert_any_call(politeness_enforcer.storage.db_path, timeout=10)
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
+
     assert rerp is not None
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/onlyhttps") is False
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/allowed") is True
@@ -267,18 +325,27 @@ async def test_get_robots_http_fail_then_https_success(politeness_enforcer: Poli
     assert politeness_enforcer.fetcher.fetch_url.call_count == 2
     politeness_enforcer.fetcher.fetch_url.assert_any_call(f"http://{domain}/robots.txt", is_robots_txt=True)
     politeness_enforcer.fetcher.fetch_url.assert_any_call(f"https://{domain}/robots.txt", is_robots_txt=True)
+    
     # Check DB update with HTTPS content
-    update_calls = [call for call in mock_cursor.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
+    update_calls = [call for call in mock_db_cursor_instance.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
+    assert len(update_calls) > 0, "UPDATE domain_metadata call was not found"
     args, _ = update_calls[0]
     assert args[1][0] == robots_text_https
+    mock_db_conn_instance.commit.assert_called_once()
+    assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
 async def test_get_robots_http_404_https_404(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "all404.com"
 
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    mock_cursor.fetchone.return_value = None # No DB cache
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_cursor_instance.fetchone.return_value = None # No DB cache
+
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
+
     politeness_enforcer.robots_parsers.pop(domain, None) # Ensure no memory cache
 
     fetch_result_404 = FetchResult(
@@ -286,22 +353,35 @@ async def test_get_robots_http_404_https_404(politeness_enforcer: PolitenessEnfo
     )
     politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_result_404, fetch_result_404]
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        rerp = await politeness_enforcer._get_robots_for_domain(domain)
+        mock_sqlite_connect.assert_any_call(politeness_enforcer.storage.db_path, timeout=10)
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
     assert rerp is not None
-    # Should allow everything if robots.txt is 404
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/anypage") is True
     assert politeness_enforcer.fetcher.fetch_url.call_count == 2
+    
     # Check DB update with empty string for content
-    update_calls = [call for call in mock_cursor.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
+    update_calls = [call for call in mock_db_cursor_instance.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
+    assert len(update_calls) > 0, "UPDATE domain_metadata call was not found"
     args, _ = update_calls[0]
     assert args[1][0] == "" # Empty string for 404
+    mock_db_conn_instance.commit.assert_called_once()
+    assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
 async def test_get_robots_all_fetches_fail_connection_error(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "allconnectfail.com"
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    mock_cursor.fetchone.return_value = None 
+    
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_cursor_instance.fetchone.return_value = None # No DB cache
+
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
+    
     politeness_enforcer.robots_parsers.pop(domain, None)
 
     fetch_fail_result = FetchResult(
@@ -309,15 +389,22 @@ async def test_get_robots_all_fetches_fail_connection_error(politeness_enforcer:
     )
     politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_fail_result, fetch_fail_result]
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        rerp = await politeness_enforcer._get_robots_for_domain(domain)
+        mock_sqlite_connect.assert_any_call(politeness_enforcer.storage.db_path, timeout=10)
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
     assert rerp is not None
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/anything") is True # Default to allow if all fails
     assert politeness_enforcer.fetcher.fetch_url.call_count == 2
+    
     # DB should still be updated, likely with empty content
-    update_calls = [call for call in mock_cursor.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
+    update_calls = [call for call in mock_db_cursor_instance.execute.call_args_list if "UPDATE domain_metadata" in call[0][0]]
+    assert len(update_calls) > 0, "UPDATE domain_metadata call was not found"
     args, _ = update_calls[0]
     assert args[1][0] == ""
+    mock_db_conn_instance.commit.assert_called_once()
+    assert domain in politeness_enforcer.robots_parsers
 
 # --- Tests for is_url_allowed (async) ---
 @pytest.mark.asyncio
@@ -325,12 +412,27 @@ async def test_is_url_allowed_manually_excluded(politeness_enforcer: PolitenessE
     domain = "manualexclude.com"
     url = f"http://{domain}/somepage"
     
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    # Simulate domain is manually excluded in DB
-    mock_cursor.fetchone.return_value = (1,) # is_manually_excluded = 1
+    # Mock the database interaction within the threaded function
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    # Simulate domain is manually excluded in DB for _db_check_manual_exclusion_sync_threaded
+    mock_db_cursor_instance.fetchone.return_value = (1,) # is_manually_excluded = 1
+    
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
 
-    assert await politeness_enforcer.is_url_allowed(url) is False
-    # Ensure _get_robots_for_domain is NOT called if manually excluded
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        is_allowed = await politeness_enforcer.is_url_allowed(url)
+
+        mock_sqlite_connect.assert_called_once_with(politeness_enforcer.storage.db_path, timeout=10)
+        mock_db_cursor_instance.execute.assert_called_once_with(
+            "SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,)
+        )
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
+    assert is_allowed is False
+    # Ensure _get_robots_for_domain is NOT called if manually excluded, so fetcher shouldn't be called by it.
     politeness_enforcer.fetcher.fetch_url.assert_not_called() 
 
 @pytest.mark.asyncio
@@ -511,33 +613,60 @@ async def test_can_fetch_domain_now_db_error(politeness_enforcer: PolitenessEnfo
 @pytest.mark.asyncio
 async def test_record_domain_fetch_attempt_new_domain(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "recordnew.com"
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
     
-    await politeness_enforcer.record_domain_fetch_attempt(domain)
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
 
-    # Check for INSERT OR IGNORE then UPDATE
-    # The exact timestamp will vary, so we check the structure of the calls
-    assert mock_cursor.execute.call_count == 2
-    mock_cursor.execute.assert_any_call(
-        "INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
-        (domain, pytest.approx(int(time.time()), abs=2)) # Allow small time diff
-    )
-    mock_cursor.execute.assert_any_call(
-        "UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
-        (pytest.approx(int(time.time()), abs=2), domain)
-    )
-    politeness_enforcer.storage.conn.commit.assert_called_once()
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        await politeness_enforcer.record_domain_fetch_attempt(domain)
+
+        mock_sqlite_connect.assert_called_once_with(politeness_enforcer.storage.db_path, timeout=10)
+        # Check for INSERT OR IGNORE then UPDATE
+        assert mock_db_cursor_instance.execute.call_count == 2
+        current_time_val = pytest.approx(int(time.time()), abs=2) # Allow small time diff
+        
+        mock_db_cursor_instance.execute.assert_any_call(
+            "INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
+            (domain, current_time_val)
+        )
+        mock_db_cursor_instance.execute.assert_any_call(
+            "UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
+            (current_time_val, domain)
+        )
+        mock_db_conn_instance.commit.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_record_domain_fetch_attempt_existing_domain(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "recordexisting.com"
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    # Simulate domain already exists, INSERT OR IGNORE might do nothing or 1 row, UPDATE does 1 row
-    
-    await politeness_enforcer.record_domain_fetch_attempt(domain)
 
-    assert mock_cursor.execute.call_count == 2
-    politeness_enforcer.storage.conn.commit.assert_called_once()
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
+    
+    # Simulate domain already exists, INSERT OR IGNORE might do nothing or 1 row, UPDATE does 1 row
+    # The behavior of execute calls should be the same (2 calls)
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        await politeness_enforcer.record_domain_fetch_attempt(domain)
+    
+        mock_sqlite_connect.assert_called_once_with(politeness_enforcer.storage.db_path, timeout=10)
+        assert mock_db_cursor_instance.execute.call_count == 2
+        current_time_val = pytest.approx(int(time.time()), abs=2)
+        mock_db_cursor_instance.execute.assert_any_call(
+            "INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
+            (domain, current_time_val)
+        )
+        mock_db_cursor_instance.execute.assert_any_call(
+            "UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
+            (current_time_val, domain)
+        )
+        mock_db_conn_instance.commit.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_record_domain_fetch_attempt_db_error(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
