@@ -252,9 +252,9 @@ class PolitenessEnforcer:
     async def can_fetch_domain_now(self, domain: str) -> bool:
         """Checks if the domain can be fetched based on last fetch time and crawl delay."""
         db_path = self.storage.db_path
-        if not self.storage.conn:
-            logger.error("Cannot check fetch_domain_now, no DB connection.")
-            return False
+        # Removed: if not self.storage.conn:
+        # logger.error("Cannot check fetch_domain_now, no DB connection.")
+        # return False
 
         last_fetch_time = 0
         try:
@@ -284,9 +284,9 @@ class PolitenessEnforcer:
     async def record_domain_fetch_attempt(self, domain: str):
         """Records that we are about to fetch (or have fetched) from a domain."""
         db_path = self.storage.db_path
-        if not self.storage.conn:
-            logger.error("Cannot record domain fetch, no DB connection.")
-            return
+        # Removed: if not self.storage.conn:
+        # logger.error("Cannot record domain fetch, no DB connection.")
+        # return
         try:
             current_time = int(time.time())
             def _db_record_fetch_sync_threaded():

@@ -244,7 +244,7 @@ async def test_get_robots_db_cache_stale_then_fetch_success(politeness_enforcer:
 @pytest.mark.asyncio
 async def test_get_robots_no_cache_fetch_http_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "newfetch.com"
-    robots_text = "User-agent: *\\nAllow: /"
+    robots_text = "User-agent: *\nAllow: /"
 
     mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
     mock_db_cursor_instance.fetchone.return_value = None # No DB cache for _db_get_cached_robots_sync_threaded
@@ -286,7 +286,7 @@ async def test_get_robots_no_cache_fetch_http_success(politeness_enforcer: Polit
 @pytest.mark.asyncio
 async def test_get_robots_http_fail_then_https_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "httpsfallback.com"
-    robots_text_https = "User-agent: *\\nDisallow: /onlyhttps"
+    robots_text_https = "User-agent: *\nDisallow: /onlyhttps"
 
     mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
     mock_db_cursor_instance.fetchone.return_value = None # No DB cache
@@ -564,28 +564,56 @@ async def test_get_crawl_delay_respects_min_crawl_delay(politeness_enforcer: Pol
 @pytest.mark.asyncio
 async def test_can_fetch_domain_now_no_previous_fetch(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "newdomain.com"
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    mock_cursor.fetchone.return_value = None # No record of last fetch
+    
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_cursor_instance.fetchone.return_value = None # No record of last fetch in _db_get_last_fetch_sync_threaded
+    
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
 
-    # Mock get_crawl_delay to return our default for simplicity here
-    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=float(MIN_CRAWL_DELAY_SECONDS)) # type: ignore
+    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=float(MIN_CRAWL_DELAY_SECONDS))
 
-    assert await politeness_enforcer.can_fetch_domain_now(domain) is True
-    mock_cursor.execute.assert_called_once_with(
-        "SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,)
-    )
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        can_fetch = await politeness_enforcer.can_fetch_domain_now(domain)
+
+        mock_sqlite_connect.assert_called_once_with(politeness_enforcer.storage.db_path, timeout=10)
+        mock_db_cursor_instance.execute.assert_called_once_with(
+            "SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,)
+        )
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
+    assert can_fetch is True
+
 
 @pytest.mark.asyncio
 async def test_can_fetch_domain_now_after_sufficient_delay(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "readyagain.com"
-    crawl_delay_val = 30.0 # Assume this is the effective delay
-    last_fetch = int(time.time()) - int(crawl_delay_val) - 1 # Last fetch was just over delay ago
+    crawl_delay_val = 30.0
+    last_fetch = int(time.time()) - int(crawl_delay_val) - 1 
 
-    mock_cursor = politeness_enforcer.storage.conn.cursor.return_value.__enter__.return_value
-    mock_cursor.fetchone.return_value = (last_fetch,)
-    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=crawl_delay_val) # type: ignore
+    mock_db_cursor_instance = MagicMock(spec=sqlite3.Cursor)
+    mock_db_cursor_instance.fetchone.return_value = (last_fetch,) # Last fetch was just over delay ago
+    
+    mock_db_conn_instance = MagicMock(spec=sqlite3.Connection)
+    mock_db_conn_instance.cursor.return_value = mock_db_cursor_instance
+    mock_db_conn_instance.__enter__.return_value = mock_db_conn_instance
+    mock_db_conn_instance.__exit__.return_value = None
 
-    assert await politeness_enforcer.can_fetch_domain_now(domain) is True
+    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=crawl_delay_val)
+
+    with patch('sqlite3.connect', return_value=mock_db_conn_instance) as mock_sqlite_connect:
+        can_fetch = await politeness_enforcer.can_fetch_domain_now(domain)
+        
+        mock_sqlite_connect.assert_called_once_with(politeness_enforcer.storage.db_path, timeout=10)
+        mock_db_cursor_instance.execute.assert_called_once_with(
+            "SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,)
+        )
+        mock_db_cursor_instance.fetchone.assert_called_once()
+
+    assert can_fetch is True
+
 
 @pytest.mark.asyncio
 async def test_can_fetch_domain_now_insufficient_delay(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
