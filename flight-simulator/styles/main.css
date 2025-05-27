@@ -1,0 +1,186 @@
+/* Cartoon Flight Simulator Styles */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Arial', sans-serif;
+    overflow: hidden;
+    background: #87CEEB; /* Sky blue */
+}
+
+#app {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+}
+
+#game-canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+/* HUD Styles */
+#hud {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 20px;
+    border-radius: 20px;
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+    border: 3px solid #333;
+    font-weight: bold;
+}
+
+.hud-item {
+    margin: 10px 0;
+    font-size: 18px;
+    color: #333;
+}
+
+.hud-item .label {
+    color: #666;
+    margin-right: 10px;
+}
+
+.hud-item .value {
+    color: #FF6B6B;
+    font-size: 24px;
+    margin: 0 5px;
+    font-family: 'Courier New', monospace;
+}
+
+.hud-item .unit {
+    color: #666;
+    font-size: 14px;
+}
+
+/* Controls Help */
+#controls-help {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 20px;
+    border-radius: 20px;
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+    border: 3px solid #333;
+    transition: transform 0.3s ease;
+}
+
+#controls-help.hidden {
+    transform: translateX(120%);
+}
+
+#controls-help h3 {
+    color: #4ECDC4;
+    margin-bottom: 15px;
+    font-size: 24px;
+    text-align: center;
+}
+
+.control-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.control-group div {
+    font-size: 14px;
+    color: #333;
+}
+
+kbd {
+    background: #FFE66D;
+    padding: 3px 8px;
+    border-radius: 8px;
+    font-weight: bold;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    margin: 0 3px;
+    display: inline-block;
+    min-width: 25px;
+    text-align: center;
+    border: 2px solid #333;
+}
+
+/* Loading Screen */
+#loading {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+    transition: opacity 0.5s ease;
+}
+
+#loading.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.loader {
+    text-align: center;
+}
+
+.plane-icon {
+    font-size: 80px;
+    animation: fly 2s ease-in-out infinite;
+}
+
+@keyframes fly {
+    0%, 100% {
+        transform: translateY(0) rotate(-5deg);
+    }
+    50% {
+        transform: translateY(-20px) rotate(5deg);
+    }
+}
+
+.loader p {
+    color: white;
+    font-size: 24px;
+    margin-top: 20px;
+    font-weight: bold;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    #hud {
+        top: 10px;
+        left: 10px;
+        padding: 15px;
+    }
+
+    .hud-item {
+        font-size: 14px;
+    }
+
+    .hud-item .value {
+        font-size: 18px;
+    }
+
+    #controls-help {
+        top: auto;
+        bottom: 10px;
+        right: 10px;
+        max-width: 200px;
+    }
+
+    #controls-help h3 {
+        font-size: 18px;
+    }
+
+    .control-group div {
+        font-size: 12px;
+    }
+} 

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cartoon Flight Simulator</title>
+    <link rel="stylesheet" href="/styles/main.css">
+</head>
+<body>
+    <div id="app">
+        <canvas id="game-canvas"></canvas>
+        
+        <!-- HUD -->
+        <div id="hud">
+            <div class="hud-item">
+                <span class="label">Speed</span>
+                <span id="speed" class="value">0</span>
+                <span class="unit">km/h</span>
+            </div>
+            <div class="hud-item">
+                <span class="label">Altitude</span>
+                <span id="altitude" class="value">0</span>
+                <span class="unit">m</span>
+            </div>
+            <div class="hud-item">
+                <span class="label">Throttle</span>
+                <span id="throttle" class="value">0</span>
+                <span class="unit">%</span>
+            </div>
+        </div>
+
+        <!-- Controls Help -->
+        <div id="controls-help">
+            <h3>Controls</h3>
+            <div class="control-group">
+                <div><kbd>W</kbd>/<kbd>S</kbd> - Pitch</div>
+                <div><kbd>A</kbd>/<kbd>D</kbd> - Roll</div>
+                <div><kbd>Q</kbd>/<kbd>E</kbd> - Yaw</div>
+                <div><kbd>↑</kbd>/<kbd>↓</kbd> - Throttle</div>
+                <div><kbd>Space</kbd> - Reset</div>
+                <div><kbd>C</kbd> - Change Camera</div>
+                <div><kbd>H</kbd> - Toggle Help</div>
+            </div>
+        </div>
+
+        <!-- Loading Screen -->
+        <div id="loading">
+            <div class="loader">
+                <div class="plane-icon">✈️</div>
+                <p>Loading Flight Simulator...</p>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html> 
