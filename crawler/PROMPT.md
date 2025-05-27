@@ -11,3 +11,9 @@ Non goals:
 The key parts of the program should be written in Python, but feel free to use non-Python modules or dependencies where needed. However, as the project is educational, we should try to maintain consistency and clean design.
 
 Work only within the `crawler` folder. Do not edit any files outside. Create a plan including the architecture, writing to `PLAN.MD`, and ask for my approval before beginning to code. In the plan, feel free to add any features which you feel are important, but make sure to honor the theme of education/simplicity. The crawler will be deployed to a cloud machine running linux (ubuntu); feel free to ask additional questions and provide suggestions about the running of the crawler while making the plan. 
+
+## Meta
+
+- Cursor agent mode
+- Gemini 2.5 Pro MAX
+- 304 requests
