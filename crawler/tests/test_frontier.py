@@ -31,7 +31,7 @@ class FrontierTestConfig:
     log_level: str = "DEBUG"
     resume: bool = False
     user_agent: str = "FrontierTestCrawler/1.0"
-
+    seeded_urls_only: bool = False
 @pytest_asyncio.fixture
 async def temp_test_frontier_dir(tmp_path: Path) -> Path:
     test_data_dir = tmp_path / "test_crawler_data_frontier"

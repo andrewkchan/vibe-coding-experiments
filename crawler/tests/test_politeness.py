@@ -24,7 +24,8 @@ def dummy_config(tmp_path: Path) -> CrawlerConfig:
         max_duration=None,
         log_level="DEBUG",
         resume=False,
-        user_agent="TestCrawler/1.0 (pytest)"
+        user_agent="TestCrawler/1.0 (pytest)",
+        seeded_urls_only=False
     )
 
 @pytest.fixture

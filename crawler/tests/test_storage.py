@@ -41,7 +41,8 @@ def dummy_config(temp_test_dir: Path) -> CrawlerConfig:
         max_duration=None,
         log_level="DEBUG",
         resume=False,
-        user_agent="StorageTestCrawler/1.0"
+        user_agent="StorageTestCrawler/1.0",
+        seeded_urls_only=False
     )
     logger.debug(f"Created dummy config with data_dir: {cfg.data_dir}")
     return cfg
