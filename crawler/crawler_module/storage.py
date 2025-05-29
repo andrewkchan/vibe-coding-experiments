@@ -101,7 +101,8 @@ class StorageManager:
                         robots_txt_content TEXT,
                         robots_txt_fetched_timestamp INTEGER,
                         robots_txt_expires_timestamp INTEGER,
-                        is_manually_excluded INTEGER DEFAULT 0
+                        is_manually_excluded INTEGER DEFAULT 0,
+                        is_seeded INTEGER DEFAULT 0
                     )
                     """)
                     

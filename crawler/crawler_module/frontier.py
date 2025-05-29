@@ -60,6 +60,18 @@ class FrontierManager:
             await self._clear_frontier_db() # Already refactored to be thread-safe
             await self._load_seeds() # add_url within is now thread-safe for DB ops
 
+    def _mark_domain_as_seeded(self, domain: str):
+        """Marks a domain as seeded in the domain_metadata table."""
+        with sqlite3.connect(self.storage.db_path, timeout=10) as conn_threaded:
+            try:
+                cursor = conn_threaded.cursor()
+                cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
+                cursor.execute("UPDATE domain_metadata SET is_seeded = 1 WHERE domain = ?", (domain,))
+                conn_threaded.commit()
+                logger.debug(f"Marked domain {domain} as seeded in DB.")
+            finally:
+                cursor.close()
+    
     async def _load_seeds(self):
         """Reads seed URLs from the seed file and adds them to the frontier."""
         if not self.config.seed_file.exists():
@@ -67,13 +79,28 @@ class FrontierManager:
             return
 
         added_count = 0
+        urls = []
+        async def _seed_worker(start, end):
+            nonlocal added_count
+            for url in urls[start: end]:
+                await self.add_url(url)
+                added_count +=1
+                # Also mark domain as is_seeded = 1 in domain_metadata table
+                domain = extract_domain(url)
+                await asyncio.to_thread(self._mark_domain_as_seeded, domain)
         try:
             with open(self.config.seed_file, 'r') as f:
                 for line in f:
                     url = line.strip()
                     if url and not url.startswith("#"):
-                        await self.add_url(url)
-                        added_count +=1
+                        urls.append(url)
+            num_per_worker = (len(urls) + self.config.max_workers - 1)//self.config.max_workers
+            seed_workers = []
+            for i in range(self.config.max_workers):
+                start = i * num_per_worker
+                end = (i + 1) * num_per_worker
+                seed_workers.append(_seed_worker(start, end))
+            await asyncio.gather(*seed_workers)
             logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
         except IOError as e:
             logger.error(f"Error reading seed file {self.config.seed_file}: {e}")

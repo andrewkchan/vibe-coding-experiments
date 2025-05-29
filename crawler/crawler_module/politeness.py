@@ -204,7 +204,10 @@ class PolitenessEnforcer:
                 with sqlite3.connect(db_path, timeout=10) as conn_threaded:
                     cursor = conn_threaded.cursor()
                     try:
-                        cursor.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
+                        if self.config.seeded_urls_only:
+                            cursor.execute("SELECT is_manually_excluded OR NOT is_seeded FROM domain_metadata WHERE domain = ?", (domain,))
+                        else:
+                            cursor.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
                         return cursor.fetchone()
                     finally:
                         cursor.close()
