@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_DATA_DIR = "./crawler_data"
-DEFAULT_MAX_WORKERS = 50
+DEFAULT_MAX_WORKERS = 20
 DEFAULT_LOG_LEVEL = "INFO"
 
 @dataclass
