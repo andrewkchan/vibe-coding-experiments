@@ -74,12 +74,12 @@ class Fetcher:
                             text_content = content_bytes.decode(detected_encoding, errors='replace')
                         else:
                             # Fallback to aiohttp's guessed encoding or utf-8
-                            text_content = response.text(errors='replace') # response.text() re-reads if not careful
+                            text_content = await response.text(errors='replace') # response.text() re-reads if not careful
                     except (UnicodeDecodeError, LookupError, TypeError) as e:
                         logger.warning(f"Encoding detection/decoding error for {actual_final_url}: {e}. Falling back.")
                         try:
                             # Fallback to requests library style (chardet, then utf-8)
-                            text_content = response.text(errors='replace') 
+                            text_content = await response.text(errors='replace') 
                         except Exception as ex_inner:
                              logger.error(f"Final fallback decoding error for {actual_final_url}: {ex_inner}")
                              text_content = "DECODING_ERROR"
