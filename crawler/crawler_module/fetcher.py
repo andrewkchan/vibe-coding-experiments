@@ -33,11 +33,19 @@ class Fetcher:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Returns the existing aiohttp session or creates a new one."""
         if self.session is None or self.session.closed:
+            # Create a connector with reasonable limits to prevent resource exhaustion
+            connector = aiohttp.TCPConnector(
+                limit=200,  # Total connection pool limit (across all hosts)
+                limit_per_host=30,  # Max connections per host
+                ttl_dns_cache=300,  # DNS cache timeout in seconds
+                enable_cleanup_closed=True,  # Clean up closed connections
+                force_close=True,  # Force close connections after each request to free up FDs
+            )
+            
             self.session = aiohttp.ClientSession(
                 timeout=self.timeout,
                 headers={"User-Agent": self.config.user_agent},
-                # Enable brotli compression if available, aiohttp handles others by default
-                # connector=aiohttp.TCPConnector(enable_brotlipy=True) # requires brotlipy
+                connector=connector,
             )
             logger.debug("Created new aiohttp.ClientSession")
         return self.session
@@ -74,12 +82,12 @@ class Fetcher:
                             text_content = content_bytes.decode(detected_encoding, errors='replace')
                         else:
                             # Fallback to aiohttp's guessed encoding or utf-8
-                            text_content = response.text(errors='replace') # response.text() re-reads if not careful
+                            text_content = await response.text(errors='replace') # response.text() re-reads if not careful
                     except (UnicodeDecodeError, LookupError, TypeError) as e:
                         logger.warning(f"Encoding detection/decoding error for {actual_final_url}: {e}. Falling back.")
                         try:
                             # Fallback to requests library style (chardet, then utf-8)
-                            text_content = response.text(errors='replace') 
+                            text_content = await response.text(errors='replace') 
                         except Exception as ex_inner:
                              logger.error(f"Final fallback decoding error for {actual_final_url}: {ex_inner}")
                              text_content = "DECODING_ERROR"

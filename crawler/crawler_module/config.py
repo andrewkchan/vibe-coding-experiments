@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_DATA_DIR = "./crawler_data"
-DEFAULT_MAX_WORKERS = 50
+DEFAULT_MAX_WORKERS = 20
 DEFAULT_LOG_LEVEL = "INFO"
 
 @dataclass
@@ -19,6 +19,7 @@ class CrawlerConfig:
     log_level: str
     resume: bool
     user_agent: str # Will be constructed
+    seeded_urls_only: bool
 
 def parse_args() -> CrawlerConfig:
     parser = argparse.ArgumentParser(description="An experimental web crawler.")
@@ -77,6 +78,11 @@ def parse_args() -> CrawlerConfig:
         action="store_true",
         help="Attempt to resume from existing data in data-dir. If not set and data-dir exists, crawler may exit."
     )
+    parser.add_argument(
+        "--seeded-urls-only",
+        action="store_true",
+        help="Only crawl seeded URLs."
+    )
 
     args = parser.parse_args()
     
@@ -95,5 +101,6 @@ def parse_args() -> CrawlerConfig:
         max_duration=args.max_duration,
         log_level=args.log_level.upper(), # Ensure log level is uppercase for logging module
         resume=args.resume,
-        user_agent=user_agent
+        user_agent=user_agent,
+        seeded_urls_only=args.seeded_urls_only
     ) 

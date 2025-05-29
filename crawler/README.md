@@ -60,7 +60,7 @@ python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com
 
 *   `--data-dir <path>`: Directory for database and content (default: `./crawler_data`).
 *   `--exclude-file <path>`: File of domains to exclude.
-*   `--max-workers <int>`: Number of concurrent fetchers (default: 50).
+*   `--max-workers <int>`: Number of concurrent fetchers (default: 20).
 *   `--max-pages <int>`: Max pages to crawl.
 *   `--max-duration <seconds>`: Max crawl duration.
 *   `--log-level <LEVEL>`: DEBUG, INFO, WARNING, ERROR (default: INFO).
