@@ -27,9 +27,17 @@ class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
         self.config = config
         
+        data_dir_path = Path(config.data_dir)
+        try:
+            data_dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Ensured data directory exists: {data_dir_path}")
+        except OSError as e:
+            logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
+            raise # Stop if we can't create data directory
+
         # Initialize DB Pool first
         self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
-            db_path=Path(config.data_dir) / "crawler_state.db",
+            db_path=data_dir_path / "crawler_state.db", # Use the Path object
             pool_size=config.max_workers, # Pool size can be linked to max_workers
             wal_mode=True # Enable WAL mode for better concurrency by default
         )
