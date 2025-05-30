@@ -65,6 +65,7 @@ python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com
 *   `--max-duration <seconds>`: Max crawl duration.
 *   `--log-level <LEVEL>`: DEBUG, INFO, WARNING, ERROR (default: INFO).
 *   `--resume`: Attempt to resume from existing data.
+*   `--seeded-urls-only`: Only crawl seeded URLs.
 
 ## Running Tests
 
