@@ -3,6 +3,8 @@ import logging
 import time
 from pathlib import Path
 from typing import Set, Optional
+import os # For process ID
+import psutil
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -154,6 +156,7 @@ class CrawlerOrchestrator:
     async def run_crawl(self):
         self.start_time = time.time()
         logger.info(f"Crawler starting with config: {self.config}")
+        current_process = psutil.Process(os.getpid())
 
         try:
             # Initialize frontier (loads seeds etc.)
@@ -183,6 +186,34 @@ class CrawlerOrchestrator:
                     break
                 
                 current_frontier_size = await asyncio.to_thread(self.frontier.count_frontier)
+                active_workers = sum(1 for task in self.worker_tasks if not task.done())
+                
+                # Resource monitoring
+                rss_mem_mb = "N/A"
+                fds_count = "N/A"
+                if current_process:
+                    try:
+                        rss_mem_bytes = current_process.memory_info().rss
+                        rss_mem_mb = f"{rss_mem_bytes / (1024 * 1024):.2f} MB"
+                        fds_count = current_process.num_fds()
+                    except psutil.Error as e:
+                        logger.warning(f"psutil error during resource monitoring: {e}")
+                        # Fallback or disable further psutil calls for this iteration if needed
+                
+                pool_connections = self.db_pool._pool.qsize() if self.db_pool and hasattr(self.db_pool, '_pool') else "N/A"
+
+                status_parts = [
+                    f"Crawled={self.pages_crawled_count}",
+                    f"Frontier={current_frontier_size}",
+                    f"AddedToFrontier={self.total_urls_added_to_frontier}",
+                    f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
+                    f"DBPoolConns={pool_connections}",
+                    f"MemRSS={rss_mem_mb}",
+                    f"OpenFDs={fds_count}",
+                    f"Runtime={(time.time() - self.start_time):.0f}s"
+                ]
+                logger.info(f"Status: {', '.join(status_parts)}")
+                
                 # If frontier is empty and workers might be idle, it could be a natural end
                 # This condition needs to be careful not to prematurely shut down if workers are just between tasks.
                 # A more robust check would involve seeing if workers are truly blocked on an empty frontier for a while.
@@ -196,8 +227,6 @@ class CrawlerOrchestrator:
                         self._shutdown_event.set()
                         break
 
-                logger.info(f"Status: Crawled={self.pages_crawled_count}, Frontier={current_frontier_size}, AddedToFrontier={self.total_urls_added_to_frontier}, Runtime={(time.time() - self.start_time):.0f}s")
-                
                 if self._check_stopping_conditions(): # Check global conditions again
                     self._shutdown_event.set()
 
