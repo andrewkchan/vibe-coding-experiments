@@ -7,23 +7,24 @@ import asyncio # For to_thread if needed for DB, and for async file saving
 import aiofiles # For async file operations
 
 from .config import CrawlerConfig # Assuming config.py is in the same directory
+from .db_pool import SQLiteConnectionPool
 
 logger = logging.getLogger(__name__)
 
 DB_SCHEMA_VERSION = 1
 
 class StorageManager:
-    def __init__(self, config: CrawlerConfig):
+    def __init__(self, config: CrawlerConfig, db_pool: SQLiteConnectionPool):
         self.config = config
         self.data_dir = Path(config.data_dir)
         self.db_path = self.data_dir / "crawler_state.db"
         self.content_dir = self.data_dir / "content"
-        self.conn = None
+        self.db_pool = db_pool
 
         self._init_storage()
 
     def _init_storage(self):
-        """Initializes the data directory, content directory, and database."""
+        """Initializes the data directory, content directory, and database schema."""
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             self.content_dir.mkdir(parents=True, exist_ok=True)
@@ -32,93 +33,98 @@ class StorageManager:
             logger.error(f"Error creating storage directories: {e}")
             raise
 
-        self._init_db()
+        self._init_db_schema()
 
-    def _init_db(self):
-        """Initializes the SQLite database and creates tables if they don't exist."""
+    def _init_db_schema(self):
+        """Initializes the SQLite database schema if it doesn't exist or needs upgrade."""
+        # This method will now be called from the main thread (Orchestrator init)
+        # or at least a context where it's okay to block for a short while.
+        # It uses a connection from the pool.
         try:
-            self.conn = sqlite3.connect(self.db_path, timeout=10) # Increased timeout
-            logger.info(f"Connected to database: {self.db_path}")
-            self._create_tables()
+            # Get a connection from the pool for schema initialization
+            with self.db_pool as conn: # Use context manager for get/return
+                logger.info(f"Initializing database schema using connection from pool: {self.db_path}")
+                self._create_tables(conn)
         except sqlite3.Error as e:
-            logger.error(f"Database error during initialization: {e}")
-            if self.conn:
-                self.conn.close()
+            logger.error(f"Database error during schema initialization with pool: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to get connection from pool for schema init: {e}")
             raise
 
-    def _create_tables(self):
+
+    def _create_tables(self, conn: sqlite3.Connection): # Takes a connection argument
         """Creates the necessary tables in the database if they don't already exist."""
-        if not self.conn:
-            raise sqlite3.Error("Database connection not established.")
+        cursor = conn.cursor() # Create cursor from the provided connection
+        try:
+            # Check current schema version
+            cursor.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
+            cursor.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
+            row = cursor.fetchone()
+            current_version = row[0] if row else 0
 
-        with self.conn as conn: # Use context manager for cursor and commit/rollback
-            cursor = conn.cursor()
+            if current_version < DB_SCHEMA_VERSION:
+                logger.info(f"Database schema version is {current_version}. Upgrading to {DB_SCHEMA_VERSION}.")
+                
+                # Frontier Table
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS frontier (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL,
+                    domain TEXT NOT NULL,
+                    depth INTEGER DEFAULT 0,
+                    added_timestamp INTEGER NOT NULL,
+                    priority_score REAL DEFAULT 0
+                )
+                """)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)")
+
+                # Visited URLs Table
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS visited_urls (
+                    url_sha256 TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    crawled_timestamp INTEGER NOT NULL,
+                    http_status_code INTEGER,
+                    content_type TEXT,
+                    content_hash TEXT,
+                    content_storage_path TEXT,
+                    redirected_to_url TEXT
+                )
+                """)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_visited_domain ON visited_urls (domain)")
+
+                # Domain Metadata Table
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS domain_metadata (
+                    domain TEXT PRIMARY KEY,
+                    last_scheduled_fetch_timestamp INTEGER DEFAULT 0,
+                    robots_txt_content TEXT,
+                    robots_txt_fetched_timestamp INTEGER,
+                    robots_txt_expires_timestamp INTEGER,
+                    is_manually_excluded INTEGER DEFAULT 0,
+                    is_seeded INTEGER DEFAULT 0
+                )
+                """)
+                
+                # Update schema version
+                cursor.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (DB_SCHEMA_VERSION,))
+                conn.commit() # Commit changes
+                logger.info("Database tables created/updated successfully.")
+            else:
+                logger.info(f"Database schema is up to date (version {current_version}).")
+
+        except sqlite3.Error as e:
+            logger.error(f"Error creating database tables: {e}")
             try:
-                # Check current schema version
-                cursor.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
-                cursor.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
-                row = cursor.fetchone()
-                current_version = row[0] if row else 0
-
-                if current_version < DB_SCHEMA_VERSION:
-                    logger.info(f"Database schema version is {current_version}. Upgrading to {DB_SCHEMA_VERSION}.")
-                    
-                    # Frontier Table
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS frontier (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        url TEXT UNIQUE NOT NULL,
-                        domain TEXT NOT NULL,
-                        depth INTEGER DEFAULT 0,
-                        added_timestamp INTEGER NOT NULL,
-                        priority_score REAL DEFAULT 0
-                    )
-                    """)
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)")
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)")
-
-                    # Visited URLs Table
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS visited_urls (
-                        url_sha256 TEXT PRIMARY KEY,
-                        url TEXT NOT NULL,
-                        domain TEXT NOT NULL,
-                        crawled_timestamp INTEGER NOT NULL,
-                        http_status_code INTEGER,
-                        content_type TEXT,
-                        content_hash TEXT,
-                        content_storage_path TEXT,
-                        redirected_to_url TEXT
-                    )
-                    """)
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_visited_domain ON visited_urls (domain)")
-
-                    # Domain Metadata Table
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS domain_metadata (
-                        domain TEXT PRIMARY KEY,
-                        last_scheduled_fetch_timestamp INTEGER DEFAULT 0,
-                        robots_txt_content TEXT,
-                        robots_txt_fetched_timestamp INTEGER,
-                        robots_txt_expires_timestamp INTEGER,
-                        is_manually_excluded INTEGER DEFAULT 0,
-                        is_seeded INTEGER DEFAULT 0
-                    )
-                    """)
-                    
-                    # Update schema version
-                    cursor.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (DB_SCHEMA_VERSION,))
-                    # conn.commit() is handled by with statement
-                    logger.info("Database tables created/updated successfully.")
-                else:
-                    logger.info(f"Database schema is up to date (version {current_version}).")
-
-            except sqlite3.Error as e:
-                logger.error(f"Error creating database tables: {e}")
-                # conn.rollback() handled by with statement on error
-                raise
-            finally:
-                cursor.close()
+                conn.rollback() # Rollback on error
+            except sqlite3.Error as re:
+                logger.error(f"Error during rollback: {re}")
+            raise
+        finally:
+            cursor.close()
 
     def get_url_sha256(self, url: str) -> str:
         """Generates a SHA256 hash for a given URL."""
@@ -153,7 +159,7 @@ class StorageManager:
         content_storage_path_str: str | None = None, 
         redirected_to_url: str | None = None
     ):
-        """Adds a record of a visited page to the database.
+        """Adds a record of a visited page to the database using a pooled connection.
            This method is expected to be called via asyncio.to_thread if in an async context.
         """
         url_sha256 = self.get_url_sha256(url)
@@ -161,36 +167,39 @@ class StorageManager:
         if content_text:
             content_hash = hashlib.sha256(content_text.encode('utf-8')).hexdigest()
 
-        conn_threaded = None # Define before try block for finally
-        cursor = None
+        conn_from_pool: sqlite3.Connection | None = None
         try:
             # This method is run in a separate thread by asyncio.to_thread,
-            # so it must establish its own database connection.
-            conn_threaded = sqlite3.connect(self.db_path, timeout=10)
-            cursor = conn_threaded.cursor()
-            cursor.execute("""
-            INSERT OR REPLACE INTO visited_urls 
-            (url_sha256, url, domain, crawled_timestamp, http_status_code, content_type, content_hash, content_storage_path, redirected_to_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                url_sha256, url, domain, crawled_timestamp, status_code, 
-                content_type, content_hash, content_storage_path_str, redirected_to_url
-            ))
-            conn_threaded.commit()
-            logger.info(f"Recorded visited URL: {url} (Status: {status_code})")
-        except sqlite3.Error as e:
-            logger.error(f"DB error adding visited page {url}: {e}")
-            if conn_threaded: # If connection was made, try to rollback
-                try:
-                    conn_threaded.rollback()
-                except sqlite3.Error as re:
-                    logger.error(f"DB error during rollback for {url}: {re}")
+            # so it gets a connection from the pool.
+            conn_from_pool = self.db_pool.get_connection()
+            cursor = conn_from_pool.cursor()
+            try:
+                cursor.execute("""
+                INSERT OR REPLACE INTO visited_urls 
+                (url_sha256, url, domain, crawled_timestamp, http_status_code, content_type, content_hash, content_storage_path, redirected_to_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    url_sha256, url, domain, crawled_timestamp, status_code, 
+                    content_type, content_hash, content_storage_path_str, redirected_to_url
+                ))
+                conn_from_pool.commit()
+                logger.info(f"Recorded visited URL: {url} (Status: {status_code})")
+            except sqlite3.Error as e: # Inner try for cursor/execute specific errors
+                logger.error(f"DB (execute/commit) error adding visited page {url}: {e}")
+                if conn_from_pool: 
+                    try:
+                        conn_from_pool.rollback()
+                    except sqlite3.Error as re:
+                        logger.error(f"DB error during rollback for {url}: {re}")
+                raise # Re-raise to be caught by outer block if necessary, or to signal failure
+            finally:
+                if cursor: cursor.close()
+        except sqlite3.Error as e: # Outer try for connection pool errors or other sqlite errors
+            logger.error(f"DB (pool/connection) error adding visited page {url}: {e}")
+            # Rollback is handled by the inner block if the error was post-connection
+        except Exception as e: # Catch other exceptions like pool Empty
+            logger.error(f"Unexpected error (e.g. pool issue) adding visited page {url}: {e}")
+            raise
         finally:
-            if cursor: cursor.close()
-            if conn_threaded: conn_threaded.close()
-
-    def close(self):
-        """Closes the database connection."""
-        if self.conn:
-            self.conn.close()
-            logger.info("Database connection closed.") 
+            if conn_from_pool:
+                self.db_pool.return_connection(conn_from_pool)

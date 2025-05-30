@@ -14,6 +14,7 @@ from crawler_module.storage import StorageManager
 from crawler_module.config import CrawlerConfig
 from crawler_module.politeness import PolitenessEnforcer # Added
 from crawler_module.fetcher import Fetcher # Added for PolitenessEnforcer mock typing
+from crawler_module.db_pool import SQLiteConnectionPool # For manual pool creation in specific tests
 
 # Configure basic logging for tests
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -55,16 +56,13 @@ async def actual_config_for_frontier(frontier_test_config_obj: FrontierTestConfi
     return CrawlerConfig(**vars(frontier_test_config_obj))
 
 @pytest_asyncio.fixture
-async def storage_manager_for_frontier(actual_config_for_frontier: CrawlerConfig) -> StorageManager:
-    sm = StorageManager(config=actual_config_for_frontier)
+async def storage_manager_for_frontier(actual_config_for_frontier: CrawlerConfig, db_pool: SQLiteConnectionPool) -> StorageManager:
+    sm = StorageManager(config=actual_config_for_frontier, db_pool=db_pool)
     yield sm
-    sm.close()
-    if actual_config_for_frontier.seed_file.exists():
-        actual_config_for_frontier.seed_file.unlink()
 
 @pytest_asyncio.fixture
 def mock_politeness_enforcer_for_frontier(actual_config_for_frontier: CrawlerConfig, 
-                                          mock_storage_manager: MagicMock, # Re-use from politeness tests if compatible or make new
+                                          mock_storage_manager: MagicMock, 
                                           mock_fetcher: MagicMock) -> MagicMock:
     """Provides a mocked PolitenessEnforcer for FrontierManager tests."""
     # mock_pe = MagicMock(spec=PolitenessEnforcer)
@@ -90,17 +88,19 @@ def mock_fetcher() -> MagicMock:
     return AsyncMock(spec=Fetcher)
 
 @pytest.fixture
-def mock_storage_manager() -> MagicMock: # For PolitenessEnforcer init if needed by mock_politeness_enforcer_for_frontier
+def mock_storage_manager() -> MagicMock: # This mock is for PolitenessEnforcer, may not need db_pool if methods are mocked
     mock = MagicMock(spec=StorageManager)
-    mock.conn = MagicMock(spec=sqlite3.Connection)
-    mock.conn.cursor.return_value.__enter__.return_value = MagicMock(spec=sqlite3.Cursor)
-    mock.conn.cursor.return_value.__exit__.return_value = None
+    # If PolitenessEnforcer's init accesses db_pool on storage, mock that attribute
+    mock.db_pool = MagicMock(spec=SQLiteConnectionPool) 
+    # Mocking individual connection/cursor calls might be too complex if PE uses the pool directly.
+    # It's better if PE methods that interact with DB are mocked if PE itself isn't the focus.
+    # For now, adding db_pool attribute to the mock.
     return mock
 
 @pytest_asyncio.fixture
 async def frontier_manager(
     actual_config_for_frontier: CrawlerConfig, 
-    storage_manager_for_frontier: StorageManager, 
+    storage_manager_for_frontier: StorageManager, # This SM instance now uses the db_pool fixture
     mock_politeness_enforcer_for_frontier: MagicMock
 ) -> FrontierManager:
     fm = FrontierManager(
@@ -185,22 +185,32 @@ async def test_add_and_get_urls(frontier_manager: FrontierManager, mock_politene
 async def test_frontier_resume_with_politeness(
     temp_test_frontier_dir: Path, 
     frontier_test_config_obj: FrontierTestConfig,
-    mock_politeness_enforcer_for_frontier: MagicMock # Use the same mock for both runs for simplicity here
-                                                # or create a new one if state needs to be distinct.
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    # tmp_path is needed to create distinct DBs for each run if not using a shared fixture pool
+    tmp_path: Path 
 ):
     logger.info("Testing Frontier Resume Functionality with Politeness Mocks")
     
     # Permissive politeness for all operations in this test
     mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
     mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
-    mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.return_value = None
+    mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.return_value = None # AsyncMock should return None by default
 
-    # --- First run: populate and close ---
+    # Define a unique DB file for this multi-run test
+    # to ensure state isolation between "runs" if we create separate pools.
+    # Using the `temp_test_frontier_dir` for consistency in paths for data_dir.
+    db_file_for_resume_test = temp_test_frontier_dir / "resume_test_frontier.db"
+
+
+    # --- First run: populate and close ---\n    cfg_run1_dict = vars(frontier_test_config_obj).copy()
     cfg_run1_dict = vars(frontier_test_config_obj).copy()
     cfg_run1_dict['resume'] = False # Ensure it's a new run
+    # Ensure data_dir points to where db_file_for_resume_test will be (or its parent)
+    # The frontier_test_config_obj already uses temp_test_frontier_dir as its data_dir
     cfg_run1 = CrawlerConfig(**cfg_run1_dict)
     
-    storage_run1 = StorageManager(config=cfg_run1)
+    pool_run1 = SQLiteConnectionPool(db_path=db_file_for_resume_test, pool_size=1)
+    storage_run1 = StorageManager(config=cfg_run1, db_pool=pool_run1)
     frontier_run1 = FrontierManager(config=cfg_run1, storage=storage_run1, politeness=mock_politeness_enforcer_for_frontier)
     await frontier_run1.initialize_frontier() 
     await frontier_run1.add_url("http://persistent.com/page_from_run1")
@@ -209,16 +219,16 @@ async def test_frontier_resume_with_politeness(
     url_to_retrieve = await frontier_run1.get_next_url()
     assert url_to_retrieve is not None
     assert await asyncio.to_thread(frontier_run1.count_frontier) == 2 
-    storage_run1.close()
+    # storage_run1.close() # Not needed, pool_run1.close_all() will handle it
+    pool_run1.close_all()
 
     # --- Second run: resume --- 
     cfg_run2_dict = vars(frontier_test_config_obj).copy()
     cfg_run2_dict['resume'] = True
-    cfg_run2 = CrawlerConfig(**cfg_run2_dict)
+    cfg_run2 = CrawlerConfig(**cfg_run2_dict) # Same data_dir, db will be reused
 
-    storage_run2 = StorageManager(config=cfg_run2)
-    # For resume, we use the same mocked politeness enforcer. Its state (like in-memory robots cache)
-    # is not what we are testing here; we test Frontier's ability to load from DB.
+    pool_run2 = SQLiteConnectionPool(db_path=db_file_for_resume_test, pool_size=1)
+    storage_run2 = StorageManager(config=cfg_run2, db_pool=pool_run2)
     frontier_run2 = FrontierManager(config=cfg_run2, storage=storage_run2, politeness=mock_politeness_enforcer_for_frontier)
     await frontier_run2.initialize_frontier() 
     
@@ -238,5 +248,6 @@ async def test_frontier_resume_with_politeness(
     assert next_url[0] == "http://persistent.com/page_from_run1"
 
     assert await asyncio.to_thread(frontier_run2.count_frontier) == 0
-    storage_run2.close()
+    # storage_run2.close() # Not needed
+    pool_run2.close_all()
     logger.info("Frontier resume test passed with politeness mocks.") 

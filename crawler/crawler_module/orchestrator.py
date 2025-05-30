@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Set
+from typing import Set, Optional
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -11,6 +11,7 @@ from .politeness import PolitenessEnforcer
 from .frontier import FrontierManager
 from .parser import PageParser, ParseResult
 from .utils import extract_domain # For getting domain for storage
+from .db_pool import SQLiteConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,15 @@ ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
         self.config = config
-        self.storage: StorageManager = StorageManager(config)
+        
+        # Initialize DB Pool first
+        self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
+            db_path=Path(config.data_dir) / "crawler_state.db",
+            pool_size=config.max_workers, # Pool size can be linked to max_workers
+            wal_mode=True # Enable WAL mode for better concurrency by default
+        )
+        
+        self.storage: StorageManager = StorageManager(config, self.db_pool)
         self.fetcher: Fetcher = Fetcher(config)
         self.politeness: PolitenessEnforcer = PolitenessEnforcer(config, self.storage, self.fetcher)
         self.frontier: FrontierManager = FrontierManager(config, self.storage, self.politeness)
@@ -43,12 +52,13 @@ class CrawlerOrchestrator:
                 next_url_info = await self.frontier.get_next_url()
 
                 if next_url_info is None:
-                    if self.frontier.count_frontier() == 0 and not self.config.resume:
-                        # If it's not a resume scenario and frontier is truly empty, worker might be done
-                        # However, other workers might still add URLs. The orchestrator handles shutdown.
-                        logger.info(f"Worker-{worker_id}: Frontier is empty. Waiting...")
-                    # else: # Frontier might have items, but they are all on cooldown
-                        # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting...")
+                    # Check if the frontier is truly empty (not just all domains on cooldown)
+                    current_frontier_size_for_worker = await asyncio.to_thread(self.frontier.count_frontier)
+                    if current_frontier_size_for_worker == 0:
+                        logger.info(f"Worker-{worker_id}: Frontier is confirmed empty by count. Waiting...")
+                    else:
+                        # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting... Frontier size: {current_frontier_size_for_worker}")
+                        pass # Still URLs, but none fetchable now
                     await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS) 
                     continue
 
@@ -155,6 +165,8 @@ class CrawlerOrchestrator:
             if initial_frontier_size == 0 and not self.config.resume:
                 logger.warning("No URLs in frontier after seed loading. Nothing to crawl.")
                 self._shutdown_event.set() # Ensure a clean shutdown path
+            elif initial_frontier_size == 0 and self.config.resume:
+                logger.warning("Resuming with an empty frontier. Crawler will wait for new URLs or shutdown if none appear.")
             
             # Start worker tasks
             for i in range(self.config.max_workers):
@@ -217,8 +229,10 @@ class CrawlerOrchestrator:
         finally:
             logger.info("Performing final cleanup...")
             await self.fetcher.close_session()
-            # StorageManager.close() is synchronous, but should be called.
-            # If it were async, we'd await it.
-            self.storage.close() 
+            
+            # Close the database pool explicitly
+            if self.db_pool:
+                self.db_pool.close_all()
+            
             logger.info(f"Crawl finished. Total pages crawled: {self.pages_crawled_count}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

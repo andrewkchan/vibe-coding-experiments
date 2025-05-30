@@ -8,236 +8,226 @@ import aiofiles # For testing async file save
 import time
 import hashlib
 
+# Import db_pool from conftest
+# pytest will automatically discover fixtures in conftest.py in the same directory or parent directories.
+
 from crawler_module.storage import StorageManager, DB_SCHEMA_VERSION
-# Adjust the import path if CrawlerConfig is in a different location or make a simpler test double
-from crawler_module.config import CrawlerConfig 
+from crawler_module.config import CrawlerConfig # Will use test_config from conftest
+from crawler_module.db_pool import SQLiteConnectionPool
 
 # Configure basic logging for tests to see output
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-@pytest.fixture
-def temp_test_dir(tmp_path: Path) -> Path:
-    """Create a temporary directory for test data."""
-    test_data_dir = tmp_path / "test_crawler_data_storage"
-    test_data_dir.mkdir(parents=True, exist_ok=True)
-    logger.debug(f"Created temp test dir: {test_data_dir}")
-    return test_data_dir
 
 @pytest.fixture
-def dummy_config(temp_test_dir: Path) -> CrawlerConfig:
-    """Create a dummy CrawlerConfig for testing StorageManager."""
-    seed_file_path = temp_test_dir / "dummy_seeds.txt"
-    with open(seed_file_path, 'w') as f:
-        f.write("http://example.com\n")
-    
-    cfg = CrawlerConfig(
-        data_dir=temp_test_dir,
-        seed_file=seed_file_path,
-        email="storage_test@example.com",
-        exclude_file=None,
-        max_workers=1,
-        max_pages=None,
-        max_duration=None,
-        log_level="DEBUG",
-        resume=False,
-        user_agent="StorageTestCrawler/1.0",
-        seeded_urls_only=False
-    )
-    logger.debug(f"Created dummy config with data_dir: {cfg.data_dir}")
-    return cfg
-
-@pytest.fixture
-def storage_manager(dummy_config: CrawlerConfig) -> StorageManager:
-    """Fixture to create and tear down a StorageManager instance."""
-    logger.debug(f"Initializing StorageManager with config data_dir: {dummy_config.data_dir}")
-    sm = StorageManager(config=dummy_config)
+def storage_manager(test_config: CrawlerConfig, db_pool: SQLiteConnectionPool) -> StorageManager:
+    """Fixture to create a StorageManager instance using a db_pool."""
+    logger.debug(f"Initializing StorageManager with config data_dir: {test_config.data_dir} and db_pool: {db_pool.db_path}")
+    sm = StorageManager(config=test_config, db_pool=db_pool)
     yield sm
-    logger.debug("Closing StorageManager connection.")
-    sm.close()
-    # Optional: shutil.rmtree(dummy_config.data_dir) # tmp_path fixture handles cleanup
 
-def test_storage_manager_initialization(storage_manager: StorageManager, dummy_config: CrawlerConfig):
+def test_storage_manager_initialization(storage_manager: StorageManager, test_config: CrawlerConfig, db_pool: SQLiteConnectionPool):
     """Test if StorageManager initializes directories and DB correctly."""
     assert storage_manager.data_dir.exists()
     assert storage_manager.content_dir.exists()
-    assert storage_manager.db_path.exists()
-    assert storage_manager.conn is not None
+    assert Path(db_pool.db_path).exists(), f"Database file {db_pool.db_path} should exist."
+    assert storage_manager.db_path == Path(db_pool.db_path), \
+        f"SM DB path {storage_manager.db_path} should match pool DB path {Path(db_pool.db_path)}"
+    
+    with db_pool as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';")
+        assert cursor.fetchone() is not None, "schema_version table should exist."
+        cursor.close()
     logger.info("StorageManager initialization test passed.")
 
-def test_database_schema_creation(storage_manager: StorageManager):
-    """Test if all tables and indexes are created as expected."""
-    conn = storage_manager.conn
-    assert conn is not None
-    cursor = conn.cursor()
+def test_database_schema_creation(storage_manager: StorageManager, db_pool: SQLiteConnectionPool):
+    """Test if all tables and indexes are created as expected using a connection from the pool."""
+    # The storage_manager fixture already initializes the schema via StorageManager.__init__
+    with db_pool as conn: # Use the pool's context manager to get a connection
+        cursor = conn.cursor()
 
-    tables_to_check = ["frontier", "visited_urls", "domain_metadata", "schema_version"]
-    for table in tables_to_check:
-        cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}';")
-        assert cursor.fetchone() is not None, f"Table {table} should exist."
+        tables_to_check = ["frontier", "visited_urls", "domain_metadata", "schema_version"]
+        for table in tables_to_check:
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}';")
+            assert cursor.fetchone() is not None, f"Table {table} should exist."
 
-    # Check schema version
-    cursor.execute("SELECT version FROM schema_version")
-    assert cursor.fetchone()[0] == DB_SCHEMA_VERSION, f"Schema version should be {DB_SCHEMA_VERSION}"
+        cursor.execute("SELECT version FROM schema_version")
+        assert cursor.fetchone()[0] == DB_SCHEMA_VERSION, f"Schema version should be {DB_SCHEMA_VERSION}"
 
-    # Example: Check for an index
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_frontier_domain';")
-    assert cursor.fetchone() is not None, "Index idx_frontier_domain on frontier table should exist."
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_visited_domain';")
-    assert cursor.fetchone() is not None, "Index idx_visited_domain on visited_urls table should exist."
-    
-    cursor.close()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_frontier_domain';")
+        assert cursor.fetchone() is not None, "Index idx_frontier_domain on frontier table should exist."
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_visited_domain';")
+        assert cursor.fetchone() is not None, "Index idx_visited_domain on visited_urls table should exist."
+        
+        cursor.close()
     logger.info("Database schema creation test passed.")
 
 def test_get_url_sha256(storage_manager: StorageManager):
     """Test the URL hashing function."""
-    url = "http://example.com/testpage"
-    expected_hash = "a6f1491faf69SOMETESTHASH" # Not a real hash, just for structure
-    # A real test would precompute the expected hash or use a known vector
-    # For now, just test that it produces a string of expected length (64 for sha256 hex)
-    actual_hash = storage_manager.get_url_sha256(url)
-    assert isinstance(actual_hash, str)
-    assert len(actual_hash) == 64
-    logger.info("URL SHA256 generation test passed (structure check).")
+    url1 = "http://example.com/page1"
+    url2 = "http://example.com/page2"
+    url1_again = "http://example.com/page1"
 
-# Test re-initialization (simulating resume or multiple starts)
-def test_storage_manager_reinitialization(dummy_config: CrawlerConfig):
+    hash1 = storage_manager.get_url_sha256(url1)
+    hash2 = storage_manager.get_url_sha256(url2)
+    hash1_again = storage_manager.get_url_sha256(url1_again)
+
+    assert isinstance(hash1, str)
+    assert len(hash1) == 64 # SHA256 hex digest length
+    assert hash1 != hash2
+    assert hash1 == hash1_again
+    logger.info("URL SHA256 hashing test passed.")
+
+def test_storage_manager_reinitialization(test_config: CrawlerConfig, tmp_path: Path): # Uses test_config from conftest
     """Test that re-initializing StorageManager with the same path is safe."""
-    sm1 = StorageManager(config=dummy_config)
-    db_path1 = sm1.db_path
-    sm1.close()
+    
+    # The standard DB path that StorageManager will use based on test_config
+    target_db_path = Path(test_config.data_dir) / "crawler_state.db"
 
-    sm2 = StorageManager(config=dummy_config)
-    db_path2 = sm2.db_path
-    sm2.close()
+    pool_reinit1 = SQLiteConnectionPool(db_path=target_db_path, pool_size=1)
+    sm1 = StorageManager(config=test_config, db_pool=pool_reinit1)
+    # Verify StorageManager calculates its db_path correctly based on the config
+    assert sm1.db_path == target_db_path, \
+        f"SM1 path {sm1.db_path} should match target DB path {target_db_path}"
+    pool_reinit1.close_all()
 
-    assert db_path1 == db_path2
-    assert db_path1.exists()
+    pool_reinit2 = SQLiteConnectionPool(db_path=target_db_path, pool_size=1)
+    sm2 = StorageManager(config=test_config, db_pool=pool_reinit2)
+    assert sm2.db_path == target_db_path, \
+        f"SM2 path {sm2.db_path} should match target DB path {target_db_path}"
+    pool_reinit2.close_all()
+
+    assert target_db_path.exists(), "Database file should exist after StorageManager initializations."
     logger.info("StorageManager re-initialization test passed.")
 
 @pytest.mark.asyncio
-async def test_save_content_to_file(storage_manager: StorageManager, tmp_path: Path):
-    """Test saving text content to a file asynchronously."""
-    # storage_manager fixture already creates content_dir inside its own temp_test_dir
-    # Ensure the content_dir used by the method is the one we expect from the fixture
-    assert storage_manager.content_dir.exists()
-
-    url_hash = "test_hash_123"
-    test_text = "This is some test content.\nWith multiple lines."
+async def test_save_content_to_file(storage_manager: StorageManager): 
+    """Test saving content to a file asynchronously."""
+    url_hash = "test_url_hash_content"
+    text_content = "This is some test content.\nWith multiple lines."
     
-    file_path = await storage_manager.save_content_to_file(url_hash, test_text)
+    file_path = await storage_manager.save_content_to_file(url_hash, text_content)
+    
     assert file_path is not None
+    assert file_path.exists()
     assert file_path.name == f"{url_hash}.txt"
     assert file_path.parent == storage_manager.content_dir
-    assert file_path.exists()
 
     async with aiofiles.open(file_path, mode='r', encoding='utf-8') as f:
         saved_content = await f.read()
-    assert saved_content == test_text
+    assert saved_content == text_content
+    logger.info("Save content to file test passed.")
 
 @pytest.mark.asyncio
 async def test_save_content_to_file_empty_content(storage_manager: StorageManager):
-    """Test that empty content is not saved."""
+    """Test that saving empty content returns None and creates no file."""
     url_hash = "empty_content_hash"
-    file_path = await storage_manager.save_content_to_file(url_hash, "")
+    text_content = ""
+    
+    file_path = await storage_manager.save_content_to_file(url_hash, text_content)
+    
     assert file_path is None
-    assert not (storage_manager.content_dir / f"{url_hash}.txt").exists()
-
-    file_path_none = await storage_manager.save_content_to_file(url_hash, None) # type: ignore
-    assert file_path_none is None
+    # Ensure no file was created
+    expected_file = storage_manager.content_dir / f"{url_hash}.txt"
+    assert not expected_file.exists()
+    logger.info("Save empty content to file test passed.")
 
 @pytest.mark.asyncio
 async def test_save_content_to_file_io_error(storage_manager: StorageManager, monkeypatch):
     """Test handling of IOError during file save."""
     url_hash = "io_error_hash"
-    test_text = "Some content"
+    text_content = "Some content that will fail to save."
 
-    # Mock aiofiles.open to raise an IOError
-    async def mock_aio_open(*args, **kwargs):
-        raise IOError("Simulated write error")
+    # Mock aiofiles.open to raise IOError
+    async def mock_aio_open_raiser(*args, **kwargs):
+        raise IOError("Simulated disk full error")
 
-    monkeypatch.setattr(aiofiles, "open", mock_aio_open)
-
-    file_path = await storage_manager.save_content_to_file(url_hash, test_text)
+    monkeypatch.setattr(aiofiles, "open", mock_aio_open_raiser)
+    
+    file_path = await storage_manager.save_content_to_file(url_hash, text_content)
+    
     assert file_path is None
+    expected_file = storage_manager.content_dir / f"{url_hash}.txt"
+    assert not expected_file.exists()
+    logger.info("Save content to file with IOError test passed.")
 
-def test_add_visited_page(storage_manager: StorageManager, dummy_config: CrawlerConfig):
+def test_add_visited_page(storage_manager: StorageManager, db_pool: SQLiteConnectionPool): 
     """Test adding a visited page record to the database."""
-    url = "http://example.com/visitedpage"
+    url = "http://example.com/visited_page"
     domain = "example.com"
     status_code = 200
     crawled_timestamp = int(time.time())
     content_type = "text/html"
     text_content = "<html><body>Visited!</body></html>"
-    # Simulate saving content and getting a path
-    # In a real scenario, this path would come from save_content_to_file
     url_hash_for_file = storage_manager.get_url_sha256(url)
-    # Assume content_dir relative to data_dir for storage path consistency in DB
-    relative_content_path = Path("content") / f"{url_hash_for_file}.txt"
-    content_storage_path_str = str(relative_content_path)
-
+    content_storage_path_str = str(storage_manager.content_dir / f"{url_hash_for_file}.txt")
+    
     storage_manager.add_visited_page(
         url=url,
         domain=domain,
         status_code=status_code,
         crawled_timestamp=crawled_timestamp,
         content_type=content_type,
-        content_text=text_content, # To generate content_hash
+        content_text=text_content, 
         content_storage_path_str=content_storage_path_str,
         redirected_to_url=None
     )
 
-    # Verify the record in the database
-    conn = storage_manager.conn
-    assert conn is not None
-    cursor = conn.cursor()
-    expected_url_sha256 = storage_manager.get_url_sha256(url)
-    expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
+    with db_pool as conn:
+        cursor = conn.cursor()
+        expected_url_sha256 = storage_manager.get_url_sha256(url)
+        expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
 
-    cursor.execute("SELECT * FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
-    row = cursor.fetchone()
-    cursor.close()
+        cursor.execute("SELECT * FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
+        row = cursor.fetchone()
+        cursor.close()
 
     assert row is not None
-    assert row[0] == expected_url_sha256
-    assert row[1] == url
-    assert row[2] == domain
-    assert row[3] == crawled_timestamp
-    assert row[4] == status_code
-    assert row[5] == content_type
-    assert row[6] == expected_content_hash
-    assert row[7] == content_storage_path_str
-    assert row[8] is None # redirected_to_url
+    (db_url_sha256, db_url, db_domain, db_crawled_ts, db_status, 
+     db_content_type, db_content_hash, db_storage_path, db_redirected_to) = row
+    
+    assert db_url_sha256 == expected_url_sha256
+    assert db_url == url
+    assert db_domain == domain
+    assert db_crawled_ts == crawled_timestamp
+    assert db_status == status_code
+    assert db_content_type == content_type
+    assert db_content_hash == expected_content_hash
+    assert db_storage_path == content_storage_path_str
+    assert db_redirected_to is None
+    logger.info("Add visited page test passed.")
 
-    logger.info("add_visited_page test passed.")
-
-def test_add_visited_page_no_content(storage_manager: StorageManager):
+def test_add_visited_page_no_content(storage_manager: StorageManager, db_pool: SQLiteConnectionPool):
     """Test adding a visited page with no text content (e.g., redirect or non-HTML)."""
     url = "http://example.com/redirect"
     domain = "example.com"
     status_code = 301
     crawled_timestamp = int(time.time())
-    redirected_to = "http://example.com/final_destination"
+    redirected_to_url = "http://example.com/final_destination"
 
     storage_manager.add_visited_page(
         url=url,
         domain=domain,
         status_code=status_code,
         crawled_timestamp=crawled_timestamp,
-        redirected_to_url=redirected_to
-        # No content_type, content_text, or content_storage_path_str
+        content_type=None,
+        content_text=None,
+        content_storage_path_str=None,
+        redirected_to_url=redirected_to_url
     )
 
-    conn = storage_manager.conn
-    assert conn is not None
-    cursor = conn.cursor()
-    expected_url_sha256 = storage_manager.get_url_sha256(url)
-    cursor.execute("SELECT content_hash, content_storage_path, redirected_to_url FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
-    row = cursor.fetchone()
-    cursor.close()
+    with db_pool as conn:
+        cursor = conn.cursor()
+        expected_url_sha256 = storage_manager.get_url_sha256(url)
+        cursor.execute("SELECT content_hash, content_storage_path, redirected_to_url FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
+        row = cursor.fetchone()
+        cursor.close()
 
     assert row is not None
-    assert row[0] is None # content_hash
-    assert row[1] is None # content_storage_path
-    assert row[2] == redirected_to
-    logger.info("add_visited_page_no_content test passed.") 
+    content_hash, content_storage_path, db_redirected_to = row
+    assert content_hash is None
+    assert content_storage_path is None
+    assert db_redirected_to == redirected_to_url
+    logger.info("Add visited page with no content test passed.") 

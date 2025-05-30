@@ -27,40 +27,48 @@ class PolitenessEnforcer:
         self._load_manual_exclusions()
 
     def _load_manual_exclusions(self):
-        """Loads manually excluded domains from the config file into the DB."""
+        """Loads manually excluded domains from the config file into the DB using the pool."""
         if self.config.exclude_file and self.config.exclude_file.exists():
-            db_path = self.storage.db_path # Get path from storage
-            conn_init_thread = None
-            cursor_init = None
+            conn_from_pool: sqlite3.Connection | None = None
             try:
-                with sqlite3.connect(db_path, timeout=10) as conn_init_thread:
-                    cursor_init = conn_init_thread.cursor()
-                    try:
-                        with open(self.config.exclude_file, 'r') as f:
-                            count = 0
-                            for line in f:
-                                domain_to_exclude = line.strip().lower()
-                                if domain_to_exclude and not domain_to_exclude.startswith("#"):
-                                    cursor_init.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain_to_exclude,))
-                                    cursor_init.execute(
-                                        "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?",
-                                        (domain_to_exclude,)
-                                    )
-                                    count += 1
-                            conn_init_thread.commit() # Commit changes
-                            logger.info(f"Loaded and marked {count} domains as manually excluded from {self.config.exclude_file}")
-                    except IOError as e:
-                        logger.error(f"Error reading exclude file {self.config.exclude_file}: {e}")
-                    finally:
-                        if cursor_init: cursor_init.close()
-            except sqlite3.Error as e:
-                logger.error(f"DB error loading manual exclusions: {e}")
-                # Rollback is implicitly handled by `with sqlite3.connect` if an error occurs before commit
+                # Get connection from pool
+                conn_from_pool = self.storage.db_pool.get_connection()
+                cursor = conn_from_pool.cursor()
+                try:
+                    with open(self.config.exclude_file, 'r') as f:
+                        count = 0
+                        for line in f:
+                            domain_to_exclude = line.strip().lower()
+                            if domain_to_exclude and not domain_to_exclude.startswith("#"):
+                                cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain_to_exclude,))
+                                cursor.execute(
+                                    "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?",
+                                    (domain_to_exclude,)
+                                )
+                                count += 1
+                        conn_from_pool.commit() # Commit changes
+                        logger.info(f"Loaded and marked {count} domains as manually excluded from {self.config.exclude_file} (using pool).")
+                except IOError as e:
+                    logger.error(f"Error reading exclude file {self.config.exclude_file}: {e}")
+                    if conn_from_pool: conn_from_pool.rollback() # Rollback if IO error after potential DB ops
+                except sqlite3.Error as e: # Catch DB errors from execute/commit
+                    logger.error(f"DB execute/commit error loading manual exclusions: {e}")
+                    if conn_from_pool: conn_from_pool.rollback()
+                    raise # Re-raise to be caught by outer block if needed
+                finally:
+                    if cursor: cursor.close()
+            except sqlite3.Error as e: # Catch DB errors from pool.get_connection or other initial DB setup
+                logger.error(f"DB (pool/connection) error loading manual exclusions: {e}")
+            except Exception as e: # Catch other errors like pool Empty
+                logger.error(f"Unexpected error (e.g. pool issue) loading manual exclusions: {e}")
+            finally:
+                if conn_from_pool:
+                    self.storage.db_pool.return_connection(conn_from_pool)
         else:
             logger.info("No manual exclude file specified or found.")
 
     async def _get_robots_for_domain(self, domain: str) -> RobotExclusionRulesParser | None:
-        """Fetches (async), parses, and caches robots.txt for a domain."""
+        """Fetches (async), parses, and caches robots.txt for a domain, using the pool for DB ops."""
         current_time = int(time.time())
 
         # We prioritize DB cache. If DB is fresh, we use it. 
@@ -73,13 +81,14 @@ class PolitenessEnforcer:
         # rerp.user_agent = self.config.user_agent 
         robots_content: str | None = None
         
-        db_path = self.storage.db_path
-        db_row = None # Initialize db_row
+        db_row: tuple | None = None 
 
         try:
-            def _db_get_cached_robots_sync_threaded():
-                with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    cursor = conn_threaded.cursor()
+            def _db_get_cached_robots_sync_threaded_pooled():
+                conn_from_pool_get: sqlite3.Connection | None = None
+                try:
+                    conn_from_pool_get = self.storage.db_pool.get_connection()
+                    cursor = conn_from_pool_get.cursor()
                     try:
                         cursor.execute(
                             "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?", 
@@ -87,14 +96,16 @@ class PolitenessEnforcer:
                         )
                         return cursor.fetchone()
                     finally:
-                        cursor.close()
-            db_row = await asyncio.to_thread(_db_get_cached_robots_sync_threaded)
+                        if cursor: cursor.close()
+                finally:
+                    if conn_from_pool_get:
+                        self.storage.db_pool.return_connection(conn_from_pool_get)
+            
+            db_row = await asyncio.to_thread(_db_get_cached_robots_sync_threaded_pooled)
         except sqlite3.Error as e:
-            logger.warning(f"DB error fetching cached robots.txt for {domain}: {e}")
-            # db_row remains None or its initial value
+            logger.warning(f"DB error (pool) fetching cached robots.txt for {domain}: {e}")
         except Exception as e: 
-            logger.error(f"Unexpected error during DB cache check for {domain}: {e}", exc_info=True)
-            # db_row remains None or its initial value
+            logger.error(f"Unexpected error (pool) during DB cache check for {domain}: {e}", exc_info=True)
 
         if db_row and db_row[0] is not None and db_row[1] is not None and db_row[1] > current_time:
             logger.debug(f"Using fresh robots.txt for {domain} from DB (expires: {db_row[1]}).")
@@ -162,22 +173,33 @@ class PolitenessEnforcer:
             
             if robots_content is not None: # robots_content will always be a string here
                 try:
-                    def _db_update_robots_cache_sync_threaded():
-                        with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                            cursor = conn_threaded.cursor()
+                    def _db_update_robots_cache_sync_threaded_pooled():
+                        conn_from_pool_update: sqlite3.Connection | None = None
+                        try:
+                            conn_from_pool_update = self.storage.db_pool.get_connection()
+                            cursor = conn_from_pool_update.cursor()
                             try:
                                 cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
                                 cursor.execute(
                                     "UPDATE domain_metadata SET robots_txt_content = ?, robots_txt_fetched_timestamp = ?, robots_txt_expires_timestamp = ? WHERE domain = ?",
                                     (robots_content, fetched_timestamp, expires_timestamp, domain)
                                 )
-                                conn_threaded.commit()
-                                logger.debug(f"Cached robots.txt for {domain} in DB.")
+                                conn_from_pool_update.commit()
+                                logger.debug(f"Cached robots.txt for {domain} in DB (pool).")
+                            except sqlite3.Error as e_inner: # Catch DB errors from execute/commit
+                                logger.error(f"DB execute/commit error caching robots.txt (pool) for {domain}: {e_inner}")
+                                if conn_from_pool_update: conn_from_pool_update.rollback()
+                                raise
                             finally:
-                                cursor.close()
-                    await asyncio.to_thread(_db_update_robots_cache_sync_threaded)
-                except sqlite3.Error as e:
-                    logger.error(f"DB error caching robots.txt for {domain}: {e}")
+                                if cursor: cursor.close()
+                        finally:
+                            if conn_from_pool_update:
+                                self.storage.db_pool.return_connection(conn_from_pool_update)
+                    await asyncio.to_thread(_db_update_robots_cache_sync_threaded_pooled)
+                except sqlite3.Error as e: # Catch errors from pool.get_connection or outer sqlite3 errors
+                    logger.error(f"DB (pool/connection) error caching robots.txt for {domain}: {e}")
+                except Exception as e: # Catch other errors like pool Empty
+                     logger.error(f"Unexpected (pool) error caching robots.txt for {domain}: {e}")
 
         # Parse whatever content we ended up with (from fetch or from fresh DB)
         if robots_content is not None:
@@ -191,8 +213,7 @@ class PolitenessEnforcer:
         return rerp
 
     async def is_url_allowed(self, url: str) -> bool:
-        """Checks if a URL is allowed by robots.txt and not manually excluded."""
-        db_path = self.storage.db_path
+        """Checks if a URL is allowed by robots.txt and not manually excluded, using the pool."""
         domain = extract_domain(url)
         if not domain:
             logger.warning(f"Could not extract domain for URL: {url} for robots check. Allowing.")
@@ -200,9 +221,11 @@ class PolitenessEnforcer:
 
         # 1. Check manual exclusion first (DB access in thread)
         try:
-            def _db_check_manual_exclusion_sync_threaded():
-                with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    cursor = conn_threaded.cursor()
+            def _db_check_manual_exclusion_sync_threaded_pooled():
+                conn_from_pool_check: sqlite3.Connection | None = None
+                try:
+                    conn_from_pool_check = self.storage.db_pool.get_connection()
+                    cursor = conn_from_pool_check.cursor()
                     try:
                         if self.config.seeded_urls_only:
                             cursor.execute("SELECT is_manually_excluded OR NOT is_seeded FROM domain_metadata WHERE domain = ?", (domain,))
@@ -210,13 +233,19 @@ class PolitenessEnforcer:
                             cursor.execute("SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", (domain,))
                         return cursor.fetchone()
                     finally:
-                        cursor.close()
-            row = await asyncio.to_thread(_db_check_manual_exclusion_sync_threaded)
+                        if cursor: cursor.close()
+                finally:
+                    if conn_from_pool_check:
+                        self.storage.db_pool.return_connection(conn_from_pool_check)
+
+            row = await asyncio.to_thread(_db_check_manual_exclusion_sync_threaded_pooled)
             if row and row[0] == 1:
                 logger.debug(f"URL {url} from manually excluded domain: {domain}")
                 return False
         except sqlite3.Error as e:
-            logger.warning(f"DB error checking manual exclusion for {domain}: {e}")
+            logger.warning(f"DB error (pool) checking manual exclusion for {domain}: {e}")
+        except Exception as e: # Catch other errors like pool Empty
+            logger.warning(f"Pool error checking manual exclusion for {domain}: {e}")
 
         # 2. Check robots.txt (already async)
         rerp = await self._get_robots_for_domain(domain)
@@ -253,30 +282,34 @@ class PolitenessEnforcer:
         return max(float(delay), float(MIN_CRAWL_DELAY_SECONDS))
 
     async def can_fetch_domain_now(self, domain: str) -> bool:
-        """Checks if the domain can be fetched based on last fetch time and crawl delay."""
-        db_path = self.storage.db_path
-        # Removed: if not self.storage.conn:
-        # logger.error("Cannot check fetch_domain_now, no DB connection.")
-        # return False
-
+        """Checks if the domain can be fetched based on last fetch time and crawl delay, using pool."""
         last_fetch_time = 0
         try:
-            def _db_get_last_fetch_sync_threaded():
-                with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    cursor = conn_threaded.cursor()
+            def _db_get_last_fetch_sync_threaded_pooled():
+                conn_from_pool_lft: sqlite3.Connection | None = None
+                try:
+                    conn_from_pool_lft = self.storage.db_pool.get_connection()
+                    cursor = conn_from_pool_lft.cursor()
                     try:
                         cursor.execute("SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,))
                         return cursor.fetchone()
                     finally:
-                        cursor.close()
-            row = await asyncio.to_thread(_db_get_last_fetch_sync_threaded)
-            if row and row[0] is not None:
-                last_fetch_time = row[0]
-        except sqlite3.Error as e:
-            logger.error(f"DB error checking can_fetch_domain_now for {domain}: {e}")
-            return False 
+                        if cursor: cursor.close()
+                finally:
+                    if conn_from_pool_lft:
+                        self.storage.db_pool.return_connection(conn_from_pool_lft)
             
-        crawl_delay = await self.get_crawl_delay(domain) # Now async
+            row = await asyncio.to_thread(_db_get_last_fetch_sync_threaded_pooled)
+            if row and row[0] is not None: # type: ignore
+                last_fetch_time = row[0] # type: ignore
+        except sqlite3.Error as e:
+            logger.error(f"DB error (pool) checking can_fetch_domain_now for {domain}: {e}")
+            return False 
+        except Exception as e: # Catch other errors like pool Empty
+            logger.error(f"Pool error checking can_fetch_domain_now for {domain}: {e}")
+            return False
+            
+        crawl_delay = await self.get_crawl_delay(domain)
         current_time = int(time.time())
         
         if current_time >= last_fetch_time + crawl_delay:
@@ -285,25 +318,31 @@ class PolitenessEnforcer:
             return False
 
     async def record_domain_fetch_attempt(self, domain: str):
-        """Records that we are about to fetch (or have fetched) from a domain."""
-        db_path = self.storage.db_path
-        # Removed: if not self.storage.conn:
-        # logger.error("Cannot record domain fetch, no DB connection.")
-        # return
+        """Records that we are about to fetch (or have fetched) from a domain, using pool."""
         try:
             current_time = int(time.time())
-            def _db_record_fetch_sync_threaded():
-                with sqlite3.connect(db_path, timeout=10) as conn_threaded:
-                    cursor = conn_threaded.cursor()
+            def _db_record_fetch_sync_threaded_pooled():
+                conn_from_pool_rec: sqlite3.Connection | None = None
+                try:
+                    conn_from_pool_rec = self.storage.db_pool.get_connection()
+                    cursor = conn_from_pool_rec.cursor()
                     try:
-                        cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)", 
-                                       (domain, current_time))
-                        cursor.execute("UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?", 
-                                       (current_time, domain))
-                        conn_threaded.commit()
+                        cursor.execute("INSERT OR IGNORE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?,?)",
+                                                                              (domain, current_time))
+                        cursor.execute("UPDATE domain_metadata SET last_scheduled_fetch_timestamp = ? WHERE domain = ?",
+                                                                              (current_time, domain))
+                        conn_from_pool_rec.commit()
+                    except sqlite3.Error as e_inner: # Catch DB errors from execute/commit
+                        logger.error(f"DB execute/commit error recording fetch attempt (pool) for {domain}: {e_inner}")
+                        if conn_from_pool_rec: conn_from_pool_rec.rollback()
+                        raise
                     finally:
-                        cursor.close()
-            await asyncio.to_thread(_db_record_fetch_sync_threaded)
-        except sqlite3.Error as e:
-            logger.error(f"DB error recording fetch attempt for {domain}: {e}")
-            # No rollback needed for SELECT usually, and commit is in the thread 
+                        if cursor: cursor.close()
+                finally:
+                    if conn_from_pool_rec:
+                        self.storage.db_pool.return_connection(conn_from_pool_rec)
+            await asyncio.to_thread(_db_record_fetch_sync_threaded_pooled)
+        except sqlite3.Error as e: # Catch errors from pool.get_connection or outer sqlite3 errors
+            logger.error(f"DB (pool/connection) error recording fetch attempt for {domain}: {e}")
+        except Exception as e: # Catch other errors like pool Empty
+            logger.error(f"Unexpected (pool) error recording fetch attempt for {domain}: {e}") 
