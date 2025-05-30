@@ -1,5 +1,5 @@
 # Continuing test-fixing session discussion
-_Exported on 5/30/2025 at 01:49:36 PDT from Cursor (0.50.5)_
+_Exported on 5/30/2025 at 02:14:51 PDT from Cursor (0.50.5)_
 
 ---
 
@@ -2361,4 +2361,408 @@ This strongly suggests that the primary cause of the "too many open files" error
         *   **System logs** around the time of termination (e.g., from `dmesg`, `journalctl`, or `/var/log/syslog`) to check for OOM killer messages or other OS-level reasons for termination.
 
 This is excellent progress! Let me know how the high-worker-count tests go, and then we can dive into the logs for Problem 2.
+
+---
+
+**User**
+
+can we add some of that monitoring to the orchestrator? in the "main monitoring loop" it doesn't log that much right now
+
+---
+
+**Cursor**
+
+You're right, the main monitoring loop in the `CrawlerOrchestrator` can definitely benefit from more detailed status logging. This will be very helpful for diagnosing Problem 2 (the long-run instability and resource usage).
+
+Let's add logging for:
+1.  Number of active worker tasks.
+2.  Current memory usage (RSS - Resident Set Size).
+3.  Number of open file descriptors for the process.
+4.  Number of connections currently in the database pool (we already added this to the log in a previous step, let's ensure it's clear).
+
+To get memory usage and file descriptor count, we'll use the `psutil` library. If you don't have it installed, you'll need to add it to your project's dependencies (e.g., `pip install psutil` or add to `requirements.txt`).
+
+Here are the proposed changes to `crawler/crawler_module/orchestrator.py`:
+
+```python:crawler/crawler_module/orchestrator.py
+// ... existing code ...
+from .parser import PageParser, ParseResult
+from .utils import extract_domain # For getting domain for storage
+from .db_pool import SQLiteConnectionPool
+import os # For process ID
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logger.warning("psutil library not found. Detailed resource monitoring will be disabled.")
+
+logger = logging.getLogger(__name__)
+
+// ... existing code ...
+    async def run_crawl(self):
+        self.start_time = time.time()
+        logger.info(f"Crawler starting with config: {self.config}")
+        current_process = None
+        if PSUTIL_AVAILABLE:
+            current_process = psutil.Process(os.getpid())
+
+        try:
+            # Initialize frontier (loads seeds etc.)
+// ... existing code ...
+            # Main monitoring loop
+            while not self._shutdown_event.is_set():
+                if not any(not task.done() for task in self.worker_tasks):
+                    logger.info("All worker tasks have completed.")
+                    self._shutdown_event.set()
+                    break
+                
+                current_frontier_size = await asyncio.to_thread(self.frontier.count_frontier)
+                active_workers = sum(1 for task in self.worker_tasks if not task.done())
+                
+                # Resource monitoring
+                rss_mem_mb = "N/A"
+                fds_count = "N/A"
+                if PSUTIL_AVAILABLE and current_process:
+                    try:
+                        rss_mem_bytes = current_process.memory_info().rss
+                        rss_mem_mb = f"{rss_mem_bytes / (1024 * 1024):.2f} MB"
+                        fds_count = current_process.num_fds()
+                    except psutil.Error as e:
+                        logger.warning(f"psutil error during resource monitoring: {e}")
+                        # Fallback or disable further psutil calls for this iteration if needed
+                
+                pool_connections = self.db_pool._pool.qsize() if self.db_pool and hasattr(self.db_pool, '_pool') else "N/A"
+
+                status_parts = [
+                    f"Crawled={self.pages_crawled_count}",
+                    f"Frontier={current_frontier_size}",
+                    f"AddedToFrontier={self.total_urls_added_to_frontier}",
+                    f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
+                    f"DBPoolConns={pool_connections}",
+                    f"MemRSS={rss_mem_mb}",
+                    f"OpenFDs={fds_count}",
+                    f"Runtime={(time.time() - self.start_time):.0f}s"
+                ]
+                logger.info(f"Status: {', '.join(status_parts)}")
+                
+                # If frontier is empty and workers might be idle, it could be a natural end
+                # This condition needs to be careful not to prematurely shut down if workers are just between tasks.
+                # A more robust check would involve seeing if workers are truly blocked on an empty frontier for a while.
+// ... existing code ...
+```
+
+**Key Changes:**
+
+1.  **Import `psutil`**:
+    *   Added an attempt to import `psutil`.
+    *   A `PSUTIL_AVAILABLE` flag is set, and a warning is logged if `psutil` is not found. This allows the crawler to run without `psutil`, albeit with less detailed monitoring.
+2.  **Process Handle**:
+    *   In `run_crawl()`, `current_process = psutil.Process(os.getpid())` gets a handle to the current process if `psutil` is available.
+3.  **Enhanced Status Logging**:
+    *   Inside the main monitoring loop, if `psutil` is available:
+        *   `current_process.memory_info().rss` gets the Resident Set Size (memory usage), converted to MB.
+        *   `current_process.num_fds()` gets the number of open file descriptors.
+    *   The number of active workers (`active_workers`) is calculated.
+    *   The number of connections in the DB pool (`pool_connections`) is retrieved (this was mostly there but made more explicit).
+    *   The main status log line is updated to include these new metrics: `ActiveWorkers`, `DBPoolConns`, `MemRSS`, `OpenFDs`.
+    *   Error handling for `psutil` calls is added to prevent monitoring issues from crashing the crawler.
+
+**Before Running:**
+
+*   **Install `psutil`**: If you don't have it, run `pip install psutil` in your environment or add it to your `requirements.txt` and install dependencies.
+
+This enhanced logging should provide much better visibility into the crawler's resource consumption and state over long runs, which will be crucial for diagnosing Problem 2.
+
+After applying these changes, the next step would be to run the crawler with a high worker count again. If it's stable regarding file descriptors, let it run for an extended period (12+ hours if possible, or until the issue reappears) and collect the logs. These detailed status logs will be invaluable.
+
+```python
+// ... existing code ...
+from .parser import PageParser, ParseResult
+from .utils import extract_domain # For getting domain for storage
+from .db_pool import SQLiteConnectionPool
+import os # For process ID
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logger.warning("psutil library not found. Detailed resource monitoring will be disabled.")
+
+logger = logging.getLogger(__name__)
+
+// ... existing code ...
+    async def run_crawl(self):
+        self.start_time = time.time()
+        logger.info(f"Crawler starting with config: {self.config}")
+        current_process = None
+        if PSUTIL_AVAILABLE:
+            current_process = psutil.Process(os.getpid())
+
+        try:
+            # Initialize frontier (loads seeds etc.)
+// ... existing code ...
+            # Main monitoring loop
+            while not self._shutdown_event.is_set():
+                if not any(not task.done() for task in self.worker_tasks):
+                    logger.info("All worker tasks have completed.")
+                    self._shutdown_event.set()
+                    break
+                
+                current_frontier_size = await asyncio.to_thread(self.frontier.count_frontier)
+                active_workers = sum(1 for task in self.worker_tasks if not task.done())
+                
+                # Resource monitoring
+                rss_mem_mb = "N/A"
+                fds_count = "N/A"
+                if PSUTIL_AVAILABLE and current_process:
+                    try:
+                        rss_mem_bytes = current_process.memory_info().rss
+                        rss_mem_mb = f"{rss_mem_bytes / (1024 * 1024):.2f} MB"
+                        fds_count = current_process.num_fds()
+                    except psutil.Error as e:
+                        logger.warning(f"psutil error during resource monitoring: {e}")
+                        # Fallback or disable further psutil calls for this iteration if needed
+                
+                pool_connections = self.db_pool._pool.qsize() if self.db_pool and hasattr(self.db_pool, '_pool') else "N/A"
+
+                status_parts = [
+                    f"Crawled={self.pages_crawled_count}",
+                    f"Frontier={current_frontier_size}",
+                    f"AddedToFrontier={self.total_urls_added_to_frontier}",
+                    f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
+                    f"DBPoolConns={pool_connections}",
+                    f"MemRSS={rss_mem_mb}",
+                    f"OpenFDs={fds_count}",
+                    f"Runtime={(time.time() - self.start_time):.0f}s"
+                ]
+                logger.info(f"Status: {', '.join(status_parts)}")
+                
+                # If frontier is empty and workers might be idle, it could be a natural end
+                # This condition needs to be careful not to prematurely shut down if workers are just between tasks.
+                # A more robust check would involve seeing if workers are truly blocked on an empty frontier for a while.
+// ... existing code ...
+```
+
+---
+
+**User**
+
+hm, seems the DB pool tries to access the sqlite file before it gets created (even when running without `--resume`)
+
+```
+2025-05-30 09:08:35 - INFO - __main__ [4728] - Logging reconfigured to level: INFO                                                                                                                                    
+2025-05-30 09:08:35 - INFO - __main__ [4728] - Starting crawler...                                                                                                                                                    
+2025-05-30 09:08:35 - ERROR - crawler_module.db_pool [4728] - Failed to create SQLite connection for crawler_data/crawler_state.db: unable to open database file
+2025-05-30 09:08:35 - ERROR - crawler_module.db_pool [4728] - Error creating initial connection for pool: unable to open database file
+2025-05-30 09:08:35 - INFO - crawler_module.db_pool [4728] - SQLiteConnectionPool initialized for crawler_data/crawler_state.db with 0 connections.
+2025-05-30 09:08:35 - INFO - crawler_module.storage [4728] - Storage directories initialized: crawler_data
+2025-05-30 09:08:40 - WARNING - crawler_module.db_pool [4728] - Connection pool for crawler_data/crawler_state.db exhausted or timed out. Trying to create a temporary connection.
+2025-05-30 09:08:40 - ERROR - crawler_module.storage [4728] - Failed to get connection from pool for schema init: No connection available from pool for crawler_data/crawler_state.db within timeout.
+Traceback (most recent call last):
+  File "/home/ubuntu/vibe-coding-experiments/crawler/crawler_module/db_pool.py", line 49, in get_connection
+    return self._pool.get(block=block, timeout=effective_timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/queue.py", line 179, in get
+    raise Empty
+_queue.Empty
+```
+
+---
+
+**Cursor**
+
+You've spotted a crucial initialization order issue. The logs clearly show the problem:
+
+1.  `SQLiteConnectionPool` is initialized:
+    *   It tries to pre-fill the pool by calling `_create_connection()` multiple times.
+    *   `_create_connection()` calls `sqlite3.connect(self.db_path, ...)`.
+    *   At this point, `crawler_data/crawler_state.db` (and possibly the `crawler_data` directory itself if it's a fresh run) might not exist yet. `sqlite3.connect()` can create the file if the directory exists, but if the directory doesn't exist, it fails with "unable to open database file".
+    *   This results in: `ERROR - crawler_module.db_pool [4728] - Failed to create SQLite connection for crawler_data/crawler_state.db: unable to open database file`
+    *   And consequently: `ERROR - crawler_module.db_pool [4728] - Error creating initial connection for pool: unable to open database file`
+    *   The pool initializes with 0 connections: `INFO - crawler_module.db_pool [4728] - SQLiteConnectionPool initialized for crawler_data/crawler_state.db with 0 connections.`
+
+2.  `StorageManager` is initialized *after* the pool:
+    *   `StorageManager._init_storage()` calls `self.data_dir.mkdir(parents=True, exist_ok=True)`, which creates the `crawler_data` directory if it's missing.
+    *   Then, `_init_db_schema()` tries to get a connection from the (empty) pool: `WARNING - crawler_module.db_pool [4728] - Connection pool for crawler_data/crawler_state.db exhausted or timed out.`
+    *   This fails: `ERROR - crawler_module.storage [4728] - Failed to get connection from pool for schema init: No connection available from pool...`
+
+**The core issue is that `SQLiteConnectionPool` tries to connect to the database file *before* `StorageManager` has had a chance to create the directory where that database file should reside.**
+
+**Solution:**
+
+We need to ensure the database directory exists *before* the `SQLiteConnectionPool` attempts to create connections.
+
+There are a couple of ways to achieve this:
+
+**Option 1: Create directory before pool initialization in `CrawlerOrchestrator` (Cleanest)**
+   The `CrawlerOrchestrator` is responsible for setting up all components. It can create the data directory before initializing the pool.
+
+   ```python:crawler/crawler_module/orchestrator.py
+   // ... existing code ...
+   class CrawlerOrchestrator:
+       def __init__(self, config: CrawlerConfig):
+           self.config = config
+           
+           # --- Ensure data directory exists FIRST ---
+           data_dir_path = Path(config.data_dir)
+           try:
+               data_dir_path.mkdir(parents=True, exist_ok=True)
+               logger.info(f"Ensured data directory exists: {data_dir_path}")
+           except OSError as e:
+               logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
+               raise # Stop if we can't create data directory
+           # --- End directory creation ---
+
+           # Initialize DB Pool 
+           self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
+               db_path=data_dir_path / "crawler_state.db", # Use the Path object
+               pool_size=config.max_workers, 
+               wal_mode=True 
+           )
+           
+           self.storage: StorageManager = StorageManager(config, self.db_pool)
+           # ... rest of the initializations ...
+   // ... existing code ...
+   ```
+   In this approach, `StorageManager._init_storage()` will still call `mkdir`, but `exist_ok=True` means it won't cause an error if the directory is already there. The primary responsibility for ensuring the directory exists *before any DB operation* moves to the orchestrator.
+
+**Option 2: Modify `SQLiteConnectionPool` to create the directory (Less ideal for separation of concerns)**
+   The pool itself could try to create the parent directory of `db_path`.
+
+   ```python:crawler/crawler_module/db_pool.py
+   // ... existing code ...
+   class SQLiteConnectionPool:
+       def __init__(self, db_path: str | Path, pool_size: int = 10, timeout: int = 10, wal_mode: bool = True):
+           self.db_path = str(db_path) 
+           
+           # --- Ensure parent directory exists ---
+           db_file_path_obj = Path(self.db_path)
+           try:
+               db_file_path_obj.parent.mkdir(parents=True, exist_ok=True)
+               # logger.debug(f"DB Pool ensured parent directory exists: {db_file_path_obj.parent}")
+           except OSError as e:
+               logger.error(f"DB Pool: Error creating parent directory {db_file_path_obj.parent} for DB {self.db_path}: {e}")
+               # Decide if to raise or try to continue (likely raise)
+               raise
+           # --- End directory creation ---
+           
+           self.timeout = timeout
+           # ... rest of the init ...
+   // ... existing code ...
+   ```
+   This makes the pool slightly more self-contained but gives it directory creation responsibilities, which might be better suited for a higher-level component like `StorageManager` or `Orchestrator`.
+
+**Recommendation:**
+
+**Option 1 is generally cleaner.** The `Orchestrator` is the central point of setup, and ensuring prerequisites like the data directory are met before initializing dependent components fits its role. `StorageManager` then correctly initializes the schema within that directory using the pool.
+
+I will proceed with applying **Option 1** to `crawler/crawler_module/orchestrator.py`.
+
+```python:crawler/crawler_module/orchestrator.py
+// ... existing code ...
+class CrawlerOrchestrator:
+    def __init__(self, config: CrawlerConfig):
+        self.config = config
+        
+        # --- Ensure data directory exists FIRST ---
+        data_dir_path = Path(config.data_dir)
+        try:
+            data_dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Ensured data directory exists: {data_dir_path}")
+        except OSError as e:
+            logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
+            raise # Stop if we can't create data directory
+        # --- End directory creation ---
+
+        # Initialize DB Pool first
+        self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
+            db_path=data_dir_path / "crawler_state.db", # Use the Path object
+            pool_size=config.max_workers, # Pool size can be linked to max_workers
+            wal_mode=True # Enable WAL mode for better concurrency by default
+        )
+        
+        self.storage: StorageManager = StorageManager(config, self.db_pool)
+// ... existing code ...
+```
+This change ensures that by the time `SQLiteConnectionPool` attempts its first `sqlite3.connect`, the `crawler_data` directory will exist, allowing `sqlite3.connect` to successfully create the `crawler_state.db` file if it's not already there. This should resolve the "unable to open database file" error during pool initialization.
+
+```python
+   // ... existing code ...
+   class CrawlerOrchestrator:
+       def __init__(self, config: CrawlerConfig):
+           self.config = config
+           
+           # --- Ensure data directory exists FIRST ---
+           data_dir_path = Path(config.data_dir)
+           try:
+               data_dir_path.mkdir(parents=True, exist_ok=True)
+               logger.info(f"Ensured data directory exists: {data_dir_path}")
+           except OSError as e:
+               logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
+               raise # Stop if we can't create data directory
+           # --- End directory creation ---
+
+           # Initialize DB Pool 
+           self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
+               db_path=data_dir_path / "crawler_state.db", # Use the Path object
+               pool_size=config.max_workers, 
+               wal_mode=True 
+           )
+           
+           self.storage: StorageManager = StorageManager(config, self.db_pool)
+           # ... rest of the initializations ...
+   // ... existing code ...
+```
+
+```python
+   // ... existing code ...
+   class SQLiteConnectionPool:
+       def __init__(self, db_path: str | Path, pool_size: int = 10, timeout: int = 10, wal_mode: bool = True):
+           self.db_path = str(db_path) 
+           
+           # --- Ensure parent directory exists ---
+           db_file_path_obj = Path(self.db_path)
+           try:
+               db_file_path_obj.parent.mkdir(parents=True, exist_ok=True)
+               # logger.debug(f"DB Pool ensured parent directory exists: {db_file_path_obj.parent}")
+           except OSError as e:
+               logger.error(f"DB Pool: Error creating parent directory {db_file_path_obj.parent} for DB {self.db_path}: {e}")
+               # Decide if to raise or try to continue (likely raise)
+               raise
+           # --- End directory creation ---
+           
+           self.timeout = timeout
+           # ... rest of the init ...
+   // ... existing code ...
+```
+
+```python
+// ... existing code ...
+class CrawlerOrchestrator:
+    def __init__(self, config: CrawlerConfig):
+        self.config = config
+        
+        # --- Ensure data directory exists FIRST ---
+        data_dir_path = Path(config.data_dir)
+        try:
+            data_dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Ensured data directory exists: {data_dir_path}")
+        except OSError as e:
+            logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
+            raise # Stop if we can't create data directory
+        # --- End directory creation ---
+
+        # Initialize DB Pool first
+        self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
+            db_path=data_dir_path / "crawler_state.db", # Use the Path object
+            pool_size=config.max_workers, # Pool size can be linked to max_workers
+            wal_mode=True # Enable WAL mode for better concurrency by default
+        )
+        
+        self.storage: StorageManager = StorageManager(config, self.db_pool)
+// ... existing code ...
+```
 
