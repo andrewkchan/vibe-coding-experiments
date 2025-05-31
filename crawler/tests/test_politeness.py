@@ -400,7 +400,7 @@ async def test_is_url_allowed_by_robots(politeness_enforcer: PolitenessEnforcer,
     # --- Test Allowed URL ---
     assert await politeness_enforcer.is_url_allowed(allowed_url) is True
     # Verify _get_robots_for_domain was called, as it wasn't manually excluded.
-    politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain)
+    politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain, mock_conn_manual_exclusion)
 
     # --- Reset for next test case ---
     politeness_enforcer._get_robots_for_domain.reset_mock()
@@ -411,7 +411,7 @@ async def test_is_url_allowed_by_robots(politeness_enforcer: PolitenessEnforcer,
     # --- Test Disallowed URL ---
     assert await politeness_enforcer.is_url_allowed(disallowed_url) is False
     # Verify _get_robots_for_domain was called again.
-    politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain)
+    politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain, mock_conn_manual_exclusion)
 
     # Check that the db_pool's get_connection was called for each is_url_allowed call (for manual exclusion)
     assert politeness_enforcer.storage.db_pool.get_connection.call_count == 2
@@ -443,7 +443,7 @@ async def test_is_url_allowed_robots_fetch_fails_defaults_to_allow(politeness_en
     
     assert await politeness_enforcer.is_url_allowed(url) is True 
     politeness_enforcer.storage.db_pool.get_connection.assert_called_once() # For manual exclusion
-    politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain)
+    politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain, mock_conn_manual_exclusion)
 
 # --- Tests for get_crawl_delay (async) ---
 @pytest.mark.asyncio
@@ -566,12 +566,21 @@ async def test_can_fetch_domain_now_insufficient_delay(politeness_enforcer: Poli
     mock_db_conn.cursor.return_value = mock_db_cursor
     politeness_enforcer.storage.db_pool.get_connection.return_value = mock_db_conn
     
-    # Mock get_crawl_delay to return a known value
-    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=crawl_delay_val)
+    # Mock get_crawl_delay
+    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=float(MIN_CRAWL_DELAY_SECONDS))
 
     assert await politeness_enforcer.can_fetch_domain_now(domain) is False
-    politeness_enforcer.storage.db_pool.get_connection.assert_called_once() # For last_fetch_time
-    politeness_enforcer.get_crawl_delay.assert_called_once_with(domain)
+
+    # Check that _db_get_last_fetch_sync was called via asyncio.to_thread
+    # This requires a bit more intricate checking if we want to assert to_thread directly.
+    # For now, checking the DB connection and cursor mocks is a good proxy.
+    politeness_enforcer.storage.db_pool.get_connection.assert_called_once()
+    mock_db_conn.cursor.assert_called_once()
+    mock_db_cursor.execute.assert_called_once_with(
+        "SELECT last_scheduled_fetch_timestamp FROM domain_metadata WHERE domain = ?", (domain,)
+    )
+    # And assert that get_crawl_delay was called with the domain and the connection
+    politeness_enforcer.get_crawl_delay.assert_called_once_with(domain, mock_db_conn)
 
 @pytest.mark.asyncio
 async def test_can_fetch_domain_now_db_error(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):

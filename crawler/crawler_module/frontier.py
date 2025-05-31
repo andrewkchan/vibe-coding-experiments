@@ -285,7 +285,8 @@ class FrontierManager:
 
             for url_id, url, domain in candidates:
                 # Politeness check is async, happens outside the threaded DB operation
-                if not await self.politeness.is_url_allowed(url):
+                # Pass the existing connection to politeness methods
+                if not await self.politeness.is_url_allowed(url, conn_from_pool):
                     logger.debug(f"URL {url} disallowed by politeness rules. Removing from frontier (pool).")
                     
                     def _delete_disallowed_url_sync_threaded_pooled(conn: sqlite3.Connection):
@@ -299,8 +300,8 @@ class FrontierManager:
                     self.seen_urls.add(url) 
                     continue 
 
-                if await self.politeness.can_fetch_domain_now(domain):
-                    await self.politeness.record_domain_fetch_attempt(domain) # Async, non-DB
+                if await self.politeness.can_fetch_domain_now(domain, conn_from_pool):
+                    await self.politeness.record_domain_fetch_attempt(domain, conn_from_pool) # Async, non-DB
                     
                     def _delete_selected_url_sync_threaded_pooled(conn: sqlite3.Connection):
                         cursor = conn.cursor()
