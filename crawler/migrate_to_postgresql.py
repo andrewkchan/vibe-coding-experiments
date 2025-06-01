@@ -19,6 +19,16 @@ from crawler_module.db_backends import create_backend
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def clean_row(row):
+    """Clean a row of data by removing NUL bytes from text fields."""
+    cleaned = []
+    for value in row:
+        if isinstance(value, str):
+            # Replace NUL bytes with empty string
+            value = value.replace('\x00', '')
+        cleaned.append(value)
+    return tuple(cleaned)
+
 async def migrate_table(sqlite_conn, pg_backend, table_name, batch_size=1000):
     """Migrate a single table from SQLite to PostgreSQL."""
     cursor = sqlite_conn.cursor()
@@ -32,7 +42,7 @@ async def migrate_table(sqlite_conn, pg_backend, table_name, batch_size=1000):
         # Get column names
         cursor.execute(f"PRAGMA table_info({table_name})")
         columns = [row[1] for row in cursor.fetchall()]
-        placeholders = ', '.join(['?' for _ in columns])
+        placeholders = ', '.join(['%s' for _ in columns])
         column_list = ', '.join(columns)
         
         # Migrate in batches
@@ -46,9 +56,12 @@ async def migrate_table(sqlite_conn, pg_backend, table_name, batch_size=1000):
             if not rows:
                 break
             
+            # Clean rows
+            cleaned_rows = [clean_row(row) for row in rows]
+            
             # Insert into PostgreSQL
             insert_query = f"INSERT INTO {table_name} ({column_list}) VALUES ({placeholders})"
-            await pg_backend.execute_many(insert_query, rows)
+            await pg_backend.execute_many(insert_query, cleaned_rows)
             
             migrated += len(rows)
             offset += batch_size
@@ -162,7 +175,8 @@ async def main():
         logger.info("\nMigration Summary:")
         for table in tables:
             cursor.execute(f"SELECT COUNT(*) FROM {table}")
-            count = cursor.fetchone()[0] if cursor.fetchone() else 0
+            result = cursor.fetchone()
+            count = result[0] if result else 0
             logger.info(f"  {table}: {count} rows")
         cursor.close()
         

@@ -285,16 +285,19 @@ class PostgreSQLBackend(DatabaseBackend):
             import psycopg_pool
             import psycopg
             
-            # Create async connection pool
+            # Create async connection pool without opening it
             self._pool = psycopg_pool.AsyncConnectionPool(
                 self.db_url,
                 min_size=self.min_size,
                 max_size=self.max_size,
                 timeout=30,
                 # Configure for high concurrency
-                configure=self._configure_connection
+                configure=self._configure_connection,
+                open=False  # Don't open in constructor
             )
             
+            # Now explicitly open the pool
+            await self._pool.open()
             await self._pool.wait()
             self._initialized = True
             logger.info(f"PostgreSQL pool initialized with min={self.min_size}, max={self.max_size}")
@@ -305,11 +308,15 @@ class PostgreSQLBackend(DatabaseBackend):
             logger.error(f"Failed to initialize PostgreSQL pool: {e}")
             raise
     
-    def _configure_connection(self, conn) -> None:
+    async def _configure_connection(self, conn) -> None:
         """Configure each connection for optimal performance."""
-        conn.execute("SET synchronous_commit = OFF")  # Faster writes, still durable
-        conn.execute("SET work_mem = '16MB'")
-        conn.execute("SET maintenance_work_mem = '64MB'")
+        # Use cursor to execute configuration commands
+        async with conn.cursor() as cur:
+            await cur.execute("SET synchronous_commit = OFF")  # Faster writes, still durable
+            await cur.execute("SET work_mem = '16MB'")
+            await cur.execute("SET maintenance_work_mem = '64MB'")
+        # Commit to end the transaction and leave connection in idle state
+        await conn.commit()
     
     async def close(self) -> None:
         """Close the PostgreSQL connection pool."""
@@ -327,12 +334,20 @@ class PostgreSQLBackend(DatabaseBackend):
     
     async def execute(self, query: str, params: Optional[Tuple] = None) -> None:
         """Execute a query without returning results."""
+        # Convert SQLite-style ? placeholders to PostgreSQL %s
+        if "?" in query:
+            query = query.replace("?", "%s")
+        
         async with self._get_connection() as conn:
             # psycopg3 automatically handles parameter placeholders
             await conn.execute(query, params or ())
     
     async def execute_many(self, query: str, params_list: List[Tuple]) -> None:
         """Execute a query multiple times with different parameters."""
+        # Convert SQLite-style ? placeholders to PostgreSQL %s
+        if "?" in query:
+            query = query.replace("?", "%s")
+        
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 for params in params_list:
@@ -340,6 +355,10 @@ class PostgreSQLBackend(DatabaseBackend):
     
     async def fetch_one(self, query: str, params: Optional[Tuple] = None) -> Optional[Tuple]:
         """Execute a query and return a single row."""
+        # Convert SQLite-style ? placeholders to PostgreSQL %s
+        if "?" in query:
+            query = query.replace("?", "%s")
+        
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params or ())
@@ -347,6 +366,10 @@ class PostgreSQLBackend(DatabaseBackend):
     
     async def fetch_all(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
         """Execute a query and return all rows."""
+        # Convert SQLite-style ? placeholders to PostgreSQL %s
+        if "?" in query:
+            query = query.replace("?", "%s")
+        
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params or ())
@@ -354,6 +377,10 @@ class PostgreSQLBackend(DatabaseBackend):
     
     async def execute_returning(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
         """Execute a query with RETURNING clause and return results."""
+        # Convert SQLite-style ? placeholders to PostgreSQL %s
+        if "?" in query:
+            query = query.replace("?", "%s")
+        
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params or ())
