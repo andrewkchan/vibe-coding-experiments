@@ -241,18 +241,38 @@ class FrontierManager:
                 WHERE claimed_at IS NOT NULL AND claimed_at < ?
             """, (expired_timestamp,))
             
-            # Atomically claim unclaimed URLs using RETURNING
-            claimed_urls = await self.storage.db.execute_returning("""
-                UPDATE frontier 
-                SET claimed_at = ? 
-                WHERE id IN (
-                    SELECT id FROM frontier 
-                    WHERE claimed_at IS NULL
-                    ORDER BY added_timestamp ASC 
-                    LIMIT ?
-                )
-                RETURNING id, url, domain
-            """, (claim_timestamp, batch_size))
+            # Use FOR UPDATE SKIP LOCKED for true atomic claiming
+            # This prevents race conditions and deadlocks
+            if self.storage.config.db_type == "postgresql":
+                # PostgreSQL supports FOR UPDATE SKIP LOCKED
+                claimed_urls = await self.storage.db.execute_returning("""
+                    WITH to_claim AS (
+                        SELECT id, url, domain 
+                        FROM frontier 
+                        WHERE claimed_at IS NULL
+                        ORDER BY added_timestamp ASC 
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE frontier 
+                    SET claimed_at = %s
+                    FROM to_claim
+                    WHERE frontier.id = to_claim.id
+                    RETURNING frontier.id, frontier.url, frontier.domain
+                """, (batch_size, claim_timestamp))
+            else:
+                # SQLite doesn't support FOR UPDATE SKIP LOCKED, use the original method
+                claimed_urls = await self.storage.db.execute_returning("""
+                    UPDATE frontier 
+                    SET claimed_at = ? 
+                    WHERE id IN (
+                        SELECT id FROM frontier 
+                        WHERE claimed_at IS NULL
+                        ORDER BY added_timestamp ASC 
+                        LIMIT ?
+                    )
+                    RETURNING id, url, domain
+                """, (claim_timestamp, batch_size))
             
             return claimed_urls
             

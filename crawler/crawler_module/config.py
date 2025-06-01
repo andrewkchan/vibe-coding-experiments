@@ -99,12 +99,23 @@ def parse_args() -> CrawlerConfig:
         default=None,
         help="PostgreSQL connection URL (required if db-type is postgresql). Example: postgresql://user:pass@localhost/dbname"
     )
+    parser.add_argument(
+        "--pg-pool-size",
+        type=int,
+        default=None,
+        help="PostgreSQL connection pool size override. If not set, automatically calculated based on worker count."
+    )
 
     args = parser.parse_args()
     
     # Validate database configuration
     if args.db_type == "postgresql" and not args.db_url:
         parser.error("--db-url is required when using PostgreSQL (--db-type=postgresql)")
+    
+    # Store pool size override in environment variable if provided
+    if args.db_type == "postgresql" and args.pg_pool_size:
+        import os
+        os.environ['CRAWLER_PG_POOL_SIZE'] = str(args.pg_pool_size)
     
     # Construct User-Agent
     # Example: MyEducationalCrawler/1.0 (+http://example.com/crawler-info; mailto:user@example.com)

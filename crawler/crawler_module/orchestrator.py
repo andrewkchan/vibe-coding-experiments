@@ -44,9 +44,37 @@ class CrawlerOrchestrator:
                 timeout=30
             )
         else:  # PostgreSQL
-            # For PostgreSQL, scale pool size with workers but cap it
-            min_pool = min(10, config.max_workers)
-            max_pool = min(config.max_workers + 10, 100)  # Cap at 100 connections
+            # For PostgreSQL, we need to be careful about connection limits
+            # PostgreSQL default max_connections is often 100
+            # We need to leave some connections for monitoring and other processes
+            
+            # Check for manual pool size override
+            pool_size_override = os.environ.get('CRAWLER_PG_POOL_SIZE')
+            if pool_size_override:
+                try:
+                    max_pool = int(pool_size_override)
+                    min_pool = min(10, max_pool)
+                    logger.info(f"Using manual PostgreSQL pool size: min={min_pool}, max={max_pool}")
+                except ValueError:
+                    logger.warning(f"Invalid CRAWLER_PG_POOL_SIZE value: {pool_size_override}, using automatic sizing")
+                    pool_size_override = None
+            
+            if not pool_size_override:
+                # Estimate reasonable pool size based on workers
+                # Not all workers need a connection simultaneously
+                # Workers spend time fetching URLs, parsing, etc.
+                concurrent_db_fraction = 0.3  # Assume ~30% of workers need DB at once
+                
+                min_pool = min(10, config.max_workers)
+                # Calculate max based on expected concurrent needs
+                estimated_concurrent = int(config.max_workers * concurrent_db_fraction)
+                # Leave 20 connections for psql, monitoring, etc.
+                safe_max = 80  # Assuming max_connections=100
+                max_pool = min(max(estimated_concurrent, 20), safe_max)
+                
+                logger.info(f"PostgreSQL pool configuration: min={min_pool}, max={max_pool} "
+                           f"(for {config.max_workers} workers)")
+            
             self.db_backend = create_backend(
                 'postgresql',
                 db_url=config.db_url,
