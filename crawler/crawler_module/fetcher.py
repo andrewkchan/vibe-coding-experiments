@@ -44,7 +44,6 @@ class Fetcher:
                 ttl_dns_cache=300,  # DNS cache timeout in seconds
                 enable_cleanup_closed=True,  # Clean up closed connections
                 force_close=True,  # Force close connections after each request to free up FDs
-                keepalive_timeout=30,  # Reduce keepalive to free connections faster
             )
             
             self.session = aiohttp.ClientSession(
