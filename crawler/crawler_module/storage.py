@@ -80,13 +80,12 @@ class StorageManager:
                 """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed ON frontier (claimed_at)")
-
                 # Add claimed_at column if upgrading from version 1
                 if current_version == 1:
                     cursor.execute("ALTER TABLE frontier ADD COLUMN claimed_at INTEGER DEFAULT NULL")
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed ON frontier (claimed_at)")
                     logger.info("Added claimed_at column to frontier table")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed ON frontier (claimed_at)")
 
                 # Visited URLs Table
                 cursor.execute("""
