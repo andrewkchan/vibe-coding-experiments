@@ -11,7 +11,7 @@ from .db_pool import SQLiteConnectionPool
 
 logger = logging.getLogger(__name__)
 
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
 
 class StorageManager:
     def __init__(self, config: CrawlerConfig, db_pool: SQLiteConnectionPool):
@@ -74,11 +74,19 @@ class StorageManager:
                     domain TEXT NOT NULL,
                     depth INTEGER DEFAULT 0,
                     added_timestamp INTEGER NOT NULL,
-                    priority_score REAL DEFAULT 0
+                    priority_score REAL DEFAULT 0,
+                    claimed_at INTEGER DEFAULT NULL
                 )
                 """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed ON frontier (claimed_at)")
+
+                # Add claimed_at column if upgrading from version 1
+                if current_version == 1:
+                    cursor.execute("ALTER TABLE frontier ADD COLUMN claimed_at INTEGER DEFAULT NULL")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed ON frontier (claimed_at)")
+                    logger.info("Added claimed_at column to frontier table")
 
                 # Visited URLs Table
                 cursor.execute("""

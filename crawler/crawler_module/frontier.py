@@ -167,8 +167,8 @@ class FrontierManager:
                     return False 
 
                 cursor.execute(
-                    "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score) VALUES (?, ?, ?, ?, ?)",
-                    (normalized_url, domain, depth, int(time.time()), 0)
+                    "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (normalized_url, domain, depth, int(time.time()), 0, None)
                 )
                 if cursor.rowcount > 0:
                     conn_from_pool.commit() # Explicit commit for INSERT
@@ -255,84 +255,137 @@ class FrontierManager:
 
     async def get_next_url(self) -> tuple[str, str, int] | None: # (url, domain, id)
         """Gets the next URL to crawl from the frontier, respecting politeness rules.
-        Uses pooled connections for DB operations.
-        Removes the URL from the frontier upon retrieval.
+        Uses atomic claim-and-read with SQLite's RETURNING clause to minimize contention.
         """
-        candidate_check_limit = self.config.max_workers * 5 # Make this configurable?
-        selected_url_info = None
+        batch_size = 10  # Claim a small batch to amortize DB overhead
+        claim_expiry_seconds = 300  # URLs claimed but not processed expire after 5 minutes
         conn_from_pool: sqlite3.Connection | None = None
+        
+        # Get worker identifier for logging
+        worker_task = asyncio.current_task()
+        worker_name = worker_task.get_name() if worker_task else "unknown"
 
         try:
-            # Get a connection for the duration of this potentially multi-step operation
             conn_from_pool = self.storage.db_pool.get_connection()
-
-            def _get_candidates_sync_threaded_pooled(conn: sqlite3.Connection):
-                cursor = conn.cursor()
-                try:
-                    cursor.execute(
-                        "SELECT id, url, domain FROM frontier ORDER BY added_timestamp ASC LIMIT ?", 
-                        (candidate_check_limit,)
-                    )
-                    return cursor.fetchall()
-                finally:
-                    cursor.close()
             
-            # Pass the obtained connection to the threaded function
-            candidates = await asyncio.to_thread(_get_candidates_sync_threaded_pooled, conn_from_pool)
-
-            if not candidates:
+            # Atomically claim a batch of URLs
+            claimed_urls = await asyncio.to_thread(
+                self._atomic_claim_urls_sync, conn_from_pool, batch_size, claim_expiry_seconds
+            )
+            
+            if not claimed_urls:
                 return None
-
-            for url_id, url, domain in candidates:
-                # Politeness check is async, happens outside the threaded DB operation
-                # Pass the existing connection to politeness methods
-                if not await self.politeness.is_url_allowed(url, conn_from_pool):
-                    logger.debug(f"URL {url} disallowed by politeness rules. Removing from frontier (pool).")
-                    
-                    def _delete_disallowed_url_sync_threaded_pooled(conn: sqlite3.Connection):
-                        cursor = conn.cursor()
-                        try:
-                            cursor.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
-                            conn.commit()
-                        finally:
-                            cursor.close()
-                    await asyncio.to_thread(_delete_disallowed_url_sync_threaded_pooled, conn_from_pool)
-                    self.seen_urls.add(url) 
-                    continue 
-
-                if await self.politeness.can_fetch_domain_now(domain, conn_from_pool):
-                    await self.politeness.record_domain_fetch_attempt(domain, conn_from_pool) # Async, non-DB
-                    
-                    def _delete_selected_url_sync_threaded_pooled(conn: sqlite3.Connection):
-                        cursor = conn.cursor()
-                        try:
-                            cursor.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
-                            conn.commit()
-                        finally:
-                            cursor.close()
-                    await asyncio.to_thread(_delete_selected_url_sync_threaded_pooled, conn_from_pool)
-                    
-                    logger.debug(f"Retrieved from frontier: {url} (ID: {url_id}) for domain {domain} (pool)")
-                    selected_url_info = (url, domain, url_id)
-                    break # Found a suitable URL
-                else:
-                    pass 
             
-            if not selected_url_info:
-                logger.debug(f"No suitable URL found in the first {len(candidates)} candidates that respects politeness rules now.")
-                pass
-
-        except sqlite3.Error as e: 
-            logger.error(f"DB Error getting next URL from frontier (pool): {e}", exc_info=True)
-            if conn_from_pool: # Try to rollback if commit failed or other op failed
+            logger.debug(f"{worker_name} claimed {len(claimed_urls)} URLs for processing")
+            
+            # Track which URLs we need to unclaim if we return early
+            urls_to_unclaim = []
+            selected_url_info = None
+            
+            # Process claimed URLs with politeness checks
+            for i, (url_id, url, domain) in enumerate(claimed_urls):
+                # Check if URL is allowed by robots.txt and manual exclusions
+                if not await self.politeness.is_url_allowed(url, conn_from_pool):
+                    logger.debug(f"URL {url} (ID: {url_id}) disallowed by politeness rules. Removing.")
+                    await asyncio.to_thread(self._delete_url_sync, conn_from_pool, url_id)
+                    self.seen_urls.add(url)
+                    continue
+                
+                # Check if we can fetch from this domain now
+                if await self.politeness.can_fetch_domain_now(domain, conn_from_pool):
+                    await self.politeness.record_domain_fetch_attempt(domain, conn_from_pool)
+                    logger.debug(f"{worker_name} processing URL ID {url_id} ({url}) from domain {domain}")
+                    # Delete the URL since we're processing it
+                    await asyncio.to_thread(self._delete_url_sync, conn_from_pool, url_id)
+                    selected_url_info = (url, domain, url_id)
+                    # Mark remaining URLs to be unclaimed
+                    urls_to_unclaim = [(uid, u, d) for uid, u, d in claimed_urls[i+1:]]
+                    break
+                else:
+                    # Domain not ready - unclaim this URL so another worker can try later
+                    await asyncio.to_thread(self._unclaim_url_sync, conn_from_pool, url_id)
+                    logger.debug(f"Domain {domain} not ready for fetch, unclaimed URL ID {url_id}")
+            
+            # Unclaim any remaining URLs if we found one to process
+            for url_id, url, domain in urls_to_unclaim:
+                await asyncio.to_thread(self._unclaim_url_sync, conn_from_pool, url_id)
+                logger.debug(f"Unclaimed remaining URL ID {url_id} from batch")
+            
+            return selected_url_info
+            
+        except sqlite3.Error as e:
+            logger.error(f"DB Error in get_next_url: {e}", exc_info=True)
+            if conn_from_pool:
                 try: conn_from_pool.rollback()
                 except: pass
-            return None 
-        except Exception as e: # Catch other exceptions like pool Empty
-            logger.error(f"Unexpected or Pool error during get_next_url (pool): {e}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error in get_next_url: {e}", exc_info=True)
             return None
         finally:
             if conn_from_pool:
                 self.storage.db_pool.return_connection(conn_from_pool)
+
+    def _atomic_claim_urls_sync(self, conn: sqlite3.Connection, batch_size: int, claim_expiry_seconds: int) -> list[tuple[int, str, str]]:
+        """Atomically claims a batch of URLs using UPDATE...RETURNING.
+        Returns list of (id, url, domain) tuples for claimed URLs."""
+        cursor = conn.cursor()
+        claim_timestamp = int(time.time() * 1000000)  # Microsecond precision
+        expired_timestamp = claim_timestamp - (claim_expiry_seconds * 1000000)
         
-        return selected_url_info 
+        try:
+            # First, release any expired claims
+            cursor.execute("""
+                UPDATE frontier 
+                SET claimed_at = NULL 
+                WHERE claimed_at IS NOT NULL AND claimed_at < ?
+            """, (expired_timestamp,))
+            
+            # Atomically claim unclaimed URLs using RETURNING
+            cursor.execute("""
+                UPDATE frontier 
+                SET claimed_at = ? 
+                WHERE id IN (
+                    SELECT id FROM frontier 
+                    WHERE claimed_at IS NULL
+                    ORDER BY added_timestamp ASC 
+                    LIMIT ?
+                )
+                RETURNING id, url, domain
+            """, (claim_timestamp, batch_size))
+            
+            claimed_urls = cursor.fetchall()
+            conn.commit()
+            
+            return claimed_urls
+            
+        except sqlite3.Error as e:
+            logger.error(f"DB error in atomic claim: {e}")
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def _delete_url_sync(self, conn: sqlite3.Connection, url_id: int):
+        """Deletes a URL from the frontier after processing or if disallowed."""
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"DB error deleting URL ID {url_id}: {e}")
+            conn.rollback()
+        finally:
+            cursor.close()
+
+    def _unclaim_url_sync(self, conn: sqlite3.Connection, url_id: int):
+        """Releases a claim on a URL so other workers can process it."""
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE frontier SET claimed_at = NULL WHERE id = ?", (url_id,))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"DB error unclaiming URL ID {url_id}: {e}")
+            conn.rollback()
+        finally:
+            cursor.close()
