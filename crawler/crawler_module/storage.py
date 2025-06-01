@@ -7,23 +7,24 @@ import asyncio # For to_thread if needed for DB, and for async file saving
 import aiofiles # For async file operations
 
 from .config import CrawlerConfig # Assuming config.py is in the same directory
+from .db_backends import DatabaseBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
 
 class StorageManager:
-    def __init__(self, config: CrawlerConfig):
+    def __init__(self, config: CrawlerConfig, db_backend: DatabaseBackend):
         self.config = config
         self.data_dir = Path(config.data_dir)
-        self.db_path = self.data_dir / "crawler_state.db"
+        self.db_path = self.data_dir / "crawler_state.db" if config.db_type == "sqlite" else None
         self.content_dir = self.data_dir / "content"
-        self.conn = None
+        self.db = db_backend
 
         self._init_storage()
 
     def _init_storage(self):
-        """Initializes the data directory, content directory, and database."""
+        """Initializes the data directory, content directory, and database schema."""
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             self.content_dir.mkdir(parents=True, exist_ok=True)
@@ -32,93 +33,110 @@ class StorageManager:
             logger.error(f"Error creating storage directories: {e}")
             raise
 
-        self._init_db()
-
-    def _init_db(self):
-        """Initializes the SQLite database and creates tables if they don't exist."""
+    async def init_db_schema(self):
+        """Initializes the database schema if it doesn't exist or needs upgrade."""
         try:
-            self.conn = sqlite3.connect(self.db_path, timeout=10) # Increased timeout
-            logger.info(f"Connected to database: {self.db_path}")
-            self._create_tables()
-        except sqlite3.Error as e:
-            logger.error(f"Database error during initialization: {e}")
-            if self.conn:
-                self.conn.close()
+            logger.info(f"Initializing database schema for {self.config.db_type}")
+            await self._create_tables()
+        except Exception as e:
+            logger.error(f"Database error during schema initialization: {e}")
             raise
 
-    def _create_tables(self):
+    async def _create_tables(self):
         """Creates the necessary tables in the database if they don't already exist."""
-        if not self.conn:
-            raise sqlite3.Error("Database connection not established.")
+        try:
+            # Check current schema version
+            await self.db.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)
+            """)
+            
+            row = await self.db.fetch_one("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
+            current_version = row[0] if row else 0
 
-        with self.conn as conn: # Use context manager for cursor and commit/rollback
-            cursor = conn.cursor()
-            try:
-                # Check current schema version
-                cursor.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
-                cursor.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
-                row = cursor.fetchone()
-                current_version = row[0] if row else 0
-
-                if current_version < DB_SCHEMA_VERSION:
-                    logger.info(f"Database schema version is {current_version}. Upgrading to {DB_SCHEMA_VERSION}.")
-                    
-                    # Frontier Table
-                    cursor.execute("""
+            if current_version < DB_SCHEMA_VERSION:
+                logger.info(f"Database schema version is {current_version}. Upgrading to {DB_SCHEMA_VERSION}.")
+                
+                # Frontier Table - adjust for PostgreSQL/SQLite differences
+                if self.config.db_type == "postgresql":
+                    await self.db.execute("""
+                    CREATE TABLE IF NOT EXISTS frontier (
+                        id SERIAL PRIMARY KEY,
+                        url TEXT UNIQUE NOT NULL,
+                        domain TEXT NOT NULL,
+                        depth INTEGER DEFAULT 0,
+                        added_timestamp BIGINT NOT NULL,
+                        priority_score REAL DEFAULT 0,
+                        claimed_at BIGINT DEFAULT NULL
+                    )
+                    """)
+                else:  # SQLite
+                    await self.db.execute("""
                     CREATE TABLE IF NOT EXISTS frontier (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         url TEXT UNIQUE NOT NULL,
                         domain TEXT NOT NULL,
                         depth INTEGER DEFAULT 0,
                         added_timestamp INTEGER NOT NULL,
-                        priority_score REAL DEFAULT 0
+                        priority_score REAL DEFAULT 0,
+                        claimed_at INTEGER DEFAULT NULL
                     )
                     """)
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)")
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)")
+                
+                # Create indexes
+                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)")
+                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)")
+                
+                # Add claimed_at column if upgrading from version 1 (SQLite only)
+                if current_version == 1 and self.config.db_type == "sqlite":
+                    try:
+                        await self.db.execute("ALTER TABLE frontier ADD COLUMN claimed_at INTEGER DEFAULT NULL")
+                        logger.info("Added claimed_at column to frontier table")
+                    except:
+                        # Column might already exist
+                        pass
+                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed ON frontier (claimed_at)")
 
-                    # Visited URLs Table
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS visited_urls (
-                        url_sha256 TEXT PRIMARY KEY,
-                        url TEXT NOT NULL,
-                        domain TEXT NOT NULL,
-                        crawled_timestamp INTEGER NOT NULL,
-                        http_status_code INTEGER,
-                        content_type TEXT,
-                        content_hash TEXT,
-                        content_storage_path TEXT,
-                        redirected_to_url TEXT
-                    )
-                    """)
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_visited_domain ON visited_urls (domain)")
+                # Visited URLs Table
+                await self.db.execute("""
+                CREATE TABLE IF NOT EXISTS visited_urls (
+                    url_sha256 TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    crawled_timestamp BIGINT NOT NULL,
+                    http_status_code INTEGER,
+                    content_type TEXT,
+                    content_hash TEXT,
+                    content_storage_path TEXT,
+                    redirected_to_url TEXT
+                )
+                """)
+                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_visited_domain ON visited_urls (domain)")
 
-                    # Domain Metadata Table
-                    cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS domain_metadata (
-                        domain TEXT PRIMARY KEY,
-                        last_scheduled_fetch_timestamp INTEGER DEFAULT 0,
-                        robots_txt_content TEXT,
-                        robots_txt_fetched_timestamp INTEGER,
-                        robots_txt_expires_timestamp INTEGER,
-                        is_manually_excluded INTEGER DEFAULT 0,
-                        is_seeded INTEGER DEFAULT 0
-                    )
-                    """)
-                    
-                    # Update schema version
-                    cursor.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (DB_SCHEMA_VERSION,))
-                    # conn.commit() is handled by with statement
-                    logger.info("Database tables created/updated successfully.")
-                else:
-                    logger.info(f"Database schema is up to date (version {current_version}).")
+                # Domain Metadata Table
+                await self.db.execute("""
+                CREATE TABLE IF NOT EXISTS domain_metadata (
+                    domain TEXT PRIMARY KEY,
+                    last_scheduled_fetch_timestamp BIGINT DEFAULT 0,
+                    robots_txt_content TEXT,
+                    robots_txt_fetched_timestamp BIGINT,
+                    robots_txt_expires_timestamp BIGINT,
+                    is_manually_excluded INTEGER DEFAULT 0,
+                    is_seeded INTEGER DEFAULT 0
+                )
+                """)
+                
+                # Update schema version
+                if self.config.db_type == "postgresql":
+                    await self.db.execute("INSERT INTO schema_version (version) VALUES (%s) ON CONFLICT DO NOTHING", (DB_SCHEMA_VERSION,))
+                else:  # SQLite
+                    await self.db.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (DB_SCHEMA_VERSION,))
+                logger.info("Database tables created/updated successfully.")
+            else:
+                logger.info(f"Database schema is up to date (version {current_version}).")
 
-            except sqlite3.Error as e:
-                logger.error(f"Error creating database tables: {e}")
-                # conn.rollback() handled by with statement on error
-                raise
-            finally:
-                cursor.close()
+        except Exception as e:
+            logger.error(f"Error creating database tables: {e}")
+            raise
 
     def get_url_sha256(self, url: str) -> str:
         """Generates a SHA256 hash for a given URL."""
@@ -142,7 +160,7 @@ class StorageManager:
             logger.error(f"Unexpected error saving content file {file_path}: {e}", exc_info=True)
             return None
 
-    def add_visited_page(
+    async def add_visited_page(
         self, 
         url: str, 
         domain: str,
@@ -153,44 +171,43 @@ class StorageManager:
         content_storage_path_str: str | None = None, 
         redirected_to_url: str | None = None
     ):
-        """Adds a record of a visited page to the database.
-           This method is expected to be called via asyncio.to_thread if in an async context.
-        """
+        """Adds a record of a visited page to the database."""
         url_sha256 = self.get_url_sha256(url)
         content_hash: str | None = None
         if content_text:
             content_hash = hashlib.sha256(content_text.encode('utf-8')).hexdigest()
 
-        conn_threaded = None # Define before try block for finally
-        cursor = None
         try:
-            # This method is run in a separate thread by asyncio.to_thread,
-            # so it must establish its own database connection.
-            conn_threaded = sqlite3.connect(self.db_path, timeout=10)
-            cursor = conn_threaded.cursor()
-            cursor.execute("""
-            INSERT OR REPLACE INTO visited_urls 
-            (url_sha256, url, domain, crawled_timestamp, http_status_code, content_type, content_hash, content_storage_path, redirected_to_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                url_sha256, url, domain, crawled_timestamp, status_code, 
-                content_type, content_hash, content_storage_path_str, redirected_to_url
-            ))
-            conn_threaded.commit()
+            if self.config.db_type == "postgresql":
+                await self.db.execute("""
+                INSERT INTO visited_urls 
+                (url_sha256, url, domain, crawled_timestamp, http_status_code, content_type, content_hash, content_storage_path, redirected_to_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (url_sha256) DO UPDATE SET
+                    crawled_timestamp = excluded.crawled_timestamp,
+                    http_status_code = excluded.http_status_code,
+                    content_type = excluded.content_type,
+                    content_hash = excluded.content_hash,
+                    content_storage_path = excluded.content_storage_path,
+                    redirected_to_url = excluded.redirected_to_url
+                """, (
+                    url_sha256, url, domain, crawled_timestamp, status_code, 
+                    content_type, content_hash, content_storage_path_str, redirected_to_url
+                ))
+            else:  # SQLite
+                await self.db.execute("""
+                INSERT OR REPLACE INTO visited_urls 
+                (url_sha256, url, domain, crawled_timestamp, http_status_code, content_type, content_hash, content_storage_path, redirected_to_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    url_sha256, url, domain, crawled_timestamp, status_code, 
+                    content_type, content_hash, content_storage_path_str, redirected_to_url
+                ))
             logger.info(f"Recorded visited URL: {url} (Status: {status_code})")
-        except sqlite3.Error as e:
+        except Exception as e:
             logger.error(f"DB error adding visited page {url}: {e}")
-            if conn_threaded: # If connection was made, try to rollback
-                try:
-                    conn_threaded.rollback()
-                except sqlite3.Error as re:
-                    logger.error(f"DB error during rollback for {url}: {re}")
-        finally:
-            if cursor: cursor.close()
-            if conn_threaded: conn_threaded.close()
+            raise
 
-    def close(self):
-        """Closes the database connection."""
-        if self.conn:
-            self.conn.close()
-            logger.info("Database connection closed.") 
+    async def close(self):
+        """Close database connections."""
+        await self.db.close()

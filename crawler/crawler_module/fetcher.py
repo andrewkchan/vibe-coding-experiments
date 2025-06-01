@@ -33,10 +33,14 @@ class Fetcher:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Returns the existing aiohttp session or creates a new one."""
         if self.session is None or self.session.closed:
-            # Create a connector with reasonable limits to prevent resource exhaustion
+            # Create a connector with conservative limits for high worker count
+            # With 500 workers, we need to be careful about file descriptors
+            max_total_connections = min(1000, self.config.max_workers * 2)  # Scale with workers
+            max_per_host = max(5, min(20, max_total_connections // 50))  # Conservative per-host limit
+            
             connector = aiohttp.TCPConnector(
-                limit=200,  # Total connection pool limit (across all hosts)
-                limit_per_host=30,  # Max connections per host
+                limit=max_total_connections,  # Total connection pool limit
+                limit_per_host=max_per_host,  # Max connections per host
                 ttl_dns_cache=300,  # DNS cache timeout in seconds
                 enable_cleanup_closed=True,  # Clean up closed connections
                 force_close=True,  # Force close connections after each request to free up FDs
@@ -47,7 +51,7 @@ class Fetcher:
                 headers={"User-Agent": self.config.user_agent},
                 connector=connector,
             )
-            logger.debug("Created new aiohttp.ClientSession")
+            logger.debug(f"Created new aiohttp.ClientSession with limit={max_total_connections}, limit_per_host={max_per_host}")
         return self.session
 
     async def close_session(self):

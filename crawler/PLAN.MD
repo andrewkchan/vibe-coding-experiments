@@ -13,7 +13,7 @@ The project prioritizes simplicity and educational value, using Python as the co
 
 ## 2. Architecture
 
-The crawler will be an asynchronous, single-process application.
+The crawler will be an asynchronous, single-process application with support for high concurrency through PostgreSQL.
 
 ### 2.1. Core Components
 
@@ -23,6 +23,7 @@ The crawler will be an asynchronous, single-process application.
     *   Manages the queue of URLs to be crawled (the "frontier").
     *   Prioritizes URLs based on domain politeness rules (e.g., 70-second delay per domain).
     *   Persists the frontier for fault tolerance.
+    *   Uses atomic claim-and-read pattern to prevent worker contention.
 *   **Fetcher (`asyncio`/`aiohttp`):**
     *   Downloads web page content for a given URL.
     *   Sets the custom User-Agent string.
@@ -34,12 +35,17 @@ The crawler will be an asynchronous, single-process application.
     *   Extracts new links (URLs) from downloaded HTML content.
     *   Extracts the main text content from the page.
 *   **Storage Manager:**
-    *   **State Storage (SQLite):** Persists the frontier, set of visited URLs, domain last-crawl timestamps, `robots.txt` cache, and manually excluded domains.
+    *   **State Storage (PostgreSQL/SQLite):** Persists the frontier, set of visited URLs, domain last-crawl timestamps, `robots.txt` cache, and manually excluded domains.
+        - **PostgreSQL (recommended for production)**: Handles high concurrency with MVCC, supports hundreds of concurrent workers
+        - **SQLite (for testing/small scale)**: Simple setup, limited to ~50-100 concurrent workers
     *   **Content Storage (File System):** Stores extracted text content in files.
 *   **Politeness Enforcer:**
     *   Ensures `robots.txt` rules are followed.
     *   Enforces the 70-second delay between crawls of the same domain.
     *   Manages the user-provided exclusion list.
+*   **Database Abstraction Layer:**
+    *   Provides a common interface for both PostgreSQL and SQLite backends
+    *   Handles connection pooling and query translation if needed
 
 ### 2.2. Data Flow
 
@@ -141,16 +147,19 @@ graph TD
 *   **Max Concurrent Requests:** Number of simultaneous fetch operations.
 *   **Target Page Count / Duration:** Optional limits for the crawl.
 
-### 3.2. State Storage (SQLite Database - `crawler_state.db`)
+### 3.2. State Storage (Database Schema)
+
+The schema is designed to work with both PostgreSQL and SQLite:
 
 *   **`frontier` table:**
-    *   `id` INTEGER PRIMARY KEY AUTOINCREMENT
+    *   `id` SERIAL/INTEGER PRIMARY KEY
     *   `url` TEXT UNIQUE NOT NULL
     *   `domain` TEXT NOT NULL
-    *   `depth` INTEGER DEFAULT 0 (optional, for crawl depth limiting)
-    *   `added_timestamp` INTEGER NOT NULL
-    *   `priority_score` REAL DEFAULT 0 (can be used for scheduling, e.g., based on domain crawl delay)
-    *   *Indexes: `(domain)`, `(priority_score, added_timestamp)`*
+    *   `depth` INTEGER DEFAULT 0
+    *   `added_timestamp` BIGINT NOT NULL
+    *   `priority_score` REAL DEFAULT 0
+    *   `claimed_at` BIGINT DEFAULT NULL (for atomic claim-and-read pattern)
+    *   *Indexes: `(domain)`, `(priority_score, added_timestamp)`, `(claimed_at)`*
 *   **`visited_urls` table:**
     *   `url_sha256` TEXT PRIMARY KEY (SHA256 hash of the normalized URL)
     *   `url` TEXT NOT NULL
@@ -253,7 +262,9 @@ crawler/
 *   **Python 3.8+**
 *   **`aiohttp`:** For asynchronous HTTP requests.
 *   **`beautifulsoup4` or `lxml`:** For HTML parsing. (lxml is generally faster)
-*   **`sqlite3`:** (Python standard library) For state persistence.
+*   **Database drivers:**
+    *   **`psycopg3[binary]`:** PostgreSQL async driver (recommended for production)
+    *   **`sqlite3`:** (Python standard library) For small-scale testing
 *   **`robotexclusionrulesparser` or `reppy`:** For `robots.txt` parsing. `reppy` is often well-regarded.
 *   **`aiofiles`:** For asynchronous file operations (writing content).
 *   *(Optional)* `cchardet` or `charset_normalizer`: For robust character encoding detection. `aiohttp` handles basic cases.
@@ -289,7 +300,9 @@ python main.py --seed-file path/to/seeds.txt --email your.email@example.com [opt
 *   `--max-pages <int>`: Maximum number of pages to crawl.
 *   `--max-duration <seconds>`: Maximum duration for the crawl.
 *   `--log-level <level>`: Logging level (e.g., INFO, DEBUG).
-*   `--resume`: Flag to attempt resuming from existing data directory. If not set and data dir exists, it might ask or error. (Or, by default, resume if data dir and DB exist).
+*   `--resume`: Flag to attempt resuming from existing data directory.
+*   `--db-type <sqlite|postgresql>`: Database backend to use (default: sqlite for compatibility, postgresql recommended for scale).
+*   `--db-url <url>`: PostgreSQL connection URL (required if db-type is postgresql).
 
 ## 10. Deployment Considerations (Linux/Ubuntu)
 
@@ -305,6 +318,13 @@ python main.py --seed-file path/to/seeds.txt --email your.email@example.com [opt
     *   The 70-second delay per domain is a major constraint. The crawler must manage a large and diverse set of domains in its frontier to achieve this throughput.
     *   The number of concurrent workers (`--max-workers`) will need careful tuning. Too few will underutilize the network; too many could overwhelm local resources or the network, or appear abusive to remote servers.
     *   Extensive testing and profiling will be needed. The primary bottlenecks are likely to be politeness delays, network latency, CPU for parsing, and disk I/O for storage.
+*   **Database Setup:**
+    *   **For SQLite:** No additional setup required, limited to ~50-100 workers
+    *   **For PostgreSQL:** 
+        - Install PostgreSQL 14+ for better performance
+        - Configure `max_connections` to handle worker count + overhead (e.g., 600 for 500 workers)
+        - Tune `shared_buffers`, `work_mem`, and `maintenance_work_mem` for performance
+        - Use connection pooling (built into psycopg3)
 
 ## 11. Educational Aspects & Simplicity
 
@@ -323,3 +343,26 @@ The 50 million page target remains an ambitious stretch goal. Achieving it would
 *   Favorable network conditions and highly optimized system performance (CPU for parsing, I/O for storage).
 
 The project will proceed with the current architecture, aiming for high performance, and actual throughput will be measured and optimized iteratively. The initial 5-15M pages/24h range serves as a more grounded baseline for success. 
+
+## 13. Database Migration (New Section)
+
+### 13.1. Migrating from SQLite to PostgreSQL
+
+For scaling beyond ~100 workers, migration to PostgreSQL is recommended:
+
+1. **Export SQLite data**: Use provided migration scripts
+2. **Create PostgreSQL database**: 
+   ```sql
+   CREATE DATABASE web_crawler;
+   ```
+3. **Run schema creation**: The crawler will auto-create tables on first run
+4. **Import data**: Use provided import scripts
+5. **Update configuration**: Switch `--db-type` to `postgresql` and provide `--db-url`
+
+### 13.2. Database Abstraction
+
+The crawler uses a database abstraction layer that:
+- Provides async/await interface for both backends
+- Handles connection pooling appropriately for each database
+- Translates queries when needed (most SQL is compatible)
+- Allows easy switching between backends for testing vs. production 

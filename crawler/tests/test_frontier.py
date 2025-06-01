@@ -7,13 +7,13 @@ import logging
 import time
 from dataclasses import dataclass
 from unittest.mock import MagicMock, AsyncMock # Added AsyncMock
-import sqlite3
 
 from crawler_module.frontier import FrontierManager
 from crawler_module.storage import StorageManager
 from crawler_module.config import CrawlerConfig
 from crawler_module.politeness import PolitenessEnforcer # Added
 from crawler_module.fetcher import Fetcher # Added for PolitenessEnforcer mock typing
+from crawler_module.db_backends import create_backend # Use new database abstraction
 
 # Configure basic logging for tests
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -32,6 +32,9 @@ class FrontierTestConfig:
     resume: bool = False
     user_agent: str = "FrontierTestCrawler/1.0"
     seeded_urls_only: bool = False
+    db_type: str = "sqlite"  # Use SQLite for tests
+    db_url: str | None = None
+
 @pytest_asyncio.fixture
 async def temp_test_frontier_dir(tmp_path: Path) -> Path:
     test_data_dir = tmp_path / "test_crawler_data_frontier"
@@ -55,26 +58,29 @@ async def actual_config_for_frontier(frontier_test_config_obj: FrontierTestConfi
     return CrawlerConfig(**vars(frontier_test_config_obj))
 
 @pytest_asyncio.fixture
-async def storage_manager_for_frontier(actual_config_for_frontier: CrawlerConfig) -> StorageManager:
-    sm = StorageManager(config=actual_config_for_frontier)
+async def db_backend(actual_config_for_frontier: CrawlerConfig):
+    """Provides a database backend for tests."""
+    backend = create_backend(
+        'sqlite',
+        db_path=actual_config_for_frontier.data_dir / "test_crawler_state.db",
+        pool_size=1,
+        timeout=10
+    )
+    await backend.initialize()
+    yield backend
+    await backend.close()
+
+@pytest_asyncio.fixture
+async def storage_manager_for_frontier(actual_config_for_frontier: CrawlerConfig, db_backend) -> StorageManager:
+    sm = StorageManager(config=actual_config_for_frontier, db_backend=db_backend)
+    await sm.init_db_schema()
     yield sm
-    sm.close()
-    if actual_config_for_frontier.seed_file.exists():
-        actual_config_for_frontier.seed_file.unlink()
 
 @pytest_asyncio.fixture
 def mock_politeness_enforcer_for_frontier(actual_config_for_frontier: CrawlerConfig, 
-                                          mock_storage_manager: MagicMock, # Re-use from politeness tests if compatible or make new
+                                          mock_storage_manager: MagicMock, 
                                           mock_fetcher: MagicMock) -> MagicMock:
     """Provides a mocked PolitenessEnforcer for FrontierManager tests."""
-    # mock_pe = MagicMock(spec=PolitenessEnforcer)
-    # If PolitenessEnforcer constructor does things (like _load_manual_exclusions), 
-    # we might need to mock those if they interfere, or use a real PE with mocked sub-components.
-    # For now, let's try a real PE with mocked fetcher and storage for its init, then mock its methods.
-    
-    # Create a basic mock storage for PE's init if it needs one.
-    # The one passed to FrontierManager (storage_manager_for_frontier) is real for its tests.
-    # This can be tricky. Let's assume PE init is tested elsewhere and mock its methods directly.
     mock_pe = AsyncMock(spec=PolitenessEnforcer)
     
     # Default mock behaviors for permissive testing of FrontierManager
@@ -82,6 +88,7 @@ def mock_politeness_enforcer_for_frontier(actual_config_for_frontier: CrawlerCon
     mock_pe.can_fetch_domain_now = AsyncMock(return_value=True)
     mock_pe.record_domain_fetch_attempt = AsyncMock()
     mock_pe.get_crawl_delay = AsyncMock(return_value=0.0) # So it doesn't delay tests
+    mock_pe._load_manual_exclusions = AsyncMock()  # Mock the async initialization
     return mock_pe
 
 # Fixture for a mock fetcher (can be shared or defined per test file)
@@ -90,17 +97,16 @@ def mock_fetcher() -> MagicMock:
     return AsyncMock(spec=Fetcher)
 
 @pytest.fixture
-def mock_storage_manager() -> MagicMock: # For PolitenessEnforcer init if needed by mock_politeness_enforcer_for_frontier
+def mock_storage_manager() -> MagicMock: # This mock is for PolitenessEnforcer, may not need db if methods are mocked
     mock = MagicMock(spec=StorageManager)
-    mock.conn = MagicMock(spec=sqlite3.Connection)
-    mock.conn.cursor.return_value.__enter__.return_value = MagicMock(spec=sqlite3.Cursor)
-    mock.conn.cursor.return_value.__exit__.return_value = None
+    # Mock the db attribute with async methods
+    mock.db = AsyncMock()
     return mock
 
 @pytest_asyncio.fixture
 async def frontier_manager(
     actual_config_for_frontier: CrawlerConfig, 
-    storage_manager_for_frontier: StorageManager, 
+    storage_manager_for_frontier: StorageManager, # This SM instance now uses the db_backend fixture
     mock_politeness_enforcer_for_frontier: MagicMock
 ) -> FrontierManager:
     fm = FrontierManager(
@@ -117,8 +123,7 @@ async def test_frontier_initialization_new(frontier_manager: FrontierManager, mo
     mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True 
     
     await frontier_manager.initialize_frontier() 
-    # count_frontier is synchronous but uses DB; wrap for asyncio test
-    assert await asyncio.to_thread(frontier_manager.count_frontier) == 2 
+    assert await frontier_manager.count_frontier() == 2 
     logger.info("Frontier initialization (new) test passed.")
     # Check that is_url_allowed was called for seeds
     assert mock_politeness_enforcer_for_frontier.is_url_allowed.call_count >= 2 
@@ -131,23 +136,20 @@ async def test_add_and_get_urls(frontier_manager: FrontierManager, mock_politene
     mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
 
     await frontier_manager.initialize_frontier() 
-    initial_count = await asyncio.to_thread(frontier_manager.count_frontier)
+    initial_count = await frontier_manager.count_frontier()
     assert initial_count == 2
 
     # Test adding a new URL
     await frontier_manager.add_url("http://test.com/page1")
-    assert await asyncio.to_thread(frontier_manager.count_frontier) == 3
+    assert await frontier_manager.count_frontier() == 3
     # is_url_allowed should be called by add_url
     # Initial calls for seeds + 1 for this add_url
     assert mock_politeness_enforcer_for_frontier.is_url_allowed.call_count >= 3 
 
-    # Try adding a duplicate of a seed - should not increase count, is_url_allowed may or may not be called based on seen_urls check order
-    # Reset call count for is_url_allowed before this specific check if needed, or check total count carefully.
+    # Try adding a duplicate of a seed - should not increase count
     current_is_allowed_calls = mock_politeness_enforcer_for_frontier.is_url_allowed.call_count
     await frontier_manager.add_url("http://example.com/seed1")
-    assert await asyncio.to_thread(frontier_manager.count_frontier) == 3
-    # If URL is in seen_urls, is_url_allowed might not be called. This depends on FrontierManager's internal logic order.
-    # Let's assume for now it might be called or not, so we don't assert exact count here strictly.
+    assert await frontier_manager.count_frontier() == 3
 
     # Get URLs
     # For get_next_url, ensure politeness checks are permissive for testing FIFO logic here
@@ -163,9 +165,6 @@ async def test_add_and_get_urls(frontier_manager: FrontierManager, mock_politene
         assert next_url_info is not None, f"Expected URL, got None at iteration {i}"
         retrieved_urls.append(next_url_info[0])
         # Politeness checks for get_next_url
-        # is_url_allowed is called for each candidate fetched from DB before can_fetch_domain_now
-        # can_fetch_domain_now is called if is_url_allowed passes
-        # record_domain_fetch_attempt is called if both pass
         assert mock_politeness_enforcer_for_frontier.is_url_allowed.called
         assert mock_politeness_enforcer_for_frontier.can_fetch_domain_now.called
         assert mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.called
@@ -175,7 +174,7 @@ async def test_add_and_get_urls(frontier_manager: FrontierManager, mock_politene
         mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.reset_mock()
 
     assert retrieved_urls == expected_order
-    assert await asyncio.to_thread(frontier_manager.count_frontier) == 0
+    assert await frontier_manager.count_frontier() == 0
 
     next_url_info = await frontier_manager.get_next_url()
     assert next_url_info is None, "Frontier should be empty"
@@ -185,58 +184,66 @@ async def test_add_and_get_urls(frontier_manager: FrontierManager, mock_politene
 async def test_frontier_resume_with_politeness(
     temp_test_frontier_dir: Path, 
     frontier_test_config_obj: FrontierTestConfig,
-    mock_politeness_enforcer_for_frontier: MagicMock # Use the same mock for both runs for simplicity here
-                                                # or create a new one if state needs to be distinct.
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    # tmp_path is needed to create distinct DBs for each run if not using a shared fixture pool
+    tmp_path: Path 
 ):
     logger.info("Testing Frontier Resume Functionality with Politeness Mocks")
     
     # Permissive politeness for all operations in this test
     mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
     mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
-    mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.return_value = None
+    mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.return_value = None # AsyncMock should return None by default
+
+    # Define a unique DB file for this multi-run test
+    db_file_for_resume_test = temp_test_frontier_dir / "resume_test_frontier.db"
 
     # --- First run: populate and close ---
     cfg_run1_dict = vars(frontier_test_config_obj).copy()
     cfg_run1_dict['resume'] = False # Ensure it's a new run
     cfg_run1 = CrawlerConfig(**cfg_run1_dict)
     
-    storage_run1 = StorageManager(config=cfg_run1)
+    backend_run1 = create_backend('sqlite', db_path=db_file_for_resume_test, pool_size=1)
+    await backend_run1.initialize()
+    
+    storage_run1 = StorageManager(config=cfg_run1, db_backend=backend_run1)
+    await storage_run1.init_db_schema()
+    
     frontier_run1 = FrontierManager(config=cfg_run1, storage=storage_run1, politeness=mock_politeness_enforcer_for_frontier)
     await frontier_run1.initialize_frontier() 
     await frontier_run1.add_url("http://persistent.com/page_from_run1")
-    assert await asyncio.to_thread(frontier_run1.count_frontier) == 3
+    assert await frontier_run1.count_frontier() == 3
     
     url_to_retrieve = await frontier_run1.get_next_url()
     assert url_to_retrieve is not None
-    assert await asyncio.to_thread(frontier_run1.count_frontier) == 2 
-    storage_run1.close()
+    assert await frontier_run1.count_frontier() == 2 
+    await backend_run1.close()
 
     # --- Second run: resume --- 
     cfg_run2_dict = vars(frontier_test_config_obj).copy()
     cfg_run2_dict['resume'] = True
     cfg_run2 = CrawlerConfig(**cfg_run2_dict)
 
-    storage_run2 = StorageManager(config=cfg_run2)
-    # For resume, we use the same mocked politeness enforcer. Its state (like in-memory robots cache)
-    # is not what we are testing here; we test Frontier's ability to load from DB.
+    backend_run2 = create_backend('sqlite', db_path=db_file_for_resume_test, pool_size=1)
+    await backend_run2.initialize()
+    
+    storage_run2 = StorageManager(config=cfg_run2, db_backend=backend_run2)
+    await storage_run2.init_db_schema()
+    
     frontier_run2 = FrontierManager(config=cfg_run2, storage=storage_run2, politeness=mock_politeness_enforcer_for_frontier)
     await frontier_run2.initialize_frontier() 
     
-    assert await asyncio.to_thread(frontier_run2.count_frontier) == 2 
+    assert await frontier_run2.count_frontier() == 2 
 
     # Try to get the remaining URLs
     next_url = await frontier_run2.get_next_url()
     assert next_url is not None
-    # Order depends on timestamps; assuming example.org/seed2 was added after example.com/seed1 was taken
-    # and persistent.com after that. So, example.org/seed2 should be next if it was second seed.
-    # Original seeds: example.com/seed1, example.org/seed2. First get_next_url got seed1.
-    # So, example.org/seed2 should be next.
     assert next_url[0] == "http://example.org/seed2" 
 
     next_url = await frontier_run2.get_next_url()
     assert next_url is not None
     assert next_url[0] == "http://persistent.com/page_from_run1"
 
-    assert await asyncio.to_thread(frontier_run2.count_frontier) == 0
-    storage_run2.close()
+    assert await frontier_run2.count_frontier() == 0
+    await backend_run2.close()
     logger.info("Frontier resume test passed with politeness mocks.") 
