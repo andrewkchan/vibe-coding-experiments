@@ -39,6 +39,7 @@ class CrawlerOrchestrator:
         self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
             db_path=data_dir_path / "crawler_state.db", # Use the Path object
             pool_size=config.max_workers, # Pool size can be linked to max_workers
+            timeout=20, # Timeout for getting a connection from the pool
             wal_mode=True # Enable WAL mode for better concurrency by default
         )
         
