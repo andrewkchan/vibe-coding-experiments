@@ -7,7 +7,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 class SQLiteConnectionPool:
-    def __init__(self, db_path: str | Path, pool_size: int = 10, timeout: int = 10, wal_mode: bool = True):
+    def __init__(self, db_path: str | Path, pool_size: int = 10, timeout: int = 30, wal_mode: bool = True):
         self.db_path = str(db_path) # Ensure db_path is a string for sqlite3.connect
         self.timeout = timeout
         self.pool_size = pool_size
@@ -34,6 +34,10 @@ class SQLiteConnectionPool:
             if self.wal_mode:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL") # WAL is durable, NORMAL is faster
+                # Additional optimizations for high concurrency
+                conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+                conn.execute("PRAGMA temp_store=MEMORY")  # Use memory for temp tables
+                conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory-mapped I/O
             self._connections_created += 1
             # logger.debug(f"Created new SQLite connection. Total created: {self._connections_created}")
             return conn
