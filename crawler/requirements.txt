@@ -7,4 +7,8 @@ tldextract
 psutil
 pytest
 pytest-asyncio
-httpx 
+httpx
+
+# Optional dependencies for PostgreSQL support
+# Uncomment the following line to install PostgreSQL driver:
+psycopg[binary,pool]>=3.1 

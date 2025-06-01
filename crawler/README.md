@@ -14,7 +14,26 @@ Refer to `PLAN.MD` for a detailed project plan and architecture.
 *   `crawler_module/frontier.py`: Manages the queue of URLs to be crawled, interacting with storage and politeness rules.
 *   `crawler_module/parser.py`: Parses HTML content using `lxml` to extract links and text.
 *   `crawler_module/orchestrator.py`: Coordinates all components, manages concurrent worker tasks, and controls the overall crawl lifecycle.
+*   `crawler_module/db_backends.py`: Database abstraction layer supporting both SQLite and PostgreSQL.
 *   `main.py`: The main entry point to run the crawler.
+
+## Database Backend Support
+
+The crawler supports two database backends:
+
+### SQLite (Default)
+- **Best for**: Testing, development, and small-scale crawls
+- **Max concurrent workers**: ~50-100
+- **Setup**: No additional setup required
+- **Limitations**: Single writer limitation can cause "database is locked" errors at high concurrency
+
+### PostgreSQL
+- **Best for**: Production use and large-scale crawls
+- **Max concurrent workers**: 500+
+- **Setup**: Requires PostgreSQL installation and configuration
+- **Benefits**: True concurrent writes, better performance at scale
+
+For detailed PostgreSQL setup and migration instructions, see [`PostgreSQL_Migration.md`](PostgreSQL_Migration.md).
 
 ## Setup
 
@@ -37,18 +56,27 @@ Refer to `PLAN.MD` for a detailed project plan and architecture.
     ```bash
     pip install -r requirements.txt
     ```
-    Key dependencies include: `aiohttp`, `lxml`, `robotexclusionrulesparser`, `aiofiles`, `cchardet`, `tldextract`, `pytest`, `pytest-asyncio`, `httpx`.
+    Key dependencies include: `aiohttp`, `lxml`, `robotexclusionrulesparser`, `aiofiles`, `cchardet`, `tldextract`, `pytest`, `pytest-asyncio`, `httpx`, and optionally `psycopg[binary,pool]` for PostgreSQL support.
 
 ## Running the Crawler
 
 The crawler is run via `main.py` from the project root directory (e.g., `vibe-coding-experiments/` if `crawler` is inside it, or directly from `crawler/` if you `cd` into it first):
 
+### Using SQLite (Default)
 ```bash
 python crawler/main.py --seed-file path/to/your/seeds.txt --email your.email@example.com [options]
 ```
 Or if you are inside the `crawler` directory:
 ```bash
 python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com [options]
+```
+
+### Using PostgreSQL
+```bash
+python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com \
+    --db-type postgresql \
+    --db-url "postgresql://user:password@localhost/crawler_db" \
+    --max-workers 500
 ```
 
 **Required Arguments:**
@@ -66,6 +94,21 @@ python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com
 *   `--log-level <LEVEL>`: DEBUG, INFO, WARNING, ERROR (default: INFO).
 *   `--resume`: Attempt to resume from existing data.
 *   `--seeded-urls-only`: Only crawl seeded URLs.
+*   `--db-type <sqlite|postgresql>`: Database backend to use (default: sqlite).
+*   `--db-url <url>`: PostgreSQL connection URL (required if db-type is postgresql).
+
+## System Requirements for High Concurrency
+
+When running with many workers (especially with PostgreSQL), you may need to increase system limits:
+
+```bash
+# Run the provided setup script
+chmod +x setup_system_limits.sh
+./setup_system_limits.sh
+
+# Or manually set limits
+ulimit -n 65536  # Increase file descriptor limit
+```
 
 ## Running Tests
 
@@ -86,4 +129,16 @@ The project uses `pytest` for testing. To run the tests:
 
 *   **Logs:** Check console output or redirect to a file. Log level is configurable.
 *   **Database (`crawler_data/crawler_state.db` within your specified data directory):** Use any SQLite client (e.g., `sqlite3` CLI, DB Browser for SQLite) to inspect tables like `frontier`, `visited_urls`, `domain_metadata`.
-*   **Content Files (`crawler_data/content/` within your specified data directory):** Extracted text content is stored in `.txt` files named by URL hash. 
+*   **Content Files (`crawler_data/content/` within your specified data directory):** Extracted text content is stored in `.txt` files named by URL hash.
+
+## Migrating from SQLite to PostgreSQL
+
+If you have an existing SQLite crawler database and want to migrate to PostgreSQL:
+
+```bash
+python migrate_to_postgresql.py \
+    --sqlite-db crawler_data/crawler_state.db \
+    --pg-url "postgresql://user:password@localhost/crawler_db"
+```
+
+See [`PostgreSQL_Migration.md`](PostgreSQL_Migration.md) for detailed instructions. 

@@ -6,6 +6,7 @@ from pathlib import Path
 DEFAULT_DATA_DIR = "./crawler_data"
 DEFAULT_MAX_WORKERS = 20
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_DB_TYPE = "sqlite"
 
 @dataclass
 class CrawlerConfig:
@@ -20,6 +21,8 @@ class CrawlerConfig:
     resume: bool
     user_agent: str # Will be constructed
     seeded_urls_only: bool
+    db_type: str # sqlite or postgresql
+    db_url: str | None # PostgreSQL connection URL
 
 def parse_args() -> CrawlerConfig:
     parser = argparse.ArgumentParser(description="An experimental web crawler.")
@@ -83,8 +86,25 @@ def parse_args() -> CrawlerConfig:
         action="store_true",
         help="Only crawl seeded URLs."
     )
+    parser.add_argument(
+        "--db-type",
+        type=str,
+        default=DEFAULT_DB_TYPE,
+        choices=["sqlite", "postgresql"],
+        help=f"Database backend to use (default: {DEFAULT_DB_TYPE}). Use 'postgresql' for high concurrency."
+    )
+    parser.add_argument(
+        "--db-url",
+        type=str,
+        default=None,
+        help="PostgreSQL connection URL (required if db-type is postgresql). Example: postgresql://user:pass@localhost/dbname"
+    )
 
     args = parser.parse_args()
+    
+    # Validate database configuration
+    if args.db_type == "postgresql" and not args.db_url:
+        parser.error("--db-url is required when using PostgreSQL (--db-type=postgresql)")
     
     # Construct User-Agent
     # Example: MyEducationalCrawler/1.0 (+http://example.com/crawler-info; mailto:user@example.com)
@@ -102,5 +122,7 @@ def parse_args() -> CrawlerConfig:
         log_level=args.log_level.upper(), # Ensure log level is uppercase for logging module
         resume=args.resume,
         user_agent=user_agent,
-        seeded_urls_only=args.seeded_urls_only
+        seeded_urls_only=args.seeded_urls_only,
+        db_type=args.db_type,
+        db_url=args.db_url
     ) 

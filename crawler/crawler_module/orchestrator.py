@@ -13,7 +13,7 @@ from .politeness import PolitenessEnforcer
 from .frontier import FrontierManager
 from .parser import PageParser, ParseResult
 from .utils import extract_domain # For getting domain for storage
-from .db_pool import SQLiteConnectionPool
+from .db_backends import create_backend
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +35,26 @@ class CrawlerOrchestrator:
             logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
             raise # Stop if we can't create data directory
 
-        # Initialize DB Pool first
-        self.db_pool: SQLiteConnectionPool = SQLiteConnectionPool(
-            db_path=data_dir_path / "crawler_state.db", # Use the Path object
-            pool_size=config.max_workers, # Pool size can be linked to max_workers
-            timeout=20, # Timeout for getting a connection from the pool
-            wal_mode=True # Enable WAL mode for better concurrency by default
-        )
+        # Initialize database backend
+        if config.db_type == 'sqlite':
+            self.db_backend = create_backend(
+                'sqlite',
+                db_path=data_dir_path / "crawler_state.db",
+                pool_size=config.max_workers,
+                timeout=30
+            )
+        else:  # PostgreSQL
+            # For PostgreSQL, scale pool size with workers but cap it
+            min_pool = min(10, config.max_workers)
+            max_pool = min(config.max_workers + 10, 100)  # Cap at 100 connections
+            self.db_backend = create_backend(
+                'postgresql',
+                db_url=config.db_url,
+                min_size=min_pool,
+                max_size=max_pool
+            )
         
-        self.storage: StorageManager = StorageManager(config, self.db_pool)
+        self.storage: StorageManager = StorageManager(config, self.db_backend)
         self.fetcher: Fetcher = Fetcher(config)
         self.politeness: PolitenessEnforcer = PolitenessEnforcer(config, self.storage, self.fetcher)
         self.frontier: FrontierManager = FrontierManager(config, self.storage, self.politeness)
@@ -64,7 +75,7 @@ class CrawlerOrchestrator:
 
                 if next_url_info is None:
                     # Check if the frontier is truly empty (not just all domains on cooldown)
-                    current_frontier_size_for_worker = await asyncio.to_thread(self.frontier.count_frontier)
+                    current_frontier_size_for_worker = await self.frontier.count_frontier()
                     if current_frontier_size_for_worker == 0:
                         logger.info(f"Worker-{worker_id}: Frontier is confirmed empty by count. Waiting...")
                     else:
@@ -82,7 +93,7 @@ class CrawlerOrchestrator:
                 if fetch_result.error_message or fetch_result.status_code >= 400:
                     logger.warning(f"Worker-{worker_id}: Fetch failed for {url_to_crawl}. Status: {fetch_result.status_code}, Error: {fetch_result.error_message}")
                     # Record failed attempt
-                    await asyncio.to_thread(self.storage.add_visited_page, # DB call in thread
+                    await self.storage.add_visited_page(
                         url=fetch_result.final_url, 
                         domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
                         status_code=fetch_result.status_code,
@@ -125,7 +136,7 @@ class CrawlerOrchestrator:
                         logger.debug(f"Worker-{worker_id}: Not HTML or no text content for {fetch_result.final_url} (Type: {fetch_result.content_type})")
                     
                     # Record success
-                    await asyncio.to_thread(self.storage.add_visited_page,
+                    await self.storage.add_visited_page(
                         url=fetch_result.final_url,
                         domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
                         status_code=fetch_result.status_code,
@@ -168,9 +179,13 @@ class CrawlerOrchestrator:
         current_process = psutil.Process(os.getpid())
 
         try:
+            # Initialize database
+            await self.db_backend.initialize()
+            await self.storage.init_db_schema()
+            
             # Initialize frontier (loads seeds etc.)
             await self.frontier.initialize_frontier()
-            initial_frontier_size = await asyncio.to_thread(self.frontier.count_frontier)
+            initial_frontier_size = await self.frontier.count_frontier()
             self.total_urls_added_to_frontier = initial_frontier_size
             logger.info(f"Frontier initialized. Size: {initial_frontier_size}")
 
@@ -194,7 +209,7 @@ class CrawlerOrchestrator:
                     self._shutdown_event.set()
                     break
                 
-                current_frontier_size = await asyncio.to_thread(self.frontier.count_frontier)
+                current_frontier_size = await self.frontier.count_frontier()
                 active_workers = sum(1 for task in self.worker_tasks if not task.done())
                 
                 # Resource monitoring
@@ -209,14 +224,19 @@ class CrawlerOrchestrator:
                         logger.warning(f"psutil error during resource monitoring: {e}")
                         # Fallback or disable further psutil calls for this iteration if needed
                 
-                pool_connections = self.db_pool._pool.qsize() if self.db_pool and hasattr(self.db_pool, '_pool') else "N/A"
+                # Connection pool info - different for each backend
+                pool_info = "N/A"
+                if self.config.db_type == 'sqlite' and hasattr(self.db_backend, '_pool'):
+                    pool_info = f"available={self.db_backend._pool.qsize()}"
+                elif self.config.db_type == 'postgresql':
+                    pool_info = f"min={self.db_backend.min_size},max={self.db_backend.max_size}"
 
                 status_parts = [
                     f"Crawled={self.pages_crawled_count}",
                     f"Frontier={current_frontier_size}",
                     f"AddedToFrontier={self.total_urls_added_to_frontier}",
                     f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
-                    f"DBPoolConns={pool_connections}",
+                    f"DBPool({self.config.db_type})={pool_info}",
                     f"MemRSS={rss_mem_mb}",
                     f"OpenFDs={fds_count}",
                     f"Runtime={(time.time() - self.start_time):.0f}s"
@@ -230,7 +250,7 @@ class CrawlerOrchestrator:
                     # Wait a bit to see if workers add more URLs or finish
                     logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring workers...")
                     await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2) # Wait longer than worker sleep
-                    current_frontier_size = await asyncio.to_thread(self.frontier.count_frontier)
+                    current_frontier_size = await self.frontier.count_frontier()
                     if current_frontier_size == 0 and not any(not task.done() for task in self.worker_tasks):
                         logger.info("Frontier empty and all workers appear done. Signaling shutdown.")
                         self._shutdown_event.set()
@@ -268,9 +288,8 @@ class CrawlerOrchestrator:
             logger.info("Performing final cleanup...")
             await self.fetcher.close_session()
             
-            # Close the database pool explicitly
-            if self.db_pool:
-                self.db_pool.close_all()
+            # Close the database
+            await self.storage.close()
             
             logger.info(f"Crawl finished. Total pages crawled: {self.pages_crawled_count}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

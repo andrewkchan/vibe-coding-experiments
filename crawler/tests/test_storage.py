@@ -1,4 +1,5 @@
 import pytest
+import pytest_asyncio
 from pathlib import Path
 import sqlite3
 import shutil
@@ -8,60 +9,60 @@ import aiofiles # For testing async file save
 import time
 import hashlib
 
-# Import db_pool from conftest
+# Import db_backend from conftest
 # pytest will automatically discover fixtures in conftest.py in the same directory or parent directories.
 
 from crawler_module.storage import StorageManager, DB_SCHEMA_VERSION
 from crawler_module.config import CrawlerConfig # Will use test_config from conftest
-from crawler_module.db_pool import SQLiteConnectionPool
+from crawler_module.db_backends import create_backend, DatabaseBackend
 
 # Configure basic logging for tests to see output
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-@pytest.fixture
-def storage_manager(test_config: CrawlerConfig, db_pool: SQLiteConnectionPool) -> StorageManager:
-    """Fixture to create a StorageManager instance using a db_pool."""
-    logger.debug(f"Initializing StorageManager with config data_dir: {test_config.data_dir} and db_pool: {db_pool.db_path}")
-    sm = StorageManager(config=test_config, db_pool=db_pool)
+@pytest_asyncio.fixture
+async def storage_manager(test_config: CrawlerConfig, db_backend: DatabaseBackend) -> StorageManager:
+    """Fixture to create a StorageManager instance using a db_backend."""
+    logger.debug(f"Initializing StorageManager with config data_dir: {test_config.data_dir} and db_backend")
+    sm = StorageManager(config=test_config, db_backend=db_backend)
+    await sm.init_db_schema()
     yield sm
 
-def test_storage_manager_initialization(storage_manager: StorageManager, test_config: CrawlerConfig, db_pool: SQLiteConnectionPool):
+@pytest.mark.asyncio
+async def test_storage_manager_initialization(storage_manager: StorageManager, test_config: CrawlerConfig, db_backend: DatabaseBackend):
     """Test if StorageManager initializes directories and DB correctly."""
     assert storage_manager.data_dir.exists()
     assert storage_manager.content_dir.exists()
-    assert Path(db_pool.db_path).exists(), f"Database file {db_pool.db_path} should exist."
-    assert storage_manager.db_path == Path(db_pool.db_path), \
-        f"SM DB path {storage_manager.db_path} should match pool DB path {Path(db_pool.db_path)}"
     
-    with db_pool as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';")
-        assert cursor.fetchone() is not None, "schema_version table should exist."
-        cursor.close()
+    # For SQLite, check that the database file exists
+    if test_config.db_type == "sqlite":
+        assert storage_manager.db_path.exists(), f"Database file {storage_manager.db_path} should exist."
+    
+    # Check that schema version table exists
+    result = await db_backend.fetch_one("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';")
+    assert result is not None, "schema_version table should exist."
+    
     logger.info("StorageManager initialization test passed.")
 
-def test_database_schema_creation(storage_manager: StorageManager, db_pool: SQLiteConnectionPool):
-    """Test if all tables and indexes are created as expected using a connection from the pool."""
-    # The storage_manager fixture already initializes the schema via StorageManager.__init__
-    with db_pool as conn: # Use the pool's context manager to get a connection
-        cursor = conn.cursor()
+@pytest.mark.asyncio
+async def test_database_schema_creation(storage_manager: StorageManager, db_backend: DatabaseBackend):
+    """Test if all tables and indexes are created as expected using the database backend."""
+    # The storage_manager fixture already initializes the schema via StorageManager.init_db_schema
+    
+    tables_to_check = ["frontier", "visited_urls", "domain_metadata", "schema_version"]
+    for table in tables_to_check:
+        result = await db_backend.fetch_one(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}';")
+        assert result is not None, f"Table {table} should exist."
 
-        tables_to_check = ["frontier", "visited_urls", "domain_metadata", "schema_version"]
-        for table in tables_to_check:
-            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}';")
-            assert cursor.fetchone() is not None, f"Table {table} should exist."
+    result = await db_backend.fetch_one("SELECT version FROM schema_version")
+    assert result[0] == DB_SCHEMA_VERSION, f"Schema version should be {DB_SCHEMA_VERSION}"
 
-        cursor.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == DB_SCHEMA_VERSION, f"Schema version should be {DB_SCHEMA_VERSION}"
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_frontier_domain';")
-        assert cursor.fetchone() is not None, "Index idx_frontier_domain on frontier table should exist."
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_visited_domain';")
-        assert cursor.fetchone() is not None, "Index idx_visited_domain on visited_urls table should exist."
-        
-        cursor.close()
+    result = await db_backend.fetch_one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_frontier_domain';")
+    assert result is not None, "Index idx_frontier_domain on frontier table should exist."
+    result = await db_backend.fetch_one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_visited_domain';")
+    assert result is not None, "Index idx_visited_domain on visited_urls table should exist."
+    
     logger.info("Database schema creation test passed.")
 
 def test_get_url_sha256(storage_manager: StorageManager):
@@ -80,24 +81,29 @@ def test_get_url_sha256(storage_manager: StorageManager):
     assert hash1 == hash1_again
     logger.info("URL SHA256 hashing test passed.")
 
-def test_storage_manager_reinitialization(test_config: CrawlerConfig, tmp_path: Path): # Uses test_config from conftest
+@pytest.mark.asyncio
+async def test_storage_manager_reinitialization(test_config: CrawlerConfig, tmp_path: Path):
     """Test that re-initializing StorageManager with the same path is safe."""
     
     # The standard DB path that StorageManager will use based on test_config
     target_db_path = Path(test_config.data_dir) / "crawler_state.db"
 
-    pool_reinit1 = SQLiteConnectionPool(db_path=target_db_path, pool_size=1)
-    sm1 = StorageManager(config=test_config, db_pool=pool_reinit1)
+    backend1 = create_backend('sqlite', db_path=target_db_path, pool_size=1)
+    await backend1.initialize()
+    sm1 = StorageManager(config=test_config, db_backend=backend1)
+    await sm1.init_db_schema()
     # Verify StorageManager calculates its db_path correctly based on the config
     assert sm1.db_path == target_db_path, \
         f"SM1 path {sm1.db_path} should match target DB path {target_db_path}"
-    pool_reinit1.close_all()
+    await backend1.close()
 
-    pool_reinit2 = SQLiteConnectionPool(db_path=target_db_path, pool_size=1)
-    sm2 = StorageManager(config=test_config, db_pool=pool_reinit2)
+    backend2 = create_backend('sqlite', db_path=target_db_path, pool_size=1)
+    await backend2.initialize()
+    sm2 = StorageManager(config=test_config, db_backend=backend2)
+    await sm2.init_db_schema()
     assert sm2.db_path == target_db_path, \
         f"SM2 path {sm2.db_path} should match target DB path {target_db_path}"
-    pool_reinit2.close_all()
+    await backend2.close()
 
     assert target_db_path.exists(), "Database file should exist after StorageManager initializations."
     logger.info("StorageManager re-initialization test passed.")
@@ -153,7 +159,8 @@ async def test_save_content_to_file_io_error(storage_manager: StorageManager, mo
     assert not expected_file.exists()
     logger.info("Save content to file with IOError test passed.")
 
-def test_add_visited_page(storage_manager: StorageManager, db_pool: SQLiteConnectionPool): 
+@pytest.mark.asyncio
+async def test_add_visited_page(storage_manager: StorageManager, db_backend: DatabaseBackend): 
     """Test adding a visited page record to the database."""
     url = "http://example.com/visited_page"
     domain = "example.com"
@@ -164,7 +171,7 @@ def test_add_visited_page(storage_manager: StorageManager, db_pool: SQLiteConnec
     url_hash_for_file = storage_manager.get_url_sha256(url)
     content_storage_path_str = str(storage_manager.content_dir / f"{url_hash_for_file}.txt")
     
-    storage_manager.add_visited_page(
+    await storage_manager.add_visited_page(
         url=url,
         domain=domain,
         status_code=status_code,
@@ -175,15 +182,11 @@ def test_add_visited_page(storage_manager: StorageManager, db_pool: SQLiteConnec
         redirected_to_url=None
     )
 
-    with db_pool as conn:
-        cursor = conn.cursor()
-        expected_url_sha256 = storage_manager.get_url_sha256(url)
-        expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
+    expected_url_sha256 = storage_manager.get_url_sha256(url)
+    expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
 
-        cursor.execute("SELECT * FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
-        row = cursor.fetchone()
-        cursor.close()
-
+    row = await db_backend.fetch_one("SELECT * FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
+    
     assert row is not None
     (db_url_sha256, db_url, db_domain, db_crawled_ts, db_status, 
      db_content_type, db_content_hash, db_storage_path, db_redirected_to) = row
@@ -199,7 +202,8 @@ def test_add_visited_page(storage_manager: StorageManager, db_pool: SQLiteConnec
     assert db_redirected_to is None
     logger.info("Add visited page test passed.")
 
-def test_add_visited_page_no_content(storage_manager: StorageManager, db_pool: SQLiteConnectionPool):
+@pytest.mark.asyncio
+async def test_add_visited_page_no_content(storage_manager: StorageManager, db_backend: DatabaseBackend):
     """Test adding a visited page with no text content (e.g., redirect or non-HTML)."""
     url = "http://example.com/redirect"
     domain = "example.com"
@@ -207,7 +211,7 @@ def test_add_visited_page_no_content(storage_manager: StorageManager, db_pool: S
     crawled_timestamp = int(time.time())
     redirected_to_url = "http://example.com/final_destination"
 
-    storage_manager.add_visited_page(
+    await storage_manager.add_visited_page(
         url=url,
         domain=domain,
         status_code=status_code,
@@ -218,12 +222,8 @@ def test_add_visited_page_no_content(storage_manager: StorageManager, db_pool: S
         redirected_to_url=redirected_to_url
     )
 
-    with db_pool as conn:
-        cursor = conn.cursor()
-        expected_url_sha256 = storage_manager.get_url_sha256(url)
-        cursor.execute("SELECT content_hash, content_storage_path, redirected_to_url FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
-        row = cursor.fetchone()
-        cursor.close()
+    expected_url_sha256 = storage_manager.get_url_sha256(url)
+    row = await db_backend.fetch_one("SELECT content_hash, content_storage_path, redirected_to_url FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
 
     assert row is not None
     content_hash, content_storage_path, db_redirected_to = row
