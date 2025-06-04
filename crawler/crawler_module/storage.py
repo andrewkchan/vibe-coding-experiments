@@ -94,7 +94,11 @@ class StorageManager:
                     except:
                         # Column might already exist
                         pass
-                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed ON frontier (claimed_at)")
+                if self.config.db_type == "postgresql":
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_unclaimed_order_by_time ON frontier (added_timestamp ASC) WHERE claimed_at IS NULL")
+                else: # SQLite does not support partial indexes on ASC/DESC order for expressions, but can do it on columns
+                      # A simple index on claimed_at and added_timestamp is the fallback.
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_added_timestamp_sqlite ON frontier (claimed_at, added_timestamp)")
 
                 # Visited URLs Table
                 await self.db.execute("""
