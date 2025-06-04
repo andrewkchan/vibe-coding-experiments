@@ -1,5 +1,5 @@
 # Fixing remaining test failures in politeness module
-_Exported on 5/31/2025 at 23:24:12 PDT from Cursor (0.50.5)_
+_Exported on 6/2/2025 at 00:44:52 PDT from Cursor (0.50.5)_
 
 ---
 
@@ -1630,5 +1630,349 @@ python main.py --seeds crawler_data/seed_urls.txt --email test@example.com \
 python main.py --seeds crawler_data/seed_urls.txt --email test@example.com \
   --db-type postgresql --db-url "postgresql://crawler_user:your_secure_password@localhost/web_crawler" \
   --max-workers 200 --pg-pool-size 75
+```
+
+---
+
+**User**
+
+Any idea why after stopping and resuming the crawler, all the workers timeout on getting DB connections after crawler initializes? 
+```
+2025-06-02 07:30:12 - INFO - __main__ [583413] - Starting crawler...
+2025-06-02 07:30:12 - INFO - crawler_module.orchestrator [583413] - Ensured data directory exists: crawler_data
+2025-06-02 07:30:12 - INFO - crawler_module.orchestrator [583413] - PostgreSQL pool configuration: min=10, max=80 (for 300 workers)
+2025-06-02 07:30:12 - INFO - crawler_module.storage [583413] - Storage directories initialized: crawler_data
+2025-06-02 07:30:12 - INFO - crawler_module.orchestrator [583413] - Crawler starting with config: CrawlerConfig(seed_file=PosixPath('top-1M-domains.txt'), email='fruitsaladisland@gmail.com', data_dir=PosixPath('crawler_data'), exclude_file=None, max_workers=300, max_pages=None, max_duration=None, log_level='INFO', resume=True, user_agent='MyEducationalCrawler/1.0 (mailto:fruitsaladisland@gmail.com)', seeded_urls_only=True, db_type='postgresql', db_url='postgresql://crawler_user:your_secure_password@localhost/web_crawler')
+2025-06-02 07:30:12 - INFO - crawler_module.db_backends [583413] - PostgreSQL pool initialized with min=10, max=80
+2025-06-02 07:30:12 - INFO - crawler_module.storage [583413] - Initializing database schema for postgresql
+2025-06-02 07:30:12 - INFO - crawler_module.storage [583413] - Database schema is up to date (version 2).
+2025-06-02 07:30:13 - INFO - crawler_module.frontier [583413] - Loaded 2506321 URLs for seen_urls set.
+2025-06-02 07:30:14 - INFO - crawler_module.frontier [583413] - Initialized seen_urls with 2506321 URLs from DB.
+2025-06-02 07:30:14 - INFO - crawler_module.frontier [583413] - Resuming crawl. Frontier has 2450312 URLs.
+2025-06-02 07:30:14 - INFO - crawler_module.orchestrator [583413] - Frontier initialized. Size: 2450312
+2025-06-02 07:30:14 - INFO - crawler_module.orchestrator [583413] - Started 300 worker tasks.
+2025-06-02 07:30:14 - INFO - crawler_module.orchestrator [583413] - Status: Crawled=0, Frontier=2450312, AddedToFrontier=2450312, ActiveWorkers=300/300, DBPool(postgresql)=min=10,max=80, MemRSS=450.09 MB, OpenFDs=21, Runtime=2s
+2025-06-02 07:30:44 - ERROR - crawler_module.frontier [583413] - DB error in atomic claim: couldn't get a connection after 30.00 sec
+2025-06-02 07:30:44 - ERROR - crawler_module.frontier [583413] - Error in get_next_url: couldn't get a connection after 30.00 sec
+Traceback (most recent call last):
+  File "/home/ubuntu/vibe-coding-experiments/crawler/crawler_module/frontier.py", line 184, in get_next_url
+    claimed_urls = await self._atomic_claim_urls(batch_size, claim_expiry_seconds)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/vibe-coding-experiments/crawler/crawler_module/frontier.py", line 248, in _atomic_claim_urls
+    claimed_urls = await self.storage.db.execute_returning("""
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/vibe-coding-experiments/crawler/crawler_module/db_backends.py", line 384, in execute_returning
+    async with self._get_connection() as conn:
+  File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/vibe-coding-experiments/crawler/crawler_module/db_backends.py", line 332, in _get_connection
+    async with self._pool.connection() as conn:
+  File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/vibe-coding-experiments/crawler/.venv/lib/python3.12/site-packages/psycopg_pool/pool_async.py", line 195, in connection
+    conn = await self.getconn(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/vibe-coding-experiments/crawler/.venv/lib/python3.12/site-packages/psycopg_pool/pool_async.py", line 230, in getconn
+    raise PoolTimeout(
+psycopg_pool.PoolTimeout: couldn't get a connection after 30.00 sec
+...
+```
+
+Wondering how I can debug what's happening here
+
+---
+
+**Cursor**
+
+*Warning: Claude Opus is significantly more expensive than Claude Sonnet. We recommend using Sonnet for most tasks.*
+
+
+
+This is a classic connection pool exhaustion issue after resuming. Here are several things to check and debug:
+
+---
+
+**User**
+
+what is pg_stat_activity?
+
+---
+
+**Cursor**
+
+`pg_stat_activity` is a PostgreSQL system view that shows real-time information about all active database connections. It's extremely useful for debugging connection issues like yours.
+
+Here's what it shows:
+- **pid**: Process ID of the backend
+- **datname**: Database name
+- **usename**: Username
+- **state**: Current state of the connection (active, idle, idle in transaction, etc.)
+- **query**: The last/current query being executed
+- **wait_event**: What the connection is waiting for (if anything)
+- **backend_start**: When the connection was established
+
+For debugging your connection pool exhaustion, the most important fields are:
+- **state**: Shows if connections are stuck in a bad state
+- **query**: Shows what queries are running or stuck
+- **wait_event**: Shows if connections are blocked waiting for locks
+
+Let me help you check what's happening with your connections:
+
+```sql
+-- Check connection counts by state
+SELECT 
+    state,
+    count(*) as connection_count,
+    usename
+FROM pg_stat_activity 
+WHERE datname = 'web_crawler'
+GROUP BY state, usename
+ORDER BY connection_count DESC;
+
+-- Check for long-running queries
+SELECT 
+    pid,
+    state,
+    query_start,
+    now() - query_start as duration,
+    query
+FROM pg_stat_activity
+WHERE datname = 'web_crawler'
+    AND state != 'idle'
+    AND query_start < now() - interval '30 seconds'
+ORDER BY duration DESC;
+
+-- Check for locks
+SELECT 
+    pid,
+    state,
+    wait_event,
+    wait_event_type,
+    query
+FROM pg_stat_activity
+WHERE datname = 'web_crawler'
+    AND wait_event IS NOT NULL;
+```
+
+Now you can run this to see what's happening:
+
+```bash
+sudo -u postgres psql -d web_crawler -f debug_connections.sql
+```
+
+Based on your error, here are the likely causes of connection pool exhaustion after resume:
+
+## 1. **Connections Not Being Released Properly**
+The pool might have connections that are stuck in transactions or not properly returned. Let me add some debug logging to the DB backend:
+
+```shellscript
+sudo -u postgres psql -d web_crawler -f debug_connections.sql
+```
+
+```python
+    @asynccontextmanager
+    async def _get_connection(self):
+        """Get a connection from the pool (context manager)."""
+        if not self._pool:
+            raise RuntimeError("PostgreSQL pool not initialized")
+        
+        conn = None
+        start_time = time.time()
+        try:
+            logger.debug(f"Requesting connection from pool (pool size: {self._pool.get_stats().get('pool_size', 'unknown')})")
+            async with self._pool.connection() as conn:
+                acquire_time = time.time() - start_time
+                if acquire_time > 1.0:
+                    logger.warning(f"Slow connection acquisition: {acquire_time:.2f}s")
+                logger.debug(f"Connection acquired in {acquire_time:.3f}s")
+                yield conn
+        finally:
+            if conn:
+                logger.debug("Connection returned to pool")
+```
+
+```python
+"""
+Database backend abstraction layer for the web crawler.
+Supports both SQLite and PostgreSQL with a common interface.
+"""
+
+import abc
+import asyncio
+import logging
+import sqlite3
+import time
+from typing import Any, List, Tuple, Optional, Dict, TYPE_CHECKING
+from pathlib import Path
+from contextlib import asynccontextmanager
+import queue
+import threading
+```
+
+## 2. **Pool Stats Check**
+Let me add a method to check pool statistics:
+
+```python
+#!/usr/bin/env python3
+"""Check PostgreSQL connection pool statistics."""
+
+import asyncio
+import sys
+sys.path.insert(0, 'crawler')
+
+from crawler_module.db_backends import create_backend
+
+
+async def check_pool_stats():
+    # Create backend with same settings as crawler
+    backend = create_backend(
+        'postgresql',
+        db_url='postgresql://crawler_user:your_secure_password@localhost/web_crawler',
+        min_size=10,
+        max_size=80
+    )
+    
+    try:
+        await backend.initialize()
+        
+        # Get pool stats if available
+        if hasattr(backend, '_pool') and backend._pool:
+            stats = backend._pool.get_stats()
+            print("Connection Pool Statistics:")
+            for key, value in stats.items():
+                print(f"  {key}: {value}")
+        else:
+            print("Pool not available or doesn't support stats")
+            
+    finally:
+        await backend.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(check_pool_stats())
+```
+
+## 3. **Common Causes of Connection Pool Exhaustion After Resume**
+
+Here are the most likely issues:
+
+### a) **Too Many Workers for Pool Size**
+With 300 workers and only 80 connections, if more than 80 workers try to access the DB simultaneously, they'll timeout. This is especially likely during startup when all workers check the frontier.
+
+### b) **Connections Stuck in Transaction**
+After an abrupt stop, connections might be left in "idle in transaction" state.
+
+### c) **Pool Not Properly Warmed Up**
+The pool might need time to create all connections.
+
+## 4. **Immediate Fixes to Try**
+
+```sql
+-- Terminate all idle in transaction connections older than 5 minutes
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'web_crawler'
+  AND state = 'idle in transaction'
+  AND state_change < now() - interval '5 minutes';
+
+-- Show current connection state summary
+SELECT state, count(*) 
+FROM pg_stat_activity 
+WHERE datname = 'web_crawler' 
+GROUP BY state;
+```
+
+## 5. **Fix: Stagger Worker Startup**
+
+The issue might be all 300 workers trying to get connections at once. Let's add staggered startup:
+
+```python
+            # Start worker tasks
+            logger.info(f"Starting {self.config.max_workers} workers with staggered startup...")
+            
+            # Stagger worker startup to avoid thundering herd on DB pool
+            workers_per_batch = 20  # Start 20 workers at a time
+            startup_delay = 0.5  # Delay between batches in seconds
+            
+            for i in range(self.config.max_workers):
+                task = asyncio.create_task(self._worker(i + 1))
+                self.worker_tasks.add(task)
+                
+                # Add delay between batches
+                if (i + 1) % workers_per_batch == 0:
+                    logger.info(f"Started {i + 1}/{self.config.max_workers} workers...")
+                    await asyncio.sleep(startup_delay)
+            
+            logger.info(f"Started all {len(self.worker_tasks)} worker tasks.")
+```
+
+## 6. **Fix: Add Initial Worker Delay**
+
+Let's also add a small random delay at the start of each worker:
+
+```python
+    async def _worker(self, worker_id: int):
+        """Core logic for a single crawl worker."""
+        logger.info(f"Worker-{worker_id}: Starting.")
+        
+        # Add small random delay to spread out initial DB access
+        startup_delay = (worker_id % 20) * 0.1  # 0-2 second delay based on worker ID
+        await asyncio.sleep(startup_delay)
+        
+        try:
+            while not self._shutdown_event.is_set():
+```
+
+## Debugging Steps Summary:
+
+1. **Check current connections**:
+   ```bash
+   sudo -u postgres psql -d web_crawler -f debug_connections.sql
+   ```
+
+2. **Clean up stuck connections**:
+   ```bash
+   sudo -u postgres psql -d web_crawler -f fix_stuck_connections.sql
+   ```
+
+3. **Run with debug logging**:
+   ```bash
+   python main.py --seeds top-1M-domains.txt --email fruitsaladisland@gmail.com \
+     --db-type postgresql --db-url "postgresql://crawler_user:your_secure_password@localhost/web_crawler" \
+     --max-workers 300 --pg-pool-size 90 --resume --log-level DEBUG
+   ```
+
+4. **Consider reducing workers or increasing pool size**:
+   - With 300 workers, even with 30% concurrency, you need ~90 connections
+   - Either use `--pg-pool-size 90` or reduce to `--max-workers 200`
+
+5. **Monitor pool usage**:
+   The status log now shows pool info. Watch for patterns when connections get exhausted.
+
+The changes I made will:
+- Stagger worker startup to avoid thundering herd
+- Add delays to spread out initial DB access
+- Add debug logging to track slow connection acquisition
+
+Try running the crawler again with these fixes and the debug logging enabled. The staggered startup should prevent the immediate connection exhaustion you're seeing.
+
+```shellscript
+   sudo -u postgres psql -d web_crawler -f debug_connections.sql
+```
+
+```shellscript
+   sudo -u postgres psql -d web_crawler -f debug_connections.sql
+```
+
+```shellscript
+   sudo -u postgres psql -d web_crawler -f fix_stuck_connections.sql
+```
+
+```shellscript
+   python main.py --seeds top-1M-domains.txt --email fruitsaladisland@gmail.com \
+     --db-type postgresql --db-url "postgresql://crawler_user:your_secure_password@localhost/web_crawler" \
+     --max-workers 300 --pg-pool-size 90 --resume --log-level DEBUG
 ```
 

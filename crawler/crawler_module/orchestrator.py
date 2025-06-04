@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Set, Optional
 import os # For process ID
 import psutil
+import random
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -97,6 +98,11 @@ class CrawlerOrchestrator:
     async def _worker(self, worker_id: int):
         """Core logic for a single crawl worker."""
         logger.info(f"Worker-{worker_id}: Starting.")
+        
+        # Add small random delay to spread out initial DB access
+        startup_delay = (worker_id % 20) * 0.5  # 0-10 second delay based on worker ID
+        await asyncio.sleep(startup_delay)
+        
         try:
             while not self._shutdown_event.is_set():
                 next_url_info = await self.frontier.get_next_url()
@@ -224,11 +230,22 @@ class CrawlerOrchestrator:
                 logger.warning("Resuming with an empty frontier. Crawler will wait for new URLs or shutdown if none appear.")
             
             # Start worker tasks
+            logger.info(f"Starting {self.config.max_workers} workers with staggered startup...")
+            
+            # Stagger worker startup to avoid thundering herd on DB pool
+            workers_per_batch = 20  # Start 20 workers at a time
+            startup_delay = 10  # Delay between batches in seconds
+            
             for i in range(self.config.max_workers):
                 task = asyncio.create_task(self._worker(i + 1))
                 self.worker_tasks.add(task)
+                
+                # Add delay between batches
+                if (i + 1) % workers_per_batch == 0:
+                    logger.info(f"Started {i + 1}/{self.config.max_workers} workers...")
+                    await asyncio.sleep(startup_delay)
             
-            logger.info(f"Started {len(self.worker_tasks)} worker tasks.")
+            logger.info(f"Started all {len(self.worker_tasks)} worker tasks.")
 
             # Main monitoring loop
             while not self._shutdown_event.is_set():

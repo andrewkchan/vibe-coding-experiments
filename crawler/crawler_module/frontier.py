@@ -172,7 +172,7 @@ class FrontierManager:
         """Gets the next URL to crawl from the frontier, respecting politeness rules.
         Uses atomic claim-and-read to minimize contention.
         """
-        batch_size = 10  # Claim a small batch to amortize DB overhead
+        batch_size = 3  # Claim a small batch to amortize DB overhead
         claim_expiry_seconds = 300  # URLs claimed but not processed expire after 5 minutes
         
         # Get worker identifier for logging
