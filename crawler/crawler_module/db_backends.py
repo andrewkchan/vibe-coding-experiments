@@ -337,16 +337,29 @@ class PostgreSQLBackend(DatabaseBackend):
         conn = None
         start_time = time.time()
         try:
-            logger.debug(f"Requesting connection from pool (pool size: {self._pool.get_stats().get('pool_size', 'unknown')})")
+            # More detailed pool stats logging
+            stats = self._pool.get_stats()
+            pool_min = stats.get('min_size', 'N/A')
+            pool_max = stats.get('max_size', 'N/A')
+            pool_used = stats.get('used_conns', 'N/A') # Or 'pool_size' - 'idle_conns' if 'used_conns' isn't available
+            pool_idle = stats.get('idle_conns', 'N/A')
+            pool_queued = stats.get('pending_requests', 'N/A') # Check psycopg_pool docs for correct key
+            
+            logger.debug(
+                f"Requesting connection. Pool stats: min={pool_min}, max={pool_max}, "
+                f"used={pool_used}, idle={pool_idle}, queued={pool_queued}"
+            )
+            acquire_time = -1
             async with self._pool.connection() as conn:
-                acquire_time = time.time() - start_time
-                if acquire_time > 1.0:
-                    logger.warning(f"Slow connection acquisition: {acquire_time:.2f}s")
-                logger.debug(f"Connection acquired in {acquire_time:.3f}s")
+                acquire_time = time.time()
+                time_to_acquire = acquire_time - start_time
+                if time_to_acquire > 1.0:
+                    logger.warning(f"Slow connection acquisition: {time_to_acquire:.2f}s")
+                logger.debug(f"Connection acquired in {time_to_acquire:.3f}s")
                 yield conn
         finally:
             if conn:
-                hold_time = time.time() - start_time
+                hold_time = time.time() - acquire_time
                 logger.debug(f"Connection returned to pool after {hold_time:.3f}s")
                 
                 if hold_time > CONNECTION_HOLD_THRESHOLD:
