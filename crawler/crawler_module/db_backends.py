@@ -13,6 +13,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import queue
 import threading
+import traceback
 
 # Type checking imports
 if TYPE_CHECKING:
@@ -24,6 +25,9 @@ if TYPE_CHECKING:
         psycopg = None
 
 logger = logging.getLogger(__name__)
+
+# Connections held longer than this threshold in seconds log a trace
+CONNECTION_HOLD_THRESHOLD = 2.0
 
 class DatabaseBackend(abc.ABC):
     """Abstract base class for database backends."""
@@ -329,8 +333,26 @@ class PostgreSQLBackend(DatabaseBackend):
         """Get a connection from the pool (context manager)."""
         if not self._pool:
             raise RuntimeError("PostgreSQL pool not initialized")
-        async with self._pool.connection() as conn:
-            yield conn
+        
+        conn = None
+        start_time = time.time()
+        try:
+            logger.debug(f"Requesting connection from pool (pool size: {self._pool.get_stats().get('pool_size', 'unknown')})")
+            async with self._pool.connection() as conn:
+                acquire_time = time.time() - start_time
+                if acquire_time > 1.0:
+                    logger.warning(f"Slow connection acquisition: {acquire_time:.2f}s")
+                logger.debug(f"Connection acquired in {acquire_time:.3f}s")
+                yield conn
+        finally:
+            if conn:
+                hold_time = time.time() - start_time
+                logger.debug(f"Connection returned to pool after {hold_time:.3f}s")
+                
+                if hold_time > CONNECTION_HOLD_THRESHOLD:
+                    logger.warning(f"Connection held for {hold_time:.3f}s (threshold: {CONNECTION_HOLD_THRESHOLD}s)")
+                    logger.warning("Stack trace of long-held connection:")
+                    traceback.print_stack()
     
     async def execute(self, query: str, params: Optional[Tuple] = None) -> None:
         """Execute a query without returning results."""
