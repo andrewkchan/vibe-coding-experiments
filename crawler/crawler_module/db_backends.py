@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 import queue
 import threading
 import traceback
+from collections import defaultdict
 
 # Type checking imports
 if TYPE_CHECKING:
@@ -43,27 +44,27 @@ class DatabaseBackend(abc.ABC):
         pass
     
     @abc.abstractmethod
-    async def execute(self, query: str, params: Optional[Tuple] = None) -> None:
+    async def execute(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> None:
         """Execute a query without returning results."""
         pass
     
     @abc.abstractmethod
-    async def execute_many(self, query: str, params_list: List[Tuple]) -> None:
+    async def execute_many(self, query: str, params_list: List[Tuple], query_name: Optional[str] = None) -> None:
         """Execute a query multiple times with different parameters."""
         pass
     
     @abc.abstractmethod
-    async def fetch_one(self, query: str, params: Optional[Tuple] = None) -> Optional[Tuple]:
+    async def fetch_one(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> Optional[Tuple]:
         """Execute a query and return a single row."""
         pass
     
     @abc.abstractmethod
-    async def fetch_all(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
+    async def fetch_all(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> List[Tuple]:
         """Execute a query and return all rows."""
         pass
     
     @abc.abstractmethod
-    async def execute_returning(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
+    async def execute_returning(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> List[Tuple]:
         """Execute a query with RETURNING clause and return results."""
         pass
     
@@ -159,7 +160,7 @@ class SQLiteBackend(DatabaseBackend):
         
         await asyncio.to_thread(_close_all)
     
-    async def execute(self, query: str, params: Optional[Tuple] = None) -> None:
+    async def execute(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> None:
         """Execute a query without returning results."""
         def _execute(conn):
             cursor = conn.cursor()
@@ -177,7 +178,7 @@ class SQLiteBackend(DatabaseBackend):
             if conn:
                 await asyncio.to_thread(self._return_connection, conn)
     
-    async def execute_many(self, query: str, params_list: List[Tuple]) -> None:
+    async def execute_many(self, query: str, params_list: List[Tuple], query_name: Optional[str] = None) -> None:
         """Execute a query multiple times with different parameters."""
         def _execute_many(conn):
             cursor = conn.cursor()
@@ -195,7 +196,7 @@ class SQLiteBackend(DatabaseBackend):
             if conn:
                 await asyncio.to_thread(self._return_connection, conn)
     
-    async def fetch_one(self, query: str, params: Optional[Tuple] = None) -> Optional[Tuple]:
+    async def fetch_one(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> Optional[Tuple]:
         """Execute a query and return a single row."""
         def _fetch_one(conn):
             cursor = conn.cursor()
@@ -213,7 +214,7 @@ class SQLiteBackend(DatabaseBackend):
             if conn:
                 await asyncio.to_thread(self._return_connection, conn)
     
-    async def fetch_all(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
+    async def fetch_all(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> List[Tuple]:
         """Execute a query and return all rows."""
         def _fetch_all(conn):
             cursor = conn.cursor()
@@ -231,7 +232,7 @@ class SQLiteBackend(DatabaseBackend):
             if conn:
                 await asyncio.to_thread(self._return_connection, conn)
     
-    async def execute_returning(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
+    async def execute_returning(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> List[Tuple]:
         """Execute a query with RETURNING clause and return results."""
         def _execute_returning(conn):
             cursor = conn.cursor()
@@ -279,6 +280,10 @@ class PostgreSQLBackend(DatabaseBackend):
         self.max_size = max_size
         self._pool: Optional[Any] = None  # Will be psycopg_pool.AsyncConnectionPool
         self._initialized = False
+        self._current_query_name: Optional[str] = None # For passing query name to _get_connection context
+
+        self.connection_acquire_times: List[float] = []
+        self.query_hold_times: Dict[str, List[float]] = defaultdict(list)
     
     async def initialize(self) -> None:
         """Initialize the PostgreSQL connection pool."""
@@ -336,6 +341,10 @@ class PostgreSQLBackend(DatabaseBackend):
         
         conn = None
         start_time = time.time()
+        # Preserve query name across context
+        active_query_name = self._current_query_name
+        self._current_query_name = None # Reset for next direct call if any
+
         try:
             # More detailed pool stats logging
             stats = self._pool.get_stats()
@@ -349,73 +358,98 @@ class PostgreSQLBackend(DatabaseBackend):
                 f"Requesting connection. Pool stats: min={pool_min}, max={pool_max}, "
                 f"used={pool_used}, idle={pool_idle}, queued={pool_queued}"
             )
-            acquire_time = -1
+            acquire_time_value = time.time()
             async with self._pool.connection() as conn:
-                acquire_time = time.time()
-                time_to_acquire = acquire_time - start_time
+                acquire_time_value = time.time()
+                time_to_acquire = acquire_time_value - start_time
+        
+                self.connection_acquire_times.append(time_to_acquire)
+        
                 if time_to_acquire > 1.0:
                     logger.warning(f"Slow connection acquisition: {time_to_acquire:.2f}s")
                 logger.debug(f"Connection acquired in {time_to_acquire:.3f}s")
                 yield conn
         finally:
             if conn:
-                hold_time = time.time() - acquire_time
-                logger.debug(f"Connection returned to pool after {hold_time:.3f}s")
+                # Note: acquire_time_value is when connection was successfully acquired.
+                # start_time is when _get_connection was entered.
+                # The 'hold_time' here is the duration the connection was actively used by the `yield` block.
+                connection_active_hold_time = time.time() - acquire_time_value # Time since conn was ready
                 
-                if hold_time > CONNECTION_HOLD_THRESHOLD:
-                    logger.warning(f"Connection held for {hold_time:.3f}s (threshold: {CONNECTION_HOLD_THRESHOLD}s)")
-                    logger.warning("Stack trace of long-held connection:")
+        
+                if active_query_name:
+                    self.query_hold_times[active_query_name].append(connection_active_hold_time)
+        
+
+                logger.debug(f"Connection returned to pool after {connection_active_hold_time:.3f}s of active use.")
+                
+                # This logs the total time from _get_connection entry, through acquire, use, and up to return.
+                # This is different from connection_active_hold_time.
+                total_context_duration = time.time() - start_time
+                if total_context_duration > CONNECTION_HOLD_THRESHOLD: # CONNECTION_HOLD_THRESHOLD might need re-evaluation
+                    logger.warning(f"Total context duration for _get_connection was {total_context_duration:.3f}s (threshold: {CONNECTION_HOLD_THRESHOLD}s). Active hold: {connection_active_hold_time:.3f}s.")
+                    logger.warning("Stack trace of long _get_connection context:") # Changed log message
                     traceback.print_stack()
     
-    async def execute(self, query: str, params: Optional[Tuple] = None) -> None:
+    async def execute(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> None:
         """Execute a query without returning results."""
         # Convert SQLite-style ? placeholders to PostgreSQL %s
         if "?" in query:
             query = query.replace("?", "%s")
         
+        self._current_query_name = query_name
+
         async with self._get_connection() as conn:
-            # psycopg3 automatically handles parameter placeholders
             await conn.execute(query, params or ())
     
-    async def execute_many(self, query: str, params_list: List[Tuple]) -> None:
+    async def execute_many(self, query: str, params_list: List[Tuple], query_name: Optional[str] = None) -> None:
         """Execute a query multiple times with different parameters."""
         # Convert SQLite-style ? placeholders to PostgreSQL %s
         if "?" in query:
             query = query.replace("?", "%s")
         
+
+        self._current_query_name = query_name
+
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 for params in params_list:
                     await cur.execute(query, params)
     
-    async def fetch_one(self, query: str, params: Optional[Tuple] = None) -> Optional[Tuple]:
+    async def fetch_one(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> Optional[Tuple]:
         """Execute a query and return a single row."""
         # Convert SQLite-style ? placeholders to PostgreSQL %s
         if "?" in query:
             query = query.replace("?", "%s")
         
+        self._current_query_name = query_name
+
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params or ())
                 return await cur.fetchone()
     
-    async def fetch_all(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
+    async def fetch_all(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> List[Tuple]:
         """Execute a query and return all rows."""
         # Convert SQLite-style ? placeholders to PostgreSQL %s
         if "?" in query:
             query = query.replace("?", "%s")
         
+        self._current_query_name = query_name
+
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params or ())
                 return await cur.fetchall()
     
-    async def execute_returning(self, query: str, params: Optional[Tuple] = None) -> List[Tuple]:
+    async def execute_returning(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> List[Tuple]:
         """Execute a query with RETURNING clause and return results."""
         # Convert SQLite-style ? placeholders to PostgreSQL %s
         if "?" in query:
             query = query.replace("?", "%s")
         
+        self._current_query_name = query_name
+
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params or ())

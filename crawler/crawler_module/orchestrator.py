@@ -2,10 +2,11 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Set, Optional
+from typing import Set, Optional, Dict, List
 import os # For process ID
 import psutil
 import random
+from collections import defaultdict
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -14,7 +15,8 @@ from .politeness import PolitenessEnforcer
 from .frontier import FrontierManager
 from .parser import PageParser, ParseResult
 from .utils import extract_domain # For getting domain for storage
-from .db_backends import create_backend
+from .db_backends import create_backend, PostgreSQLBackend
+from .metrics_utils import calculate_percentiles
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,8 @@ logger = logging.getLogger(__name__)
 EMPTY_FRONTIER_SLEEP_SECONDS = 10
 # How often the main orchestrator loop checks status and stopping conditions
 ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
+
+METRICS_LOG_INTERVAL_SECONDS = 20
 
 class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
@@ -94,6 +98,46 @@ class CrawlerOrchestrator:
         self.worker_tasks: Set[asyncio.Task] = set()
         self._shutdown_event: asyncio.Event = asyncio.Event()
         self.total_urls_added_to_frontier: int = 0
+
+        self.pages_crawled_in_interval: int = 0
+        self.last_metrics_log_time: float = time.time()
+
+    async def _log_metrics(self):
+        current_time = time.time()
+        time_elapsed_seconds = current_time - self.last_metrics_log_time
+        if time_elapsed_seconds == 0: time_elapsed_seconds = 1 # Avoid division by zero
+
+        pages_per_second = self.pages_crawled_in_interval / time_elapsed_seconds
+        logger.info(f"[Metrics] Pages Crawled/sec: {pages_per_second:.2f}")
+
+        # Ensure db_backend is PostgreSQLBackend for these specific metrics lists
+        if isinstance(self.db_backend, PostgreSQLBackend): # type: ignore
+            # Connection Acquire Times
+            acquire_times = list(self.db_backend.connection_acquire_times) # Copy for processing
+            self.db_backend.connection_acquire_times.clear()
+            if acquire_times:
+                p50_acquire = calculate_percentiles(acquire_times, [50])[0]
+                p95_acquire = calculate_percentiles(acquire_times, [95])[0]
+                logger.info(f"[Metrics] DB Conn Acquire Time (ms): P50={p50_acquire*1000:.2f}, P95={p95_acquire*1000:.2f} (from {len(acquire_times)} samples)")
+            else:
+                logger.info("[Metrics] DB Conn Acquire Time (ms): No samples")
+
+            # Query Hold Times (for specific queries)
+            query_hold_times_copy: Dict[str, List[float]] = defaultdict(list)
+            for name, times in self.db_backend.query_hold_times.items():
+                query_hold_times_copy[name] = list(times)
+                times.clear() # Clear original list
+            
+            for query_name, hold_times in query_hold_times_copy.items():
+                if hold_times:
+                    p50_hold = calculate_percentiles(hold_times, [50])[0]
+                    p95_hold = calculate_percentiles(hold_times, [95])[0]
+                    logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): P50={p50_hold*1000:.2f}, P95={p95_hold*1000:.2f} (from {len(hold_times)} samples)")
+                # else: logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): No samples") # Optional: log if no samples
+
+        # Reset for next interval
+        self.pages_crawled_in_interval = 0
+        self.last_metrics_log_time = current_time
 
     async def _worker(self, worker_id: int):
         """Core logic for a single crawl worker."""
@@ -189,6 +233,8 @@ class CrawlerOrchestrator:
                 
                 await asyncio.sleep(0) # Yield control to event loop
 
+                self.pages_crawled_in_interval += 1
+
         except asyncio.CancelledError:
             logger.info(f"Worker-{worker_id}: Cancelled.")
         except Exception as e:
@@ -254,6 +300,9 @@ class CrawlerOrchestrator:
                     self._shutdown_event.set()
                     break
                 
+                if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
+                    await self._log_metrics()
+
                 current_frontier_size = await self.frontier.count_frontier()
                 active_workers = sum(1 for task in self.worker_tasks if not task.done())
                 
