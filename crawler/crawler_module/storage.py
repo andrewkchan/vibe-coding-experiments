@@ -11,7 +11,7 @@ from .db_backends import DatabaseBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 3
 
 class StorageManager:
     def __init__(self, config: CrawlerConfig, db_backend: DatabaseBackend):
@@ -96,9 +96,15 @@ class StorageManager:
                         pass
                 if self.config.db_type == "postgresql":
                     await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_unclaimed_order_by_time ON frontier (added_timestamp ASC) WHERE claimed_at IS NULL")
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_for_expiry ON frontier (claimed_at) WHERE claimed_at IS NOT NULL")
                 else: # SQLite does not support partial indexes on ASC/DESC order for expressions, but can do it on columns
                       # A simple index on claimed_at and added_timestamp is the fallback.
                     await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_added_timestamp_sqlite ON frontier (claimed_at, added_timestamp)")
+                    # For SQLite, a non-partial index on claimed_at might be beneficial for the expiry logic,
+                    # though the original query might not be as efficient as with PG's partial index.
+                    # This isn't strictly for the same purpose as PG's idx_frontier_claimed_at_for_expiry
+                    # but is a general improvement for claimed_at lookups if needed.
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_sqlite ON frontier (claimed_at)")
 
                 # Visited URLs Table
                 await self.db.execute("""
