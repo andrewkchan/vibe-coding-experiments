@@ -172,7 +172,7 @@ class FrontierManager:
         """Gets the next URL to crawl from the frontier, respecting politeness rules.
         Uses atomic claim-and-read to minimize contention.
         """
-        batch_size = 10  # Claim a small batch to amortize DB overhead
+        batch_size = 3  # Claim a small batch to amortize DB overhead
         claim_expiry_seconds = 300  # URLs claimed but not processed expire after 5 minutes
         
         # Get worker identifier for logging
@@ -239,7 +239,7 @@ class FrontierManager:
                 UPDATE frontier 
                 SET claimed_at = NULL 
                 WHERE claimed_at IS NOT NULL AND claimed_at < ?
-            """, (expired_timestamp,))
+            """, (expired_timestamp,), query_name="release_expired_claims")
             
             # Use FOR UPDATE SKIP LOCKED for true atomic claiming
             # This prevents race conditions and deadlocks
@@ -259,7 +259,7 @@ class FrontierManager:
                     FROM to_claim
                     WHERE frontier.id = to_claim.id
                     RETURNING frontier.id, frontier.url, frontier.domain
-                """, (batch_size, claim_timestamp))
+                """, (batch_size, claim_timestamp), query_name="atomic_claim_urls_pg")
             else:
                 # SQLite doesn't support FOR UPDATE SKIP LOCKED, use the original method
                 claimed_urls = await self.storage.db.execute_returning("""
@@ -272,7 +272,7 @@ class FrontierManager:
                         LIMIT ?
                     )
                     RETURNING id, url, domain
-                """, (claim_timestamp, batch_size))
+                """, (claim_timestamp, batch_size), query_name="atomic_claim_urls_sqlite")
             
             return claimed_urls
             
@@ -283,13 +283,17 @@ class FrontierManager:
     async def _delete_url(self, url_id: int):
         """Deletes a URL from the frontier after processing or if disallowed."""
         try:
-            await self.storage.db.execute("DELETE FROM frontier WHERE id = ?", (url_id,))
+            await self.storage.db.execute("DELETE FROM frontier WHERE id = ?", (url_id,), query_name="delete_frontier_url")
         except Exception as e:
             logger.error(f"DB error deleting URL ID {url_id}: {e}")
 
-    async def _unclaim_url(self, url_id: int):
-        """Releases a claim on a URL so other workers can process it."""
+    async def _unclaim_url(self, url_id: int) -> None:
+        """Unclaims a specific URL by its ID, setting claimed_at to NULL."""
         try:
-            await self.storage.db.execute("UPDATE frontier SET claimed_at = NULL WHERE id = ?", (url_id,))
+            await self.storage.db.execute(
+                "UPDATE frontier SET claimed_at = NULL WHERE id = ?", 
+                (url_id,),
+                query_name="unclaim_url_set_null"
+            )
         except Exception as e:
-            logger.error(f"DB error unclaiming URL ID {url_id}: {e}")
+            logger.error(f"Error unclaiming URL ID {url_id}: {e}")
