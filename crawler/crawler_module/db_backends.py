@@ -92,7 +92,6 @@ class SQLiteBackend(DatabaseBackend):
         self.pool_size = pool_size
         self.timeout = timeout
         self._pool: queue.Queue = queue.Queue(maxsize=pool_size)
-        self._lock = threading.Lock()
         self._connections_created = 0
         self._initialized = False
     

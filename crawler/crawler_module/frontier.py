@@ -297,15 +297,3 @@ class FrontierManager:
             )
         except Exception as e:
             logger.error(f"Error unclaiming URL ID {url_id}: {e}")
-
-    async def _delete_url_from_frontier(self, url_id: int) -> None:
-        """Deletes a URL from the frontier by ID. Used by clear_stale_claims if needed."""
-        try:
-            await self.storage.db.execute(
-                "DELETE FROM frontier WHERE id = ?", 
-                (url_id,),
-                query_name="delete_frontier_url"
-            )
-            logger.debug(f"Deleted URL ID {url_id} from frontier.")
-        except Exception as e:
-            logger.error(f"Error deleting URL ID {url_id} from frontier: {e}")
