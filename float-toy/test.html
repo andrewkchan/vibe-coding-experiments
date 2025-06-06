@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Float Toy - Tests</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        body { padding: 2rem; }
+        .test-results { background: #2a2a2a; border-radius: 8px; padding: 1rem 2rem; margin-top: 2rem; }
+        h2 { margin-bottom: 1rem; }
+        .test-case { border-bottom: 1px solid #444; padding: 0.8rem 0; }
+        .test-case:last-child { border-bottom: none; }
+        .test-case.pass { color: #2ecc71; }
+        .test-case.fail { color: #e74c3c; }
+        .test-name { font-weight: bold; }
+        .test-detail { font-family: monospace; font-size: 0.9em; padding-left: 1rem; margin-top: 0.5rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Float Toy - Test Suite</h1>
+        <p>This page runs automated tests against the `calculateValue` function to ensure correctness, especially for the non-standard `f8e4m3` format.</p>
+        <div id="test-results" class="test-results"></div>
+    </div>
+    <script src="float-toy.js"></script>
+    <script src="tests.js"></script>
+</body>
+</html> 
