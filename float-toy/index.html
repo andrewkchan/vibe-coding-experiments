@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Float Toy - Interactive Floating Point Visualizer</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Float Toy</h1>
+        <p class="subtitle">Interactive Floating Point Format Visualizer</p>
+        
+        <div class="widgets-container">
+            <!-- Float64 Widget (IEEE 754 double: 1 sign, 11 exponent, 52 mantissa) -->
+            <div class="float-widget" data-format="float64">
+                <h2>float64 <span class="format-info">(1-11-52)</span></h2>
+                <div class="bits-container" id="float64-bits"></div>
+                <div class="value-display" id="float64-value"></div>
+            </div>
+
+            <!-- Float32 Widget (IEEE 754 single: 1 sign, 8 exponent, 23 mantissa) -->
+            <div class="float-widget" data-format="float32">
+                <h2>float32 <span class="format-info">(1-8-23)</span></h2>
+                <div class="bits-container" id="float32-bits"></div>
+                <div class="value-display" id="float32-value"></div>
+            </div>
+
+            <!-- Float16 Widget (IEEE 754 half: 1 sign, 5 exponent, 10 mantissa) -->
+            <div class="float-widget" data-format="float16">
+                <h2>float16 <span class="format-info">(1-5-10)</span></h2>
+                <div class="bits-container" id="float16-bits"></div>
+                <div class="value-display" id="float16-value"></div>
+            </div>
+
+            <!-- BFloat16 Widget (1 sign, 8 exponent, 7 mantissa) -->
+            <div class="float-widget" data-format="bfloat16">
+                <h2>bfloat16 <span class="format-info">(1-8-7)</span></h2>
+                <div class="bits-container" id="bfloat16-bits"></div>
+                <div class="value-display" id="bfloat16-value"></div>
+            </div>
+
+            <!-- FP8 E5M2 Widget (1 sign, 5 exponent, 2 mantissa) -->
+            <div class="float-widget" data-format="f8e5m2">
+                <h2>f8e5m2 <span class="format-info">(1-5-2)</span></h2>
+                <div class="bits-container" id="f8e5m2-bits"></div>
+                <div class="value-display" id="f8e5m2-value"></div>
+            </div>
+
+            <!-- FP8 E4M3 Widget (1 sign, 4 exponent, 3 mantissa) -->
+            <div class="float-widget" data-format="f8e4m3">
+                <h2>f8e4m3 <span class="format-info">(1-4-3)</span></h2>
+                <div class="bits-container" id="f8e4m3-bits"></div>
+                <div class="value-display" id="f8e4m3-value"></div>
+            </div>
+        </div>
+
+        <div class="info-section">
+            <h3>How to use:</h3>
+            <ul>
+                <li>Click on any bit to toggle it between 0 and 1</li>
+                <li><span class="sign-bit">Red bits</span> represent the sign</li>
+                <li><span class="exponent-bit">Blue bits</span> represent the exponent</li>
+                <li><span class="mantissa-bit">Green bits</span> represent the mantissa/fraction</li>
+            </ul>
+        </div>
+    </div>
+
+    <script src="float-toy.js"></script>
+</body>
+</html> 
