@@ -228,51 +228,83 @@ class FrontierManager:
             return None
 
     async def _atomic_claim_urls(self, batch_size: int, claim_expiry_seconds: int) -> list[tuple[int, str, str]]:
-        """Atomically claims a batch of URLs using UPDATE...RETURNING.
-        Returns list of (id, url, domain) tuples for claimed URLs."""
-        claim_timestamp = int(time.time() * 1000000)  # Microsecond precision
-        expired_timestamp = claim_timestamp - (claim_expiry_seconds * 1000000)
-        
+        """Atomically claims a batch of URLs from the frontier."""
         try:
-            # First, release any expired claims
-            await self.storage.db.execute("""
-                UPDATE frontier 
-                SET claimed_at = NULL 
-                WHERE claimed_at IS NOT NULL AND claimed_at < ?
-            """, (expired_timestamp,), query_name="release_expired_claims")
-            
-            # Use FOR UPDATE SKIP LOCKED for true atomic claiming
-            # This prevents race conditions and deadlocks
+            claim_timestamp = int(time.time() * 1000) # Current time in milliseconds
+
             if self.storage.config.db_type == "postgresql":
-                # PostgreSQL supports FOR UPDATE SKIP LOCKED
-                claimed_urls = await self.storage.db.execute_returning("""
-                    WITH to_claim AS (
-                        SELECT id, url, domain 
-                        FROM frontier 
-                        WHERE claimed_at IS NULL
-                        ORDER BY added_timestamp ASC 
-                        LIMIT %s
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    UPDATE frontier 
-                    SET claimed_at = %s
-                    FROM to_claim
-                    WHERE frontier.id = to_claim.id
-                    RETURNING frontier.id, frontier.url, frontier.domain
-                """, (batch_size, claim_timestamp), query_name="atomic_claim_urls_pg")
+                # Calculate the threshold for considering a claim expired
+                expired_claim_timestamp_threshold = claim_timestamp - (claim_expiry_seconds * 1000)
+
+                sql_query = '''
+                WITH unexpired_candidates AS (
+                    SELECT id, url, domain, added_timestamp
+                    FROM frontier
+                    WHERE claimed_at IS NULL
+                    ORDER BY added_timestamp ASC
+                    LIMIT %s
+                ),
+                expired_candidates AS (
+                    SELECT id, url, domain, added_timestamp
+                    FROM frontier
+                    WHERE claimed_at IS NOT NULL AND claimed_at < %s
+                    ORDER BY added_timestamp ASC
+                    LIMIT %s
+                ),
+                all_candidates AS (
+                    SELECT id, url, domain, added_timestamp FROM unexpired_candidates
+                    UNION ALL
+                    SELECT id, url, domain, added_timestamp FROM expired_candidates
+                ),
+                ordered_limited_candidates AS (
+                    SELECT id, url, domain
+                    FROM all_candidates
+                    ORDER BY added_timestamp ASC
+                    LIMIT %s
+                ),
+                to_claim AS (
+                    SELECT id, url, domain FROM ordered_limited_candidates
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE frontier
+                SET claimed_at = %s
+                FROM to_claim
+                WHERE frontier.id = to_claim.id
+                RETURNING frontier.id, frontier.url, frontier.domain;
+                '''
+                claimed_urls = await self.storage.db.execute_returning(
+                    sql_query,
+                    (batch_size, expired_claim_timestamp_threshold, batch_size, batch_size, claim_timestamp),
+                    query_name="atomic_claim_urls_pg_implicit_expiry"
+                )
             else:
-                # SQLite doesn't support FOR UPDATE SKIP LOCKED, use the original method
-                claimed_urls = await self.storage.db.execute_returning("""
+                # SQLite doesn't support FOR UPDATE SKIP LOCKED or complex CTEs as well.
+                # Keep the old explicit release and simpler claim for SQLite.
+                # This path will be less performant for high-volume crawling.
+                expired_timestamp = claim_timestamp - (claim_expiry_seconds * 1000)
+                await self.storage.db.execute("""
                     UPDATE frontier 
-                    SET claimed_at = ? 
-                    WHERE id IN (
-                        SELECT id FROM frontier 
+                    SET claimed_at = NULL 
+                    WHERE claimed_at IS NOT NULL AND claimed_at < ?
+                """, (expired_timestamp,), query_name="release_expired_claims")
+
+                # Original SQLite claiming logic
+                claimed_urls = await self.storage.db.execute_returning(
+                    """
+                    WITH to_claim_ids AS (
+                        SELECT id
+                        FROM frontier
                         WHERE claimed_at IS NULL
-                        ORDER BY added_timestamp ASC 
+                        ORDER BY added_timestamp ASC
                         LIMIT ?
                     )
+                    UPDATE frontier
+                    SET claimed_at = ?
+                    WHERE id IN (SELECT id FROM to_claim_ids)
                     RETURNING id, url, domain
-                """, (claim_timestamp, batch_size), query_name="atomic_claim_urls_sqlite")
+                    """, (batch_size, claim_timestamp), # Corrected params for SQLite query
+                    query_name="atomic_claim_urls_sqlite"
+                )
             
             return claimed_urls
             
