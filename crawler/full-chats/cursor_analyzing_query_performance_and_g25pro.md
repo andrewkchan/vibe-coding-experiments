@@ -1,5 +1,5 @@
 # Analyzing query performance and optimization
-_Exported on 6/6/2025 at 00:05:34 PDT from Cursor (0.50.5)_
+_Exported on 6/6/2025 at 00:15:51 PDT from Cursor (0.50.5)_
 
 ---
 
@@ -1642,4 +1642,177 @@ class PolitenessEnforcer:
         # Default to allowed if no robots.txt
         return True
 ```
+
+---
+
+**User**
+
+I can't accept this code. It appears you have deleted the contents of `_load_manual_exclusions` and are trying to access a nonexistent field `config.default_crawl_delay` and maybe more things as well. Maybe the interface is giving you incomplete contents of the file. Do you want to try again and instrument the queries one-by-one?
+
+---
+
+**Cursor**
+
+You are absolutely right. My apologies. The full-file replacement was a mistake, and I clearly was working with a corrupted version of `politeness.py`. Your analysis of the errors was spot on, and your suggestion to instrument the queries one by one is the correct, safe path forward. I will follow your lead.
+
+Let's start by instrumenting the database query in the `_get_cached_robots` method.
+
+
+```python
+\
+// ... existing code ...
+    async def _get_cached_robots(self, domain: str) -> tuple | None:
+        try:
+            row = await self.storage.db.fetch_one(
+                "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?", 
+                (domain,),
+                query_name="get_cached_robots"
+            )
+            return row
+        except Exception as e:
+// ... existing code ...
+
+```
+
+Okay, the first one is done. Now for the next one.
+
+`_check_manual_exclusion` has two different `fetch_one` calls inside an `if/else` block. I'll add a distinct `query_name` to each one so we can differentiate them in the logs.
+
+
+```python
+\
+// ... existing code ...
+    async def _check_manual_exclusion(self, domain: str) -> bool:
+        """Returns True if domain is manually excluded or (if seeded_urls_only) not seeded."""
+        try:
+            if self.config.seeded_urls_only:
+                row = await self.storage.db.fetch_one(
+                    "SELECT is_manually_excluded, is_seeded FROM domain_metadata WHERE domain = ?", 
+                    (domain,),
+                    query_name="check_manual_exclusion_seeded"
+                )
+                if row:
+                    is_excluded = bool(row[0] == 1)
+// ... existing code ...
+                    # Domain not in metadata - it's not seeded
+                    return True
+            else:
+                row = await self.storage.db.fetch_one(
+                    "SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", 
+                    (domain,),
+                    query_name="check_manual_exclusion_unseeded"
+                )
+                return bool(row and row[0] == 1)
+        except Exception as e:
+// ... existing code ...
+
+```
+
+Two down. Next, I'll instrument the `record_domain_fetch_attempt` method. This one is particularly interesting as it's an `INSERT ... ON CONFLICT` (`UPSERT`) which can have different performance characteristics.
+
+
+```python
+\
+// ... existing code ...
+    async def record_domain_fetch_attempt(self, domain: str):
+        """Records that we are about to fetch from a domain."""
+        try:
+            current_time = int(time.time())
+            if self.storage.config.db_type == "postgresql":
+                await self.storage.db.execute(
+                    "INSERT INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (%s, %s) ON CONFLICT (domain) DO UPDATE SET last_scheduled_fetch_timestamp = %s",
+                    (domain, current_time, current_time),
+                    query_name="record_fetch_attempt_pg"
+                )
+            else:  # SQLite
+                await self.storage.db.execute(
+                    "INSERT OR REPLACE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?, ?)",
+                    (domain, current_time),
+                    query_name="record_fetch_attempt_sqlite"
+                )
+        except Exception as e: 
+            logger.error(f"Error recording fetch attempt for {domain}: {e}")
+
+```
+
+Excellent. Now for `_update_robots_cache`. This method performs two separate `execute` calls for PostgreSQL (an `INSERT` followed by an `UPDATE`) which is inefficient. While we could optimize this to a single `UPSERT` later, for now, let's just add metrics to see how much time each part is taking.
+
+
+```python
+\
+// ... existing code ...
+    async def _update_robots_cache(self, domain: str, robots_content: str, fetched_timestamp: int, expires_timestamp: int):
+        try:
+            if self.storage.config.db_type == "postgresql":
+                await self.storage.db.execute(
+                    "INSERT INTO domain_metadata (domain) VALUES (%s) ON CONFLICT DO NOTHING", 
+                    (domain,),
+                    query_name="update_robots_cache_insert_pg"
+                )
+                await self.storage.db.execute(
+                    "UPDATE domain_metadata SET robots_txt_content = %s, robots_txt_fetched_timestamp = %s, robots_txt_expires_timestamp = %s WHERE domain = %s",
+                    (robots_content, fetched_timestamp, expires_timestamp, domain),
+                    query_name="update_robots_cache_update_pg"
+                )
+            else:  # SQLite
+                await self.storage.db.execute(
+                    "INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", 
+                    (domain,),
+                    query_name="update_robots_cache_insert_sqlite"
+                )
+                await self.storage.db.execute(
+                    "UPDATE domain_metadata SET robots_txt_content = ?, robots_txt_fetched_timestamp = ?, robots_txt_expires_timestamp = ? WHERE domain = ?",
+                    (robots_content, fetched_timestamp, expires_timestamp, domain),
+                    query_name="update_robots_cache_update_sqlite"
+                )
+            logger.debug(f"Cached robots.txt for {domain} in DB.")
+// ... existing code ...
+
+```
+
+Perfect. Finally, let's instrument `_load_manual_exclusions`. This method also contains multiple database calls that should be tagged.
+
+
+```python
+\
+// ... existing code ...
+                    for line in f:
+                        domain_to_exclude = line.strip().lower()
+                        if domain_to_exclude and not domain_to_exclude.startswith("#"):
+                            if self.storage.config.db_type == "postgresql":
+                                await self.storage.db.execute(
+                                    "INSERT INTO domain_metadata (domain) VALUES (%s) ON CONFLICT DO NOTHING", 
+                                    (domain_to_exclude,),
+                                    query_name="load_exclusions_insert_pg"
+                                )
+                            else:  # SQLite
+                                await self.storage.db.execute(
+                                    "INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", 
+                                    (domain_to_exclude,),
+                                    query_name="load_exclusions_insert_sqlite"
+                                )
+                            await self.storage.db.execute(
+                                "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = %s" if self.storage.config.db_type == "postgresql" else "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?",
+                                (domain_to_exclude,),
+                                query_name="load_exclusions_update"
+                            )
+                            count += 1
+                    logger.info(f"Loaded and marked {count} domains as manually excluded from {self.config.exclude_file}.")
+// ... existing code ...
+
+```
+
+That completes the instrumentation of `politeness.py`. We've now added `query_name` tags to every database call within that module.
+
+Now, when you run the crawler, your metrics logs should include detailed performance data for:
+*   `get_cached_robots`
+*   `check_manual_exclusion_seeded`
+*   `check_manual_exclusion_unseeded`
+*   `record_fetch_attempt_pg` / `..._sqlite`
+*   `update_robots_cache_...`
+*   `load_exclusions_...`
+
+This will give us a much clearer picture of where the database time is being spent and why the connection pool is still saturated.
+
+Please run the crawler again. Once you have a new set of metrics, we can analyze them to identify the next major bottleneck. My hypothesis is that the cumulative time spent in these small, frequent politeness queries is now the dominant factor limiting your throughput.
 

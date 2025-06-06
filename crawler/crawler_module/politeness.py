@@ -39,16 +39,19 @@ class PolitenessEnforcer:
                             if self.storage.config.db_type == "postgresql":
                                 await self.storage.db.execute(
                                     "INSERT INTO domain_metadata (domain) VALUES (%s) ON CONFLICT DO NOTHING", 
-                                    (domain_to_exclude,)
+                                    (domain_to_exclude,),
+                                    query_name="load_exclusions_insert_pg"
                                 )
                             else:  # SQLite
                                 await self.storage.db.execute(
                                     "INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", 
-                                    (domain_to_exclude,)
+                                    (domain_to_exclude,),
+                                    query_name="load_exclusions_insert_sqlite"
                                 )
                             await self.storage.db.execute(
                                 "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = %s" if self.storage.config.db_type == "postgresql" else "UPDATE domain_metadata SET is_manually_excluded = 1 WHERE domain = ?",
-                                (domain_to_exclude,)
+                                (domain_to_exclude,),
+                                query_name="load_exclusions_update"
                             )
                             count += 1
                     logger.info(f"Loaded and marked {count} domains as manually excluded from {self.config.exclude_file}.")
@@ -66,7 +69,8 @@ class PolitenessEnforcer:
         try:
             row = await self.storage.db.fetch_one(
                 "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?", 
-                (domain,)
+                (domain,),
+                query_name="get_cached_robots"
             )
             return row
         except Exception as e:
@@ -78,20 +82,24 @@ class PolitenessEnforcer:
             if self.storage.config.db_type == "postgresql":
                 await self.storage.db.execute(
                     "INSERT INTO domain_metadata (domain) VALUES (%s) ON CONFLICT DO NOTHING", 
-                    (domain,)
+                    (domain,),
+                    query_name="update_robots_cache_insert_pg"
                 )
                 await self.storage.db.execute(
                     "UPDATE domain_metadata SET robots_txt_content = %s, robots_txt_fetched_timestamp = %s, robots_txt_expires_timestamp = %s WHERE domain = %s",
-                    (robots_content, fetched_timestamp, expires_timestamp, domain)
+                    (robots_content, fetched_timestamp, expires_timestamp, domain),
+                    query_name="update_robots_cache_update_pg"
                 )
             else:  # SQLite
                 await self.storage.db.execute(
                     "INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", 
-                    (domain,)
+                    (domain,),
+                    query_name="update_robots_cache_insert_sqlite"
                 )
                 await self.storage.db.execute(
                     "UPDATE domain_metadata SET robots_txt_content = ?, robots_txt_fetched_timestamp = ?, robots_txt_expires_timestamp = ? WHERE domain = ?",
-                    (robots_content, fetched_timestamp, expires_timestamp, domain)
+                    (robots_content, fetched_timestamp, expires_timestamp, domain),
+                    query_name="update_robots_cache_update_sqlite"
                 )
             logger.debug(f"Cached robots.txt for {domain} in DB.")
         except Exception as e:
@@ -177,7 +185,8 @@ class PolitenessEnforcer:
             if self.config.seeded_urls_only:
                 row = await self.storage.db.fetch_one(
                     "SELECT is_manually_excluded, is_seeded FROM domain_metadata WHERE domain = ?", 
-                    (domain,)
+                    (domain,),
+                    query_name="check_manual_exclusion_seeded"
                 )
                 if row:
                     is_excluded = bool(row[0] == 1)
@@ -189,7 +198,8 @@ class PolitenessEnforcer:
             else:
                 row = await self.storage.db.fetch_one(
                     "SELECT is_manually_excluded FROM domain_metadata WHERE domain = ?", 
-                    (domain,)
+                    (domain,),
+                    query_name="check_manual_exclusion_unseeded"
                 )
                 return bool(row and row[0] == 1)
         except Exception as e:
@@ -272,12 +282,14 @@ class PolitenessEnforcer:
             if self.storage.config.db_type == "postgresql":
                 await self.storage.db.execute(
                     "INSERT INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (%s, %s) ON CONFLICT (domain) DO UPDATE SET last_scheduled_fetch_timestamp = %s",
-                    (domain, current_time, current_time)
+                    (domain, current_time, current_time),
+                    query_name="record_fetch_attempt_pg"
                 )
             else:  # SQLite
                 await self.storage.db.execute(
                     "INSERT OR REPLACE INTO domain_metadata (domain, last_scheduled_fetch_timestamp) VALUES (?, ?)",
-                    (domain, current_time)
+                    (domain, current_time),
+                    query_name="record_fetch_attempt_sqlite"
                 )
         except Exception as e: 
             logger.error(f"Error recording fetch attempt for {domain}: {e}") 
