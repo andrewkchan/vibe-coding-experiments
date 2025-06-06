@@ -102,6 +102,16 @@ class CrawlerOrchestrator:
         self.pages_crawled_in_interval: int = 0
         self.last_metrics_log_time: float = time.time()
 
+    async def _initialize_components(self):
+        """Initializes all crawler components that require async setup."""
+        logger.info("Initializing crawler components...")
+        await self.db_backend.initialize()
+        await self.storage.init_db_schema()
+        # Load politeness-related data that needs to be available before crawl starts
+        await self.politeness._load_manual_exclusions()
+        await self.frontier.initialize_frontier()
+        logger.info("Crawler components initialized.")
+
     async def _log_metrics(self):
         current_time = time.time()
         time_elapsed_seconds = current_time - self.last_metrics_log_time
@@ -259,22 +269,9 @@ class CrawlerOrchestrator:
         current_process = psutil.Process(os.getpid())
 
         try:
-            # Initialize database
-            await self.db_backend.initialize()
-            await self.storage.init_db_schema()
-            
-            # Initialize frontier (loads seeds etc.)
-            await self.frontier.initialize_frontier()
-            initial_frontier_size = await self.frontier.count_frontier()
-            self.total_urls_added_to_frontier = initial_frontier_size
-            logger.info(f"Frontier initialized. Size: {initial_frontier_size}")
+            # Initialize components that need async setup
+            await self._initialize_components()
 
-            if initial_frontier_size == 0 and not self.config.resume:
-                logger.warning("No URLs in frontier after seed loading. Nothing to crawl.")
-                self._shutdown_event.set() # Ensure a clean shutdown path
-            elif initial_frontier_size == 0 and self.config.resume:
-                logger.warning("Resuming with an empty frontier. Crawler will wait for new URLs or shutdown if none appear.")
-            
             # Start worker tasks
             logger.info(f"Starting {self.config.max_workers} workers with staggered startup...")
             

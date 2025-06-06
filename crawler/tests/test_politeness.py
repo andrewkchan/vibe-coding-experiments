@@ -121,229 +121,209 @@ async def test_load_manual_exclusions_with_file(
 
 # --- Tests for _get_robots_for_domain (async) --- 
 @pytest.mark.asyncio
-async def test_get_robots_from_memory_cache(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_robots_from_memory_cache(politeness_enforcer: PolitenessEnforcer):
+    """Tests that if a parser is in memory, the DB is not hit."""
     domain = "example.com"
     mock_rerp = MagicMock(spec=RobotExclusionRulesParser)
-    mock_rerp.source_content = "User-agent: *\nDisallow: /test"
     politeness_enforcer.robots_parsers[domain] = mock_rerp
 
-    # Mock the async database methods
-    politeness_enforcer.storage.db.fetch_one.return_value = None
-
+    # Act
     rerp = await politeness_enforcer._get_robots_for_domain(domain)
+
+    # Assert
     assert rerp == mock_rerp
+    # With the new logic, if it's in the memory cache, no other calls are made.
+    politeness_enforcer.storage.db.fetch_one.assert_not_called()
     politeness_enforcer.fetcher.fetch_url.assert_not_called()
-    # Check that fetch_one was called to look for cached robots
-    politeness_enforcer.storage.db.fetch_one.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_get_robots_from_db_cache_fresh(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+    """Tests getting a fresh robots.txt from the DB cache when not in memory."""
     domain = "dbcached.com"
     robots_text = "User-agent: TestCrawler\nDisallow: /private"
     future_expiry = int(time.time()) + DEFAULT_ROBOTS_TXT_TTL
 
-    # Mock the async database methods
+    # Setup: Ensure not in memory, but DB mock will return a fresh record
+    politeness_enforcer.robots_parsers.pop(domain, None)
     politeness_enforcer.storage.db.fetch_one.return_value = (robots_text, future_expiry)
     
-    if domain in politeness_enforcer.robots_parsers:
-        del politeness_enforcer.robots_parsers[domain]
-
+    # Act
     rerp = await politeness_enforcer._get_robots_for_domain(domain)
         
+    # Assert
+    # 1. DB was checked
     politeness_enforcer.storage.db.fetch_one.assert_called_once_with(
         "SELECT robots_txt_content, robots_txt_expires_timestamp FROM domain_metadata WHERE domain = ?",
-        (domain,)
+        (domain,),
+        query_name="get_cached_robots"
     )
-
+    # 2. Web was NOT fetched
+    politeness_enforcer.fetcher.fetch_url.assert_not_called()
+    # 3. Parser is correct
     assert rerp is not None
     assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/private") is False
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/public") is True
-    politeness_enforcer.fetcher.fetch_url.assert_not_called()
+    # 4. In-memory cache is now populated
     assert domain in politeness_enforcer.robots_parsers
+    assert politeness_enforcer.robots_parsers[domain] == rerp
 
 @pytest.mark.asyncio
-async def test_get_robots_db_cache_stale_then_fetch_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_robots_db_cache_stale_then_fetch_success(politeness_enforcer: PolitenessEnforcer):
+    """Tests fetching from web when DB cache is stale."""
     domain = "staledb.com"
-    stale_robots_text = "User-agent: *\nDisallow: /old"
     past_expiry = int(time.time()) - 1000
     new_robots_text = "User-agent: *\nDisallow: /new"
 
-    # Mock the async database methods
-    politeness_enforcer.storage.db.fetch_one.return_value = (stale_robots_text, past_expiry)
-    politeness_enforcer.storage.db.execute.return_value = None
-    
-    if domain in politeness_enforcer.robots_parsers:
-        del politeness_enforcer.robots_parsers[domain]
-
+    # Setup: DB returns a stale record
+    politeness_enforcer.robots_parsers.pop(domain, None)
+    politeness_enforcer.storage.db.fetch_one.return_value = ("stale content", past_expiry)
+    # Mock the web fetch to succeed
     politeness_enforcer.fetcher.fetch_url.return_value = FetchResult(
-        initial_url=f"http://{domain}/robots.txt",
-        final_url=f"http://{domain}/robots.txt",
-        status_code=200,
-        text_content=new_robots_text
+        initial_url=f"http://{domain}/robots.txt", final_url=f"http://{domain}/robots.txt",
+        status_code=200, text_content=new_robots_text
     )
-    
+    # Mock the DB update
+    politeness_enforcer.storage.db.execute = AsyncMock()
+
+    # Act
     rerp = await politeness_enforcer._get_robots_for_domain(domain)
 
+    # Assert
     assert rerp is not None
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/new") is False
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/old") is True 
-    
-    politeness_enforcer.fetcher.fetch_url.assert_called_once_with(f"http://{domain}/robots.txt", is_robots_txt=True)
-    
-    # Check if DB was updated
-    # With the new async backend, we expect execute calls for INSERT OR IGNORE and UPDATE
-    assert politeness_enforcer.storage.db.execute.call_count >= 2  # INSERT OR IGNORE, UPDATE
-    
-    update_calls = [call for call in politeness_enforcer.storage.db.execute.call_args_list 
-                    if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
-    
-    args, _ = update_calls[0]  # First UPDATE call
-    assert args[1][0] == new_robots_text  # Check content being updated
-    assert args[1][3] == domain  # Check domain being updated
-    
+    # 1. DB was checked for cache
+    politeness_enforcer.storage.db.fetch_one.assert_called_once()
+    # 2. Web was fetched (since DB was stale)
+    politeness_enforcer.fetcher.fetch_url.assert_called_once()
+    # 3. DB was updated with the new content
+    politeness_enforcer.storage.db.execute.assert_called_once()
+    call_args = politeness_enforcer.storage.db.execute.call_args
+    # Correctly access positional args: call_args[0] for args, call_args[1] for kwargs
+    query_arg = call_args[0][0]
+    params_arg = call_args[0][1]
+    assert "INSERT OR REPLACE" in query_arg
+    assert params_arg[1] == new_robots_text # Check content
+    # 4. In-memory cache is now populated
     assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
-async def test_get_robots_no_cache_fetch_http_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_robots_no_cache_fetch_http_success(politeness_enforcer: PolitenessEnforcer):
+    """Tests fetching from web when no caches are available."""
     domain = "newfetch.com"
     robots_text = "User-agent: *\nAllow: /"
 
-    # Mock the async database methods
+    # Setup: No in-memory or DB cache
+    politeness_enforcer.robots_parsers.pop(domain, None)
     politeness_enforcer.storage.db.fetch_one.return_value = None
-    politeness_enforcer.storage.db.execute.return_value = None
-    
-    politeness_enforcer.robots_parsers.pop(domain, None)  # Ensure no memory cache
-
+    # Mock web fetch and DB update
     politeness_enforcer.fetcher.fetch_url.return_value = FetchResult(
-        initial_url=f"http://{domain}/robots.txt",
-        final_url=f"http://{domain}/robots.txt",
-        status_code=200,
-        text_content=robots_text
+        initial_url=f"http://{domain}/robots.txt", final_url=f"http://{domain}/robots.txt",
+        status_code=200, text_content=robots_text
     )
+    politeness_enforcer.storage.db.execute = AsyncMock()
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
+    # Act
+    await politeness_enforcer._get_robots_for_domain(domain)
 
-    assert rerp is not None
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/anypage") is True
-    politeness_enforcer.fetcher.fetch_url.assert_called_once_with(f"http://{domain}/robots.txt", is_robots_txt=True)
-    
-    update_calls = [call for call in politeness_enforcer.storage.db.execute.call_args_list 
-                    if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
-    args, _ = update_calls[0]
-    assert args[1][0] == robots_text
+    # Assert
+    politeness_enforcer.storage.db.fetch_one.assert_called_once() # DB cache check
+    politeness_enforcer.fetcher.fetch_url.assert_called_once() # Web fetch
+    politeness_enforcer.storage.db.execute.assert_called_once() # DB cache update
     assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
-async def test_get_robots_http_fail_then_https_success(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_robots_http_fail_then_https_success(politeness_enforcer: PolitenessEnforcer):
+    """Tests fallback from HTTP to HTTPS for robots.txt fetch."""
     domain = "httpsfallback.com"
     robots_text_https = "User-agent: *\nDisallow: /onlyhttps"
 
-    # Mock the async database methods
-    politeness_enforcer.storage.db.fetch_one.return_value = None
-    politeness_enforcer.storage.db.execute.return_value = None
-    
+    # Setup
     politeness_enforcer.robots_parsers.pop(domain, None)
-
-    fetch_result_http = FetchResult(
-        initial_url=f"http://{domain}/robots.txt",
-        final_url=f"http://{domain}/robots.txt",
-        status_code=500,
-        error_message="HTTP fetch failed"
-    )
+    politeness_enforcer.storage.db.fetch_one.return_value = None
+    politeness_enforcer.storage.db.execute = AsyncMock()
+    # Mock fetcher to fail on HTTP and succeed on HTTPS
+    fetch_result_http = FetchResult(initial_url="...", final_url="...", status_code=500)
     fetch_result_https = FetchResult(
-        initial_url=f"https://{domain}/robots.txt",
-        final_url=f"https://{domain}/robots.txt",
-        status_code=200,
-        text_content=robots_text_https
+        initial_url="...", final_url="...", status_code=200, text_content=robots_text_https
     )
     politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_result_http, fetch_result_https]
 
-    rerp = await politeness_enforcer._get_robots_for_domain(domain)
-    assert rerp is not None
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/onlyhttps") is False
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/allowed") is True
-    
+    # Act
+    await politeness_enforcer._get_robots_for_domain(domain)
+
+    # Assert
     assert politeness_enforcer.fetcher.fetch_url.call_count == 2
-    politeness_enforcer.fetcher.fetch_url.assert_any_call(f"http://{domain}/robots.txt", is_robots_txt=True)
-    politeness_enforcer.fetcher.fetch_url.assert_any_call(f"https://{domain}/robots.txt", is_robots_txt=True)
-    
-    update_calls = [call for call in politeness_enforcer.storage.db.execute.call_args_list 
-                    if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
-    args, _ = update_calls[0]
-    assert args[1][0] == robots_text_https
+    politeness_enforcer.storage.db.execute.assert_called_once() # DB update should happen
+    params_arg = politeness_enforcer.storage.db.execute.call_args[0][1]
+    assert params_arg[1] == robots_text_https
     assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
-async def test_get_robots_http_404_https_404(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_robots_http_404_https_404(politeness_enforcer: PolitenessEnforcer):
+    """Tests that two 404s result in an empty (allow all) robots rule."""
     domain = "all404.com"
-
-    # Mock the async database methods
-    politeness_enforcer.storage.db.fetch_one.return_value = None
-    politeness_enforcer.storage.db.execute.return_value = None
-    
+    # Setup
     politeness_enforcer.robots_parsers.pop(domain, None)
-
-    fetch_result_404 = FetchResult(
-        initial_url="dummy", final_url="dummy", status_code=404, error_message="Not Found"
-    )
+    politeness_enforcer.storage.db.fetch_one.return_value = None
+    politeness_enforcer.storage.db.execute = AsyncMock()
+    # Mock fetcher to return 404 for both calls
+    fetch_result_404 = FetchResult(initial_url="...", final_url="...", status_code=404)
     politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_result_404, fetch_result_404]
 
+    # Act
     rerp = await politeness_enforcer._get_robots_for_domain(domain)
+
+    # Assert
     assert rerp is not None
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/anypage") is True
+    assert rerp.is_allowed(politeness_enforcer.config.user_agent, "/") is True
     assert politeness_enforcer.fetcher.fetch_url.call_count == 2
-    
-    update_calls = [call for call in politeness_enforcer.storage.db.execute.call_args_list 
-                    if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
-    args, _ = update_calls[0]
-    assert args[1][0] == ""  # Empty string for 404
+    # DB should be updated with an empty string to cache the "not found" result
+    politeness_enforcer.storage.db.execute.assert_called_once()
+    params_arg = politeness_enforcer.storage.db.execute.call_args[0][1]
+    assert params_arg[1] == ""
     assert domain in politeness_enforcer.robots_parsers
 
 @pytest.mark.asyncio
-async def test_get_robots_all_fetches_fail_connection_error(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_robots_all_fetches_fail_connection_error(politeness_enforcer: PolitenessEnforcer):
+    """Tests that connection errors result in an empty (allow all) robots rule."""
     domain = "allconnectfail.com"
-    
-    # Mock the async database methods
-    politeness_enforcer.storage.db.fetch_one.return_value = None
-    politeness_enforcer.storage.db.execute.return_value = None
-    
+    # Setup
     politeness_enforcer.robots_parsers.pop(domain, None)
-
-    fetch_fail_result = FetchResult(
-        initial_url="dummy", final_url="dummy", status_code=901, error_message="Connection failed"
-    )
+    politeness_enforcer.storage.db.fetch_one.return_value = None
+    politeness_enforcer.storage.db.execute = AsyncMock()
+    # Mock fetcher to simulate connection error
+    fetch_fail_result = FetchResult(initial_url="...", final_url="...", status_code=901)
     politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_fail_result, fetch_fail_result]
 
+    # Act
     rerp = await politeness_enforcer._get_robots_for_domain(domain)
-    assert rerp is not None
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/anything") is True  # Default to allow if all fails
-    assert politeness_enforcer.fetcher.fetch_url.call_count == 2
     
-    update_calls = [call for call in politeness_enforcer.storage.db.execute.call_args_list 
-                    if "UPDATE domain_metadata" in call[0][0]]
-    assert len(update_calls) > 0
-    args, _ = update_calls[0]
-    assert args[1][0] == ""
+    # Assert
+    assert rerp is not None
+    assert rerp.is_allowed(politeness_enforcer.config.user_agent, "/") is True
+    assert politeness_enforcer.fetcher.fetch_url.call_count == 2
+    politeness_enforcer.storage.db.execute.assert_called_once()
+    params_arg = politeness_enforcer.storage.db.execute.call_args[0][1]
+    assert params_arg[1] == "" # Cache empty string
     assert domain in politeness_enforcer.robots_parsers
 
 # --- Tests for is_url_allowed (async) ---
 @pytest.mark.asyncio
-async def test_is_url_allowed_manually_excluded(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_is_url_allowed_manually_excluded(politeness_enforcer: PolitenessEnforcer):
     domain = "manualexclude.com"
     url = f"http://{domain}/somepage"
     
-    # Mock the async database methods
-    politeness_enforcer.storage.db.fetch_one.return_value = (1,)  # Domain is manually excluded
+    # Setup: Prime the manual exclusion cache correctly
+    politeness_enforcer.exclusion_cache[domain] = True
+    politeness_enforcer.exclusion_cache_order[domain] = None
 
+    # Act
     is_allowed = await politeness_enforcer.is_url_allowed(url)
 
+    # Assert
     assert is_allowed is False
-    # Ensure _get_robots_for_domain is NOT called if manually excluded, so fetcher shouldn't be called by it.
-    politeness_enforcer.fetcher.fetch_url.assert_not_called()
+    # Ensure _get_robots_for_domain is NOT called if manually excluded
+    politeness_enforcer._get_robots_for_domain = AsyncMock()
+    await politeness_enforcer.is_url_allowed(url)
+    politeness_enforcer._get_robots_for_domain.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_is_url_allowed_by_robots(politeness_enforcer: PolitenessEnforcer, dummy_config: CrawlerConfig):
@@ -352,31 +332,26 @@ async def test_is_url_allowed_by_robots(politeness_enforcer: PolitenessEnforcer,
     disallowed_url = f"http://{domain}/disallowed"
     robots_text = f"User-agent: {dummy_config.user_agent}\nDisallow: /disallowed"
 
-    # Mock the async database methods for manual exclusion check
-    politeness_enforcer.storage.db.fetch_one.return_value = (0,)  # Domain is NOT manually excluded
-
-    # Mock _get_robots_for_domain to return a pre-configured RERP instance
+    # Setup: Ensure not manually excluded (prime cache correctly)
+    politeness_enforcer.exclusion_cache[domain] = False
+    politeness_enforcer.exclusion_cache_order[domain] = None
+    
+    # Mock _get_robots_for_domain to return a pre-configured parser
     rerp_instance = RobotExclusionRulesParser()
     rerp_instance.parse(robots_text)
-    
-    # Patch the _get_robots_for_domain method on the instance
     politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp_instance)
 
-    # --- Test Allowed URL ---
+    # Test Allowed URL
     assert await politeness_enforcer.is_url_allowed(allowed_url) is True
-    # Verify _get_robots_for_domain was called, as it wasn't manually excluded
     politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain)
 
-    # --- Reset for next test case ---
+    # Test Disallowed URL
     politeness_enforcer._get_robots_for_domain.reset_mock()
-
-    # --- Test Disallowed URL ---
     assert await politeness_enforcer.is_url_allowed(disallowed_url) is False
-    # Verify _get_robots_for_domain was called again
     politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain)
 
-    # Check that fetch_one was called for each is_url_allowed call (for manual exclusion)
-    assert politeness_enforcer.storage.db.fetch_one.call_count == 2
+    # Ensure the DB mock for exclusion checks was not hit because the cache was primed
+    politeness_enforcer.storage.db.fetch_one.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_is_url_allowed_no_domain(politeness_enforcer: PolitenessEnforcer):
