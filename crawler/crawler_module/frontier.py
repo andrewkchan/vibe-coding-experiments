@@ -147,20 +147,22 @@ class FrontierManager:
         # Create SHA256 hashes for the query
         url_hashes_to_check = [self.storage.get_url_sha256(u) for u in allowed_urls]
         
-        # This part is tricky. A large IN clause can be slow.
-        # However, for a single page, the number of links is usually manageable.
-        # This could be a future optimization.
-        
-        # Fetch all hashes that already exist in visited_urls
+        # Chunk the check for existing hashes to avoid very large IN clauses.
         existing_hashes = set()
-        rows = await self.storage.db.fetch_all(
-            f"SELECT url_sha256 FROM visited_urls WHERE url_sha256 IN ({','.join(['?' for _ in url_hashes_to_check])})",
-            tuple(url_hashes_to_check),
-            query_name="batch_check_visited"
-        )
-        if rows:
-            for row in rows:
-                existing_hashes.add(row[0])
+        chunk_size = 500
+        
+        for i in range(0, len(url_hashes_to_check), chunk_size):
+            chunk = url_hashes_to_check[i:i + chunk_size]
+            
+            # Fetch hashes from the current chunk that already exist in visited_urls
+            rows = await self.storage.db.fetch_all(
+                f"SELECT url_sha256 FROM visited_urls WHERE url_sha256 IN ({','.join(['?' for _ in chunk])})",
+                tuple(chunk),
+                query_name="batch_check_visited"
+            )
+            if rows:
+                for row in rows:
+                    existing_hashes.add(row[0])
 
         # Filter out URLs that are already visited
         new_urls_to_add = [u for u in allowed_urls if self.storage.get_url_sha256(u) not in existing_hashes]
@@ -168,7 +170,7 @@ class FrontierManager:
         if not new_urls_to_add:
             return 0
 
-        # 4. Bulk insert new URLs into the frontier
+        # 4. Bulk insert new URLs into the frontier in chunks
         added_count = 0
         current_time = int(time.time())
         
@@ -182,30 +184,31 @@ class FrontierManager:
             return 0
             
         try:
-            # Use execute_many for efficient bulk insertion
-            if self.storage.config.db_type == "postgresql":
-                await self.storage.db.execute_many(
-                    "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (url) DO NOTHING",
-                    records_to_insert,
-                    query_name="batch_insert_frontier_pg"
-                )
-            else: # SQLite
-                await self.storage.db.execute_many(
-                    "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    records_to_insert,
-                    query_name="batch_insert_frontier_sqlite"
-                )
+            for i in range(0, len(records_to_insert), chunk_size):
+                chunk_of_records = records_to_insert[i:i + chunk_size]
+                
+                if self.storage.config.db_type == "postgresql":
+                    await self.storage.db.execute_many(
+                        "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (url) DO NOTHING",
+                        chunk_of_records,
+                        query_name="batch_insert_frontier_pg"
+                    )
+                else: # SQLite
+                    await self.storage.db.execute_many(
+                        "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        chunk_of_records,
+                        query_name="batch_insert_frontier_sqlite"
+                    )
 
-            # Update in-memory cache and count
-            for url, _, _, _, _, _ in records_to_insert:
-                self.seen_urls.add(url)
-            
-            added_count = len(records_to_insert)
+                # Update in-memory cache and count for the processed chunk
+                for record in chunk_of_records:
+                    self.seen_urls.add(record[0])
+                
+                added_count += len(chunk_of_records)
             
         except Exception as e:
             # This can happen in a race condition if another worker adds the same URL between our checks and this insert.
             logger.error(f"DB error during batch insert to frontier: {e}")
-            # We could try to insert one-by-one here as a fallback, but for now, we'll just log.
 
         return added_count
 

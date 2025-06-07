@@ -26,7 +26,7 @@ EMPTY_FRONTIER_SLEEP_SECONDS = 10
 # How often the main orchestrator loop checks status and stopping conditions
 ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 
-METRICS_LOG_INTERVAL_SECONDS = 20
+METRICS_LOG_INTERVAL_SECONDS = 60
 
 class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
@@ -142,7 +142,8 @@ class CrawlerOrchestrator:
                 if hold_times:
                     p50_hold = calculate_percentiles(hold_times, [50])[0]
                     p95_hold = calculate_percentiles(hold_times, [95])[0]
-                    logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): P50={p50_hold*1000:.2f}, P95={p95_hold*1000:.2f} (from {len(hold_times)} samples)")
+                    max_hold = max(hold_times)
+                    logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): P50={p50_hold*1000:.2f}, P95={p95_hold*1000:.2f}, MAX={max_hold*1000:.2f} (from {len(hold_times)} samples)")
                 # else: logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): No samples") # Optional: log if no samples
 
         # Reset for next interval
