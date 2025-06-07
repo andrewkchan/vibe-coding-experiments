@@ -162,18 +162,17 @@ class CrawlerOrchestrator:
                 next_url_info = await self.frontier.get_next_url()
 
                 if next_url_info is None:
-                    # Check if the frontier is truly empty (not just all domains on cooldown)
-                    current_frontier_size_for_worker = await self.frontier.count_frontier()
-                    if current_frontier_size_for_worker == 0:
-                        logger.info(f"Worker-{worker_id}: Frontier is confirmed empty by count. Waiting...")
+                    # Check if the frontier is truly empty before sleeping
+                    if await self.frontier.is_empty():
+                        logger.info(f"Worker-{worker_id}: Frontier is confirmed empty. Waiting...")
                     else:
-                        # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting... Frontier size: {current_frontier_size_for_worker}")
+                        # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting...")
                         pass # Still URLs, but none fetchable now
                     await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS) 
                     continue
 
-                url_to_crawl, domain, frontier_id = next_url_info
-                logger.info(f"Worker-{worker_id}: Processing URL ID {frontier_id}: {url_to_crawl} from domain {domain}")
+                url_to_crawl, domain, frontier_id, depth = next_url_info
+                logger.info(f"Worker-{worker_id}: Processing URL ID {frontier_id} at depth {depth}: {url_to_crawl} from domain {domain}")
 
                 fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
                 crawled_timestamp = int(time.time())
@@ -213,10 +212,8 @@ class CrawlerOrchestrator:
                         
                         if parse_data.extracted_links:
                             logger.debug(f"Worker-{worker_id}: Found {len(parse_data.extracted_links)} links on {fetch_result.final_url}")
-                            links_added_this_page = 0
-                            for link in parse_data.extracted_links:
-                                if await self.frontier.add_url(link):
-                                    links_added_this_page +=1
+                            # Batch add URLs to the frontier
+                            links_added_this_page = await self.frontier.add_urls_batch(list(parse_data.extracted_links), depth=depth + 1)
                             if links_added_this_page > 0:
                                 self.total_urls_added_to_frontier += links_added_this_page
                                 logger.info(f"Worker-{worker_id}: Added {links_added_this_page} new URLs to frontier from {fetch_result.final_url}. Total added: {self.total_urls_added_to_frontier}")
@@ -300,7 +297,8 @@ class CrawlerOrchestrator:
                 if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                     await self._log_metrics()
 
-                current_frontier_size = await self.frontier.count_frontier()
+                # Use the fast, estimated count for logging
+                estimated_frontier_size = await self.frontier.count_frontier()
                 active_workers = sum(1 for task in self.worker_tasks if not task.done())
                 
                 # Resource monitoring
@@ -324,7 +322,7 @@ class CrawlerOrchestrator:
 
                 status_parts = [
                     f"Crawled={self.pages_crawled_count}",
-                    f"Frontier={current_frontier_size}",
+                    f"Frontier={estimated_frontier_size}",
                     f"AddedToFrontier={self.total_urls_added_to_frontier}",
                     f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
                     f"DBPool({self.config.db_type})={pool_info}",
@@ -335,15 +333,15 @@ class CrawlerOrchestrator:
                 logger.info(f"Status: {', '.join(status_parts)}")
                 
                 # If frontier is empty and workers might be idle, it could be a natural end
-                # This condition needs to be careful not to prematurely shut down if workers are just between tasks.
-                # A more robust check would involve seeing if workers are truly blocked on an empty frontier for a while.
-                if current_frontier_size == 0 and self.pages_crawled_count > 0: # Check if any crawling happened
+                # Use the accurate is_empty() check for shutdown logic
+                if await self.frontier.is_empty() and self.pages_crawled_count > 0: # Check if any crawling happened
                     # Wait a bit to see if workers add more URLs or finish
                     logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring workers...")
                     await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2) # Wait longer than worker sleep
-                    current_frontier_size = await self.frontier.count_frontier()
-                    if current_frontier_size == 0 and not any(not task.done() for task in self.worker_tasks):
-                        logger.info("Frontier empty and all workers appear done. Signaling shutdown.")
+                    
+                    # Final, accurate check before shutdown
+                    if await self.frontier.is_empty():
+                        logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
                         self._shutdown_event.set()
                         break
 
