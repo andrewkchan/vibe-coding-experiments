@@ -131,6 +131,10 @@ class FrontierManager:
         # 2. Politeness filtering
         allowed_urls = []
         for url in candidates:
+            # This is a performance optimization. By checking here, we avoid inserting
+            # known-disallowed URLs into the frontier table. It also populates the
+            # in-memory seen_urls set for disallowed links, preventing us from
+            # re-checking them every time they are discovered.
             if await self.politeness.is_url_allowed(url):
                 allowed_urls.append(url)
             else:
@@ -262,7 +266,11 @@ class FrontierManager:
             
             # Process claimed URLs with politeness checks
             for i, (url_id, url, domain, depth) in enumerate(claimed_urls):
-                # Check if URL is allowed by robots.txt and manual exclusions
+                # This is a correctness check. It ensures that any URL pulled from the
+                # frontier, which may have been added hours or days ago, is re-validated
+                # against the LATEST politeness rules before we fetch it. This is
+                # crucial for long-running crawls or crawls that are paused and resumed
+                # after rule changes (e.g., an updated robots.txt or exclusion list).
                 if not await self.politeness.is_url_allowed(url):
                     logger.debug(f"URL {url} (ID: {url_id}) disallowed by politeness rules. Removing.")
                     await self._delete_url(url_id)
