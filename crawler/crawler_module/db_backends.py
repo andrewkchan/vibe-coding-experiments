@@ -395,13 +395,11 @@ class PostgreSQLBackend(DatabaseBackend):
         if "?" in query:
             query = query.replace("?", "%s")
         
-
         self._current_query_name = query_name
 
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
-                for params in params_list:
-                    await cur.execute(query, params)
+                await cur.executemany(query, params_list)
     
     async def fetch_one(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> Optional[Tuple]:
         """Execute a query and return a single row."""
