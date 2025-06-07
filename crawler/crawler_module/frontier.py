@@ -23,12 +23,12 @@ class FrontierManager:
         seen = set()
         try:
             # Load from visited_urls
-            rows = await self.storage.db.fetch_all("SELECT url FROM visited_urls")
+            rows = await self.storage.db.fetch_all("SELECT url FROM visited_urls", query_name="populate_seen_from_visited")
             for row in rows:
                 seen.add(row[0])
             
             # Load from current frontier (in case of resume)
-            rows = await self.storage.db.fetch_all("SELECT url FROM frontier")
+            rows = await self.storage.db.fetch_all("SELECT url FROM frontier", query_name="populate_seen_from_frontier")
             for row in rows:
                 seen.add(row[0])
             
@@ -58,11 +58,11 @@ class FrontierManager:
         """Marks a domain as seeded in the domain_metadata table."""
         try:
             if self.storage.config.db_type == "postgresql":
-                await self.storage.db.execute("INSERT INTO domain_metadata (domain) VALUES (%s) ON CONFLICT DO NOTHING", (domain,))
-                await self.storage.db.execute("UPDATE domain_metadata SET is_seeded = 1 WHERE domain = %s", (domain,))
+                await self.storage.db.execute("INSERT INTO domain_metadata (domain) VALUES (%s) ON CONFLICT DO NOTHING", (domain,), query_name="mark_seeded_insert_pg")
+                await self.storage.db.execute("UPDATE domain_metadata SET is_seeded = 1 WHERE domain = %s", (domain,), query_name="mark_seeded_update_pg")
             else:  # SQLite
-                await self.storage.db.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
-                await self.storage.db.execute("UPDATE domain_metadata SET is_seeded = 1 WHERE domain = ?", (domain,))
+                await self.storage.db.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,), query_name="mark_seeded_insert_sqlite")
+                await self.storage.db.execute("UPDATE domain_metadata SET is_seeded = 1 WHERE domain = ?", (domain,), query_name="mark_seeded_update_sqlite")
             logger.debug(f"Marked domain {domain} as seeded in DB.")
         except Exception as e:
             logger.error(f"DB error marking domain {domain} as seeded: {e}")
@@ -110,7 +110,7 @@ class FrontierManager:
     async def _clear_frontier_db(self):
         """Clears the frontier table."""
         try:
-            await self.storage.db.execute("DELETE FROM frontier")
+            await self.storage.db.execute("DELETE FROM frontier", query_name="clear_frontier")
             logger.info("Cleared frontier table in database.")
             self.seen_urls.clear()
         except Exception as e:
@@ -139,7 +139,8 @@ class FrontierManager:
         # Check if already visited
         row = await self.storage.db.fetch_one(
             "SELECT 1 FROM visited_urls WHERE url_sha256 = ?", 
-            (self.storage.get_url_sha256(normalized_url),)
+            (self.storage.get_url_sha256(normalized_url),),
+            query_name="add_url_check_visited"
         )
         if row:
             self.seen_urls.add(normalized_url)
@@ -149,7 +150,8 @@ class FrontierManager:
         try:
             await self.storage.db.execute(
                 "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (normalized_url, domain, depth, int(time.time()), 0, None)
+                (normalized_url, domain, depth, int(time.time()), 0, None),
+                query_name="add_url_insert_frontier"
             )
             self.seen_urls.add(normalized_url)
             return True
@@ -162,7 +164,7 @@ class FrontierManager:
     async def count_frontier(self) -> int:
         """Counts the number of URLs currently in the frontier table."""
         try:
-            row = await self.storage.db.fetch_one("SELECT COUNT(*) FROM frontier")
+            row = await self.storage.db.fetch_one("SELECT COUNT(*) FROM frontier", query_name="count_frontier")
             return row[0] if row else 0
         except Exception as e:
             logger.error(f"Error counting frontier: {e}")
