@@ -154,7 +154,7 @@ class CrawlerOrchestrator:
         logger.info(f"Worker-{worker_id}: Starting.")
         
         # Add small random delay to spread out initial DB access
-        startup_delay = (worker_id % 20) * 0.5  # 0-10 second delay based on worker ID
+        startup_delay = (worker_id % 20) * 0.25  # 0-5 second delay based on worker ID
         await asyncio.sleep(startup_delay)
         
         try:
@@ -277,7 +277,7 @@ class CrawlerOrchestrator:
             
             # Stagger worker startup to avoid thundering herd on DB pool
             workers_per_batch = 20  # Start 20 workers at a time
-            startup_delay = 10  # Delay between batches in seconds
+            startup_delay = 5  # Delay between batches in seconds
             
             for i in range(self.config.max_workers):
                 task = asyncio.create_task(self._worker(i + 1))
