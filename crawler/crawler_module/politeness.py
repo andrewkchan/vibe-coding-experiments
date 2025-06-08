@@ -164,6 +164,10 @@ class PolitenessEnforcer:
             else:
                 logger.debug(f"Failed to fetch robots.txt for {domain} via HTTPS. Assuming allow all.")
                 robots_content = "" # Treat as empty, meaning allow all
+        if '\0' in robots_content:
+            # The robots.txt is malformed, and Postgres will reject it.
+            # Treat as empty, meaning allow all.
+            robots_content = ""
 
         # Cache the newly fetched content
         await self._update_robots_cache(domain, robots_content, fetched_timestamp, expires_timestamp)
