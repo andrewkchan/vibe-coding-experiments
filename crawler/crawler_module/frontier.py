@@ -311,52 +311,66 @@ class FrontierManager:
         """Atomically claims a batch of URLs from the frontier."""
         try:
             claim_timestamp = int(time.time() * 1000) # Current time in milliseconds
+            current_time_seconds = int(time.time())
 
             if self.storage.config.db_type == "postgresql":
                 # Calculate the threshold for considering a claim expired
                 expired_claim_timestamp_threshold = claim_timestamp - (claim_expiry_seconds * 1000)
+                # Calculate when a domain is ready (70 seconds have passed since last fetch)
+                domain_ready_threshold = current_time_seconds - 70
 
-                # Try to claim unclaimed URLs first (most common case)
+                # Domain-aware claiming: only claim URLs from domains that are ready
                 sql_query = '''
                 UPDATE frontier
                 SET claimed_at = %s
                 WHERE id = (
-                    SELECT id
-                    FROM frontier
-                    WHERE claimed_at IS NULL
-                    ORDER BY added_timestamp ASC
+                    SELECT f.id
+                    FROM frontier f
+                    LEFT JOIN domain_metadata dm ON f.domain = dm.domain
+                    WHERE f.claimed_at IS NULL
+                    AND (
+                        dm.last_scheduled_fetch_timestamp IS NULL 
+                        OR dm.last_scheduled_fetch_timestamp <= %s
+                    )
+                    ORDER BY f.added_timestamp ASC
                     LIMIT 1
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF f SKIP LOCKED
                 )
                 RETURNING id, url, domain, depth;
                 '''
                 
                 claimed_urls = await self.storage.db.execute_returning(
                     sql_query,
-                    (claim_timestamp,),
-                    query_name="atomic_claim_urls_pg_unclaimed"
+                    (claim_timestamp, domain_ready_threshold),
+                    query_name="atomic_claim_urls_pg_domain_aware"
                 )
                 
-                # If no unclaimed URLs found, try expired ones
+                # If no unclaimed URLs found, try expired ones (also domain-aware)
                 if not claimed_urls:
                     sql_query = '''
                     UPDATE frontier
                     SET claimed_at = %s
                     WHERE id = (
-                        SELECT id
-                        FROM frontier
-                        WHERE claimed_at IS NOT NULL AND claimed_at < %s
-                        ORDER BY added_timestamp ASC
+                        SELECT f.id
+                        FROM frontier f
+                        LEFT JOIN domain_metadata dm ON f.domain = dm.domain
+                        WHERE f.claimed_at IS NOT NULL 
+                        AND f.claimed_at < %s
+                        AND (
+                            dm.last_scheduled_fetch_timestamp IS NULL 
+                            OR dm.last_scheduled_fetch_timestamp <= %s
+                        )
+                        ORDER BY f.added_timestamp ASC
                         LIMIT 1
-                        FOR UPDATE SKIP LOCKED
+                        FOR UPDATE OF f SKIP LOCKED
                     )
                     RETURNING id, url, domain, depth;
                     '''
                     
                     claimed_urls = await self.storage.db.execute_returning(
                         sql_query,
-                        (claim_timestamp, expired_claim_timestamp_threshold),
-                        query_name="atomic_claim_urls_pg_expired"
+                        (claim_timestamp, expired_claim_timestamp_threshold, domain_ready_threshold),
+                        query_name="atomic_claim_urls_pg_expired_domain_aware"
                     )
             else:
                 # SQLite doesn't support FOR UPDATE SKIP LOCKED or complex CTEs as well.
