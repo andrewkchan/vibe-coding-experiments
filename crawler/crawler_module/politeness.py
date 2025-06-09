@@ -167,6 +167,8 @@ class PolitenessEnforcer:
         if '\0' in robots_content:
             # The robots.txt is malformed, and Postgres will reject it.
             # Treat as empty, meaning allow all.
+            # TODO: Handle this by storing byte field in DB instead.
+            logger.debug(f"robots.txt for {domain} contains null byte. Assuming allow all.")
             robots_content = ""
 
         # Cache the newly fetched content
