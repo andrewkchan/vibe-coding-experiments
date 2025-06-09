@@ -281,6 +281,7 @@ class FrontierManager:
                     continue
                 
                 # Check if we can fetch from this domain now
+                logger.debug(f"{worker_name} checking if URL ID {url_id} from domain {domain} is ready for fetch")
                 if await self.politeness.can_fetch_domain_now(domain):
                     await self.politeness.record_domain_fetch_attempt(domain)
                     logger.debug(f"{worker_name} processing URL ID {url_id} ({url}) from domain {domain}")
@@ -293,7 +294,7 @@ class FrontierManager:
                 else:
                     # Domain not ready - unclaim this URL so another worker can try later
                     await self._unclaim_url(url_id)
-                    logger.debug(f"Domain {domain} not ready for fetch, unclaimed URL ID {url_id}")
+                    logger.debug(f"Domain {domain} not ready for fetch, {worker_name} unclaimed URL ID {url_id}")
             
             # Unclaim any remaining URLs if we found one to process
             for url_id, url, domain, depth in urls_to_unclaim:

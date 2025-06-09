@@ -68,7 +68,7 @@ class CrawlerOrchestrator:
                 # Estimate reasonable pool size based on workers
                 # Not all workers need a connection simultaneously
                 # Workers spend time fetching URLs, parsing, etc.
-                concurrent_db_fraction = 0.3  # Assume ~30% of workers need DB at once
+                concurrent_db_fraction = 0.7  # Assume ~70% of workers need DB at once
                 
                 min_pool = min(10, config.max_workers)
                 # Calculate max based on expected concurrent needs
