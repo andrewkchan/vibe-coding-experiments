@@ -316,47 +316,48 @@ class FrontierManager:
                 # Calculate the threshold for considering a claim expired
                 expired_claim_timestamp_threshold = claim_timestamp - (claim_expiry_seconds * 1000)
 
+                # Try to claim unclaimed URLs first (most common case)
                 sql_query = '''
-                WITH unexpired_candidates AS (
-                    SELECT id, url, domain, added_timestamp, depth
+                UPDATE frontier
+                SET claimed_at = %s
+                WHERE id = (
+                    SELECT id
                     FROM frontier
                     WHERE claimed_at IS NULL
                     ORDER BY added_timestamp ASC
-                    LIMIT %s
-                ),
-                expired_candidates AS (
-                    SELECT id, url, domain, added_timestamp, depth
-                    FROM frontier
-                    WHERE claimed_at IS NOT NULL AND claimed_at < %s
-                    ORDER BY added_timestamp ASC
-                    LIMIT %s
-                ),
-                all_candidates AS (
-                    SELECT id, url, domain, added_timestamp, depth FROM unexpired_candidates
-                    UNION ALL
-                    SELECT id, url, domain, added_timestamp, depth FROM expired_candidates
-                ),
-                ordered_limited_candidates AS (
-                    SELECT id, url, domain, depth
-                    FROM all_candidates
-                    ORDER BY added_timestamp ASC
-                    LIMIT %s
-                ),
-                to_claim AS (
-                    SELECT id, url, domain, depth FROM ordered_limited_candidates
+                    LIMIT 1
                     FOR UPDATE SKIP LOCKED
                 )
-                UPDATE frontier
-                SET claimed_at = %s
-                FROM to_claim
-                WHERE frontier.id = to_claim.id
-                RETURNING frontier.id, frontier.url, frontier.domain, frontier.depth;
+                RETURNING id, url, domain, depth;
                 '''
+                
                 claimed_urls = await self.storage.db.execute_returning(
                     sql_query,
-                    (batch_size, expired_claim_timestamp_threshold, batch_size, batch_size, claim_timestamp),
-                    query_name="atomic_claim_urls_pg_implicit_expiry"
+                    (claim_timestamp,),
+                    query_name="atomic_claim_urls_pg_unclaimed"
                 )
+                
+                # If no unclaimed URLs found, try expired ones
+                if not claimed_urls:
+                    sql_query = '''
+                    UPDATE frontier
+                    SET claimed_at = %s
+                    WHERE id = (
+                        SELECT id
+                        FROM frontier
+                        WHERE claimed_at IS NOT NULL AND claimed_at < %s
+                        ORDER BY added_timestamp ASC
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, url, domain, depth;
+                    '''
+                    
+                    claimed_urls = await self.storage.db.execute_returning(
+                        sql_query,
+                        (claim_timestamp, expired_claim_timestamp_threshold),
+                        query_name="atomic_claim_urls_pg_expired"
+                    )
             else:
                 # SQLite doesn't support FOR UPDATE SKIP LOCKED or complex CTEs as well.
                 # Keep the old explicit release and simpler claim for SQLite.
