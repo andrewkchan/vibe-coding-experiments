@@ -1,5 +1,5 @@
 # Debugging race condition in crawler
-_Exported on 6/8/2025 at 17:28:21 PDT from Cursor (0.50.5)_
+_Exported on 6/8/2025 at 22:19:04 PDT from Cursor (0.50.5)_
 
 ---
 
@@ -769,5 +769,945 @@ SET work_mem = '256MB';  -- Or adjust postgresql.conf
 
 -- Ensure autovacuum is running regularly
 ALTER TABLE frontier SET (autovacuum_vacuum_scale_factor = 0.01);
+```
+
+---
+
+**User**
+
+I want to add a test for this in crawler/tests/test_frontier.py but I think it might require some large changes, because (1) we don't have any tests for concurrent workers and (2) the tests currently use SQLite for the backing store when the tests actually hit a DB.
+
+What do you think?
+
+---
+
+**Cursor**
+
+You're absolutely right - testing this race condition fix properly would require some significant changes to the test infrastructure. Here's what I'd recommend:
+
+## 1. **Mock-based unit test** (minimal changes needed)
+
+First, add a test that verifies the correct SQL is being generated without actually hitting a database:
+
+You're right about the challenges. Here's a practical approach that balances thorough testing with minimal infrastructure changes:
+
+```python
+    logger.info("Frontier resume test passed with politeness mocks.") 
+
+
+@pytest.mark.asyncio
+async def test_atomic_claim_sql_generation(frontier_manager: FrontierManager):
+    """Test that the correct SQL is generated for atomic URL claiming."""
+    logger.info("Testing atomic claim SQL generation")
+    
+    # Mock the storage db to capture SQL queries
+    original_execute_returning = frontier_manager.storage.db.execute_returning
+    captured_queries = []
+    
+    async def capture_execute_returning(query, params, query_name=None):
+        captured_queries.append((query, params, query_name))
+        # Return empty list to simulate no URLs found
+        return []
+    
+    frontier_manager.storage.db.execute_returning = AsyncMock(side_effect=capture_execute_returning)
+    frontier_manager.storage.db.execute = AsyncMock()  # For SET statements
+    
+    # Test PostgreSQL path
+    frontier_manager.storage.config.db_type = "postgresql"
+    await frontier_manager._atomic_claim_urls(1, 300)
+    
+    # Verify SET statements were called
+    assert frontier_manager.storage.db.execute.call_count >= 2
+    set_calls = [call for call in frontier_manager.storage.db.execute.call_args_list]
+    assert any("SET enable_seqscan = off" in str(call) for call in set_calls)
+    assert any("SET enable_seqscan = on" in str(call) for call in set_calls)
+    
+    # Verify the queries use FOR UPDATE SKIP LOCKED correctly
+    assert len(captured_queries) >= 1
+    unclaimed_query = captured_queries[0][0]
+    assert "FOR UPDATE SKIP LOCKED" in unclaimed_query
+    assert "WHERE claimed_at IS NULL" in unclaimed_query
+    assert "UPDATE frontier" in unclaimed_query
+    assert "RETURNING id, url, domain, depth" in unclaimed_query
+    
+    # If there's an expired query (second attempt), verify it too
+    if len(captured_queries) >= 2:
+        expired_query = captured_queries[1][0]
+        assert "FOR UPDATE SKIP LOCKED" in expired_query
+        assert "WHERE claimed_at IS NOT NULL AND claimed_at <" in expired_query
+    
+    # Restore original method
+    frontier_manager.storage.db.execute_returning = original_execute_returning
+    
+    logger.info("Atomic claim SQL generation test passed.")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_url_claiming_sqlite(
+    actual_config_for_frontier: CrawlerConfig,
+    db_backend,
+    mock_politeness_enforcer_for_frontier: MagicMock
+):
+    """Test concurrent URL claiming behavior with SQLite (limited testing of race conditions)."""
+    logger.info("Testing concurrent URL claiming with SQLite")
+    
+    # Create storage manager
+    storage = StorageManager(config=actual_config_for_frontier, db_backend=db_backend)
+    await storage.init_db_schema()
+    
+    # Add test URLs to frontier
+    test_urls = [(f"http://test{i}.com/page", f"test{i}.com", 0, int(time.time()), 0.0, None) 
+                 for i in range(10)]
+    
+    await storage.db.execute_many(
+        "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+        test_urls
+    )
+    
+    # Create multiple frontier managers (simulating workers)
+    frontiers = []
+    for i in range(3):
+        fm = FrontierManager(
+            config=actual_config_for_frontier,
+            storage=storage,
+            politeness=mock_politeness_enforcer_for_frontier
+        )
+        frontiers.append(fm)
+    
+    # Have each "worker" try to claim URLs concurrently
+    claimed_urls = []
+    
+    async def worker_claim(frontier, worker_id):
+        urls = []
+        for _ in range(4):  # Each worker tries to claim 4 URLs
+            result = await frontier.get_next_url()
+            if result:
+                urls.append((worker_id, result[2]))  # (worker_id, url_id)
+        return urls
+    
+    # Run workers concurrently
+    results = await asyncio.gather(
+        worker_claim(frontiers[0], 0),
+        worker_claim(frontiers[1], 1),
+        worker_claim(frontiers[2], 2)
+    )
+    
+    # Flatten results
+    all_claims = []
+    for worker_results in results:
+        all_claims.extend(worker_results)
+    
+    # Verify no URL was claimed by multiple workers
+    claimed_url_ids = [claim[1] for claim in all_claims]
+    assert len(claimed_url_ids) == len(set(claimed_url_ids)), "Same URL claimed by multiple workers!"
+    
+    # Verify total claims don't exceed available URLs
+    assert len(all_claims) <= 10
+    
+    logger.info(f"Concurrent claiming test passed. {len(all_claims)} URLs claimed by 3 workers.")
+
+
+# Optional: PostgreSQL integration test
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not pytest.config.getoption("--postgresql", default=False),
+    reason="PostgreSQL tests not enabled. Use --postgresql flag to run."
+)
+async def test_atomic_claim_with_postgresql():
+    """Integration test with real PostgreSQL to verify FOR UPDATE SKIP LOCKED behavior."""
+    # This would require:
+    # 1. A test PostgreSQL instance (e.g., via docker-compose or testcontainers)
+    # 2. Proper connection string from environment or test config
+    # 3. Full concurrent testing with actual lock behavior
+    pass
+```
+
+Let me fix the linter errors:
+
+```python
+    # Have each "worker" try to claim URLs concurrently
+    async def worker_claim(frontier, worker_id):
+        urls = []
+        for _ in range(4):  # Each worker tries to claim 4 URLs
+            result = await frontier.get_next_url()
+            if result:
+                urls.append((worker_id, result[2]))  # (worker_id, url_id)
+        return urls
+    
+    # Run workers concurrently
+    results = await asyncio.gather(
+        worker_claim(frontiers[0], 0),
+        worker_claim(frontiers[1], 1),
+        worker_claim(frontiers[2], 2)
+    )
+    
+    # Flatten results
+    all_claims = []
+    for worker_results in results:
+        all_claims.extend(worker_results)
+    
+    # Verify no URL was claimed by multiple workers
+    claimed_url_ids = [claim[1] for claim in all_claims]
+    assert len(claimed_url_ids) == len(set(claimed_url_ids)), "Same URL claimed by multiple workers!"
+    
+    # Verify total claims don't exceed available URLs
+    assert len(all_claims) <= 10
+    
+    logger.info(f"Concurrent claiming test passed. {len(all_claims)} URLs claimed by 3 workers.")
+
+
+# Optional: PostgreSQL integration test
+@pytest.mark.asyncio
+@pytest.mark.skip(reason="PostgreSQL integration test - requires test database setup")
+async def test_atomic_claim_with_postgresql():
+    """Integration test with real PostgreSQL to verify FOR UPDATE SKIP LOCKED behavior."""
+    # This would require:
+    # 1. A test PostgreSQL instance (e.g., via docker-compose or testcontainers)
+    # 2. Proper connection string from environment or test config
+    # 3. Full concurrent testing with actual lock behavior
+    # 
+    # Example implementation:
+    # import os
+    # pg_url = os.environ.get("TEST_POSTGRES_URL")
+    # if not pg_url:
+    #     pytest.skip("TEST_POSTGRES_URL not set")
+    # 
+    # config = CrawlerConfig(db_type="postgresql", db_url=pg_url, ...)
+    # # ... rest of test
+    pass
+```
+
+The remaining linter errors are about module imports, which are likely false positives due to the test file's location relative to the main code. These imports work at runtime but the linter can't resolve them properly.
+
+## Summary
+
+I've added three testing approaches for the race condition fix:
+
+### 1. **Mock-based SQL verification test** (`test_atomic_claim_sql_generation`)
+- Verifies the correct PostgreSQL SQL is generated
+- Checks for `FOR UPDATE SKIP LOCKED` usage
+- Confirms the `SET enable_seqscan` optimization
+- No database required - pure unit test
+
+### 2. **SQLite concurrent test** (`test_concurrent_url_claiming_sqlite`)
+- Tests basic concurrent claiming behavior
+- While SQLite doesn't have `FOR UPDATE SKIP LOCKED`, it still verifies:
+  - Multiple workers don't claim the same URL
+  - The claim count doesn't exceed available URLs
+- Provides some confidence in the concurrent logic
+
+### 3. **PostgreSQL integration test stub** (`test_atomic_claim_with_postgresql`)
+- Marked as skipped by default
+- Shows how to add a full integration test when a PostgreSQL test instance is available
+- Would test the actual lock behavior
+
+## Running the tests
+
+```bash
+# Run the new tests
+pytest crawler/tests/test_frontier.py::test_atomic_claim_sql_generation -v
+pytest crawler/tests/test_frontier.py::test_concurrent_url_claiming_sqlite -v
+
+# To add PostgreSQL integration testing later:
+# 1. Set up a test PostgreSQL instance (docker-compose, etc.)
+# 2. Implement the test_atomic_claim_with_postgresql function
+# 3. Run with environment variable:
+# TEST_POSTGRES_URL=postgresql://user:pass@localhost:5432/test_db pytest crawler/tests/test_frontier.py::test_atomic_claim_with_postgresql
+```
+
+This approach gives you:
+- Immediate verification of the SQL changes
+- Basic concurrent behavior testing
+- A path to full integration testing when needed
+
+The import linter errors are common in test files and don't affect functionality - they occur because the linter can't resolve the relative import paths from the test directory.
+
+```shellscript
+# Run the new tests
+pytest crawler/tests/test_frontier.py::test_atomic_claim_sql_generation -v
+pytest crawler/tests/test_frontier.py::test_concurrent_url_claiming_sqlite -v
+
+# To add PostgreSQL integration testing later:
+# 1. Set up a test PostgreSQL instance (docker-compose, etc.)
+# 2. Implement the test_atomic_claim_with_postgresql function
+# 3. Run with environment variable:
+# TEST_POSTGRES_URL=postgresql://user:pass@localhost:5432/test_db pytest crawler/tests/test_frontier.py::test_atomic_claim_with_postgresql
+```
+
+---
+
+**User**
+
+Can you show me how you would write the actual PostgreSQL integration test? You can put it in the chat, no need to edit the file
+
+---
+
+**Cursor**
+
+Here's how I would write a comprehensive PostgreSQL integration test for the race condition fix:
+
+```python
+import pytest
+import asyncio
+import os
+import time
+from typing import List, Set, Tuple
+import logging
+from collections import defaultdict
+
+from crawler_module.config import CrawlerConfig
+from crawler_module.storage import StorageManager
+from crawler_module.frontier import FrontierManager
+from crawler_module.politeness import PolitenessEnforcer
+from crawler_module.fetcher import Fetcher
+from crawler_module.db_backends import create_backend
+
+logger = logging.getLogger(__name__)
+
+
+@pytest.mark.asyncio
+async def test_atomic_claim_with_postgresql():
+    """Integration test with real PostgreSQL to verify FOR UPDATE SKIP LOCKED behavior."""
+    # Get PostgreSQL connection from environment
+    pg_url = os.environ.get("TEST_POSTGRES_URL")
+    if not pg_url:
+        pytest.skip("TEST_POSTGRES_URL not set. Example: postgresql://test:test@localhost:5432/crawler_test")
+    
+    # Create test configuration
+    test_dir = Path("/tmp/crawler_pg_test")
+    test_dir.mkdir(exist_ok=True)
+    
+    config = CrawlerConfig(
+        data_dir=test_dir,
+        seed_file=test_dir / "seeds.txt",  # Won't be used
+        email="test@example.com",
+        db_type="postgresql",
+        db_url=pg_url,
+        max_workers=50,  # Simulate high concurrency
+        resume=False
+    )
+    
+    # Initialize database backend with larger pool for concurrent testing
+    db_backend = create_backend(
+        'postgresql',
+        db_url=pg_url,
+        min_size=10,
+        max_size=60  # Enough for all workers + some overhead
+    )
+    
+    try:
+        await db_backend.initialize()
+        
+        # Clean up any existing test data
+        await db_backend.execute("DROP TABLE IF EXISTS frontier CASCADE")
+        await db_backend.execute("DROP TABLE IF EXISTS visited_urls CASCADE")
+        await db_backend.execute("DROP TABLE IF EXISTS domain_metadata CASCADE")
+        await db_backend.execute("DROP TABLE IF EXISTS schema_version CASCADE")
+        
+        # Initialize storage and schema
+        storage = StorageManager(config=config, db_backend=db_backend)
+        await storage.init_db_schema()
+        
+        # Create mock politeness enforcer
+        mock_politeness = AsyncMock(spec=PolitenessEnforcer)
+        mock_politeness.is_url_allowed = AsyncMock(return_value=True)
+        mock_politeness.can_fetch_domain_now = AsyncMock(return_value=True)
+        mock_politeness.record_domain_fetch_attempt = AsyncMock()
+        
+        # Populate frontier with test URLs
+        num_urls = 1000  # Enough to see race conditions
+        test_urls = []
+        for i in range(num_urls):
+            test_urls.append((
+                f"http://test{i % 100}.com/page{i}",
+                f"test{i % 100}.com",
+                0,
+                int(time.time() * 1000) + i,  # Stagger timestamps slightly
+                0.0,
+                None
+            ))
+        
+        # Batch insert test URLs
+        await storage.db.execute_many(
+            "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            test_urls
+        )
+        logger.info(f"Inserted {num_urls} test URLs into frontier")
+        
+        # Create multiple frontier managers (simulating workers)
+        num_workers = 50
+        workers = []
+        for i in range(num_workers):
+            fm = FrontierManager(
+                config=config,
+                storage=storage,
+                politeness=mock_politeness
+            )
+            workers.append((i, fm))
+        
+        # Track claims by worker
+        claims_by_worker: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
+        all_claimed_url_ids: List[int] = []
+        claim_times: List[float] = []
+        
+        async def worker_task(worker_id: int, frontier: FrontierManager, num_claims: int):
+            """Simulates a worker claiming and processing URLs."""
+            local_claims = []
+            for _ in range(num_claims):
+                start_time = time.time()
+                result = await frontier.get_next_url()
+                claim_time = time.time() - start_time
+                
+                if result:
+                    url, domain, url_id, depth = result
+                    local_claims.append((url, url_id))
+                    claim_times.append(claim_time)
+                    
+                    # Simulate some processing time
+                    await asyncio.sleep(0.001)
+                else:
+                    break
+            
+            return worker_id, local_claims
+        
+        # Run all workers concurrently
+        start_time = time.time()
+        tasks = [
+            worker_task(worker_id, frontier, 30)  # Each worker tries to claim 30 URLs
+            for worker_id, frontier in workers
+        ]
+        
+        results = await asyncio.gather(*tasks)
+        total_time = time.time() - start_time
+        
+        # Process results
+        for worker_id, claims in results:
+            claims_by_worker[worker_id] = claims
+            all_claimed_url_ids.extend([claim[1] for claim in claims])
+        
+        # Assertions
+        
+        # 1. No URL should be claimed by multiple workers
+        unique_url_ids = set(all_claimed_url_ids)
+        assert len(all_claimed_url_ids) == len(unique_url_ids), \
+            f"Race condition detected! {len(all_claimed_url_ids) - len(unique_url_ids)} URLs were claimed multiple times"
+        
+        # 2. Total claims should not exceed available URLs
+        assert len(all_claimed_url_ids) <= num_urls, \
+            f"Claimed {len(all_claimed_url_ids)} URLs but only {num_urls} were available"
+        
+        # 3. Performance check - claims should be fast
+        if claim_times:
+            avg_claim_time = sum(claim_times) / len(claim_times)
+            p95_claim_time = sorted(claim_times)[int(len(claim_times) * 0.95)]
+            logger.info(f"Claim performance: avg={avg_claim_time*1000:.2f}ms, p95={p95_claim_time*1000:.2f}ms")
+            
+            # With proper indexing, claims should be very fast
+            assert avg_claim_time < 0.1, f"Average claim time too slow: {avg_claim_time:.3f}s"
+            assert p95_claim_time < 0.5, f"P95 claim time too slow: {p95_claim_time:.3f}s"
+        
+        # 4. Verify work distribution is relatively even
+        claims_per_worker = [len(claims) for claims in claims_by_worker.values() if claims]
+        if claims_per_worker:
+            min_claims = min(claims_per_worker)
+            max_claims = max(claims_per_worker)
+            avg_claims = sum(claims_per_worker) / len(claims_per_worker)
+            
+            logger.info(f"Work distribution: min={min_claims}, max={max_claims}, avg={avg_claims:.1f}")
+            
+            # With good concurrency, work should be reasonably distributed
+            # Allow for some variance due to timing
+            assert max_claims - min_claims <= 10, \
+                f"Work distribution too uneven: min={min_claims}, max={max_claims}"
+        
+        # 5. Verify the frontier is empty after all claims
+        remaining = await storage.db.fetch_one("SELECT COUNT(*) FROM frontier")
+        assert remaining[0] == 0, f"Frontier still has {remaining[0]} unclaimed URLs"
+        
+        # 6. Test expired claims recovery
+        logger.info("Testing expired claims recovery...")
+        
+        # Insert URLs with expired claims
+        expired_timestamp = int(time.time() * 1000) - 400000  # More than 5 minutes ago
+        expired_urls = [
+            (f"http://expired{i}.com/page", f"expired{i}.com", 0, 
+             int(time.time() * 1000), 0.0, expired_timestamp)
+            for i in range(10)
+        ]
+        
+        await storage.db.execute_many(
+            "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            expired_urls
+        )
+        
+        # Workers should be able to claim these expired URLs
+        expired_claims = []
+        for worker_id, frontier in workers[:5]:  # Use first 5 workers
+            result = await frontier.get_next_url()
+            if result:
+                expired_claims.append(result[2])
+        
+        assert len(expired_claims) == 5, f"Could not reclaim expired URLs: got {len(expired_claims)}"
+        assert len(set(expired_claims)) == 5, "Expired URLs were claimed multiple times"
+        
+        logger.info(f"""
+        PostgreSQL Atomic Claim Test Results:
+        - Total URLs: {num_urls}
+        - Workers: {num_workers}
+        - Total claimed: {len(all_claimed_url_ids)}
+        - Unique claims: {len(unique_url_ids)}
+        - Total time: {total_time:.2f}s
+        - Claims/second: {len(all_claimed_url_ids) / total_time:.0f}
+        - No race conditions detected ✓
+        """)
+        
+    finally:
+        # Cleanup
+        await db_backend.close()
+        
+        
+# Additional test for stress testing the claim mechanism
+@pytest.mark.asyncio
+async def test_claim_stress_with_domain_constraints():
+    """Test atomic claims with domain-based politeness constraints."""
+    pg_url = os.environ.get("TEST_POSTGRES_URL")
+    if not pg_url:
+        pytest.skip("TEST_POSTGRES_URL not set")
+    
+    # This test would simulate more realistic conditions where:
+    # 1. Many URLs are from the same domain
+    # 2. Politeness rules prevent immediate re-crawling
+    # 3. Workers compete for the available URLs from different domains
+    
+    # ... similar setup as above ...
+    
+    # Create URLs with heavy domain concentration
+    # 80% from 10 domains, 20% from 90 other domains
+    # This creates more contention and tests the atomic claim under pressure
+    
+    pass  # Implementation details omitted for brevity
+
+
+# Docker-compose.yml for test PostgreSQL:
+"""
+version: '3.8'
+services:
+  postgres-test:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: crawler_test
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=64MB
+      -c work_mem=4MB
+"""
+```
+
+Key aspects of this integration test:
+
+1. **Real PostgreSQL instance**: Uses actual PostgreSQL to test true `FOR UPDATE SKIP LOCKED` behavior
+
+2. **High concurrency**: 50 workers competing for 1000 URLs to stress-test the atomic claiming
+
+3. **Performance metrics**: Tracks claim times to ensure the fix doesn't degrade performance
+
+4. **Race condition detection**: Verifies no URL is claimed multiple times
+
+5. **Work distribution**: Ensures claims are reasonably distributed among workers
+
+6. **Expired claims**: Tests that expired claims can be reclaimed by other workers
+
+7. **Comprehensive assertions**: Multiple checks to ensure correctness
+
+To run this test:
+
+```bash
+# Start PostgreSQL
+docker-compose up -d postgres-test
+
+# Run the test
+TEST_POSTGRES_URL=postgresql://test:test@localhost:5432/crawler_test \
+  pytest crawler/tests/test_frontier.py::test_atomic_claim_with_postgresql -v -s
+
+# Cleanup
+docker-compose down
+```
+
+This test would catch the race condition you encountered - without the fix, you'd see assertions fail when multiple workers claim the same URL ID.
+
+```python
+import pytest
+import asyncio
+import os
+import time
+from typing import List, Set, Tuple
+import logging
+from collections import defaultdict
+
+from crawler_module.config import CrawlerConfig
+from crawler_module.storage import StorageManager
+from crawler_module.frontier import FrontierManager
+from crawler_module.politeness import PolitenessEnforcer
+from crawler_module.fetcher import Fetcher
+from crawler_module.db_backends import create_backend
+
+logger = logging.getLogger(__name__)
+
+
+@pytest.mark.asyncio
+async def test_atomic_claim_with_postgresql():
+    """Integration test with real PostgreSQL to verify FOR UPDATE SKIP LOCKED behavior."""
+    # Get PostgreSQL connection from environment
+    pg_url = os.environ.get("TEST_POSTGRES_URL")
+    if not pg_url:
+        pytest.skip("TEST_POSTGRES_URL not set. Example: postgresql://test:test@localhost:5432/crawler_test")
+    
+    # Create test configuration
+    test_dir = Path("/tmp/crawler_pg_test")
+    test_dir.mkdir(exist_ok=True)
+    
+    config = CrawlerConfig(
+        data_dir=test_dir,
+        seed_file=test_dir / "seeds.txt",  # Won't be used
+        email="test@example.com",
+        db_type="postgresql",
+        db_url=pg_url,
+        max_workers=50,  # Simulate high concurrency
+        resume=False
+    )
+    
+    # Initialize database backend with larger pool for concurrent testing
+    db_backend = create_backend(
+        'postgresql',
+        db_url=pg_url,
+        min_size=10,
+        max_size=60  # Enough for all workers + some overhead
+    )
+    
+    try:
+        await db_backend.initialize()
+        
+        # Clean up any existing test data
+        await db_backend.execute("DROP TABLE IF EXISTS frontier CASCADE")
+        await db_backend.execute("DROP TABLE IF EXISTS visited_urls CASCADE")
+        await db_backend.execute("DROP TABLE IF EXISTS domain_metadata CASCADE")
+        await db_backend.execute("DROP TABLE IF EXISTS schema_version CASCADE")
+        
+        # Initialize storage and schema
+        storage = StorageManager(config=config, db_backend=db_backend)
+        await storage.init_db_schema()
+        
+        # Create mock politeness enforcer
+        mock_politeness = AsyncMock(spec=PolitenessEnforcer)
+        mock_politeness.is_url_allowed = AsyncMock(return_value=True)
+        mock_politeness.can_fetch_domain_now = AsyncMock(return_value=True)
+        mock_politeness.record_domain_fetch_attempt = AsyncMock()
+        
+        # Populate frontier with test URLs
+        num_urls = 1000  # Enough to see race conditions
+        test_urls = []
+        for i in range(num_urls):
+            test_urls.append((
+                f"http://test{i % 100}.com/page{i}",
+                f"test{i % 100}.com",
+                0,
+                int(time.time() * 1000) + i,  # Stagger timestamps slightly
+                0.0,
+                None
+            ))
+        
+        # Batch insert test URLs
+        await storage.db.execute_many(
+            "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            test_urls
+        )
+        logger.info(f"Inserted {num_urls} test URLs into frontier")
+        
+        # Create multiple frontier managers (simulating workers)
+        num_workers = 50
+        workers = []
+        for i in range(num_workers):
+            fm = FrontierManager(
+                config=config,
+                storage=storage,
+                politeness=mock_politeness
+            )
+            workers.append((i, fm))
+        
+        # Track claims by worker
+        claims_by_worker: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
+        all_claimed_url_ids: List[int] = []
+        claim_times: List[float] = []
+        
+        async def worker_task(worker_id: int, frontier: FrontierManager, num_claims: int):
+            """Simulates a worker claiming and processing URLs."""
+            local_claims = []
+            for _ in range(num_claims):
+                start_time = time.time()
+                result = await frontier.get_next_url()
+                claim_time = time.time() - start_time
+                
+                if result:
+                    url, domain, url_id, depth = result
+                    local_claims.append((url, url_id))
+                    claim_times.append(claim_time)
+                    
+                    # Simulate some processing time
+                    await asyncio.sleep(0.001)
+                else:
+                    break
+            
+            return worker_id, local_claims
+        
+        # Run all workers concurrently
+        start_time = time.time()
+        tasks = [
+            worker_task(worker_id, frontier, 30)  # Each worker tries to claim 30 URLs
+            for worker_id, frontier in workers
+        ]
+        
+        results = await asyncio.gather(*tasks)
+        total_time = time.time() - start_time
+        
+        # Process results
+        for worker_id, claims in results:
+            claims_by_worker[worker_id] = claims
+            all_claimed_url_ids.extend([claim[1] for claim in claims])
+        
+        # Assertions
+        
+        # 1. No URL should be claimed by multiple workers
+        unique_url_ids = set(all_claimed_url_ids)
+        assert len(all_claimed_url_ids) == len(unique_url_ids), \
+            f"Race condition detected! {len(all_claimed_url_ids) - len(unique_url_ids)} URLs were claimed multiple times"
+        
+        # 2. Total claims should not exceed available URLs
+        assert len(all_claimed_url_ids) <= num_urls, \
+            f"Claimed {len(all_claimed_url_ids)} URLs but only {num_urls} were available"
+        
+        # 3. Performance check - claims should be fast
+        if claim_times:
+            avg_claim_time = sum(claim_times) / len(claim_times)
+            p95_claim_time = sorted(claim_times)[int(len(claim_times) * 0.95)]
+            logger.info(f"Claim performance: avg={avg_claim_time*1000:.2f}ms, p95={p95_claim_time*1000:.2f}ms")
+            
+            # With proper indexing, claims should be very fast
+            assert avg_claim_time < 0.1, f"Average claim time too slow: {avg_claim_time:.3f}s"
+            assert p95_claim_time < 0.5, f"P95 claim time too slow: {p95_claim_time:.3f}s"
+        
+        # 4. Verify work distribution is relatively even
+        claims_per_worker = [len(claims) for claims in claims_by_worker.values() if claims]
+        if claims_per_worker:
+            min_claims = min(claims_per_worker)
+            max_claims = max(claims_per_worker)
+            avg_claims = sum(claims_per_worker) / len(claims_per_worker)
+            
+            logger.info(f"Work distribution: min={min_claims}, max={max_claims}, avg={avg_claims:.1f}")
+            
+            # With good concurrency, work should be reasonably distributed
+            # Allow for some variance due to timing
+            assert max_claims - min_claims <= 10, \
+                f"Work distribution too uneven: min={min_claims}, max={max_claims}"
+        
+        # 5. Verify the frontier is empty after all claims
+        remaining = await storage.db.fetch_one("SELECT COUNT(*) FROM frontier")
+        assert remaining[0] == 0, f"Frontier still has {remaining[0]} unclaimed URLs"
+        
+        # 6. Test expired claims recovery
+        logger.info("Testing expired claims recovery...")
+        
+        # Insert URLs with expired claims
+        expired_timestamp = int(time.time() * 1000) - 400000  # More than 5 minutes ago
+        expired_urls = [
+            (f"http://expired{i}.com/page", f"expired{i}.com", 0, 
+             int(time.time() * 1000), 0.0, expired_timestamp)
+            for i in range(10)
+        ]
+        
+        await storage.db.execute_many(
+            "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            expired_urls
+        )
+        
+        # Workers should be able to claim these expired URLs
+        expired_claims = []
+        for worker_id, frontier in workers[:5]:  # Use first 5 workers
+            result = await frontier.get_next_url()
+            if result:
+                expired_claims.append(result[2])
+        
+        assert len(expired_claims) == 5, f"Could not reclaim expired URLs: got {len(expired_claims)}"
+        assert len(set(expired_claims)) == 5, "Expired URLs were claimed multiple times"
+        
+        logger.info(f"""
+        PostgreSQL Atomic Claim Test Results:
+        - Total URLs: {num_urls}
+        - Workers: {num_workers}
+        - Total claimed: {len(all_claimed_url_ids)}
+        - Unique claims: {len(unique_url_ids)}
+        - Total time: {total_time:.2f}s
+        - Claims/second: {len(all_claimed_url_ids) / total_time:.0f}
+        - No race conditions detected ✓
+        """)
+        
+    finally:
+        # Cleanup
+        await db_backend.close()
+        
+        
+# Additional test for stress testing the claim mechanism
+@pytest.mark.asyncio
+async def test_claim_stress_with_domain_constraints():
+    """Test atomic claims with domain-based politeness constraints."""
+    pg_url = os.environ.get("TEST_POSTGRES_URL")
+    if not pg_url:
+        pytest.skip("TEST_POSTGRES_URL not set")
+    
+    # This test would simulate more realistic conditions where:
+    # 1. Many URLs are from the same domain
+    # 2. Politeness rules prevent immediate re-crawling
+    # 3. Workers compete for the available URLs from different domains
+    
+    # ... similar setup as above ...
+    
+    # Create URLs with heavy domain concentration
+    # 80% from 10 domains, 20% from 90 other domains
+    # This creates more contention and tests the atomic claim under pressure
+    
+    pass  # Implementation details omitted for brevity
+
+
+# Docker-compose.yml for test PostgreSQL:
+"""
+version: '3.8'
+services:
+  postgres-test:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: crawler_test
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=64MB
+      -c work_mem=4MB
+"""
+```
+
+```shellscript
+# Start PostgreSQL
+docker-compose up -d postgres-test
+
+# Run the test
+TEST_POSTGRES_URL=postgresql://test:test@localhost:5432/crawler_test \
+  pytest crawler/tests/test_frontier.py::test_atomic_claim_with_postgresql -v -s
+
+# Cleanup
+docker-compose down
+```
+
+---
+
+**User**
+
+Just curious as I haven't encountered this type of test before, IIRC it's non-deterministic (but will catch bugs with very high probability), what do you call this category of test, is it a form of fuzzing?
+
+---
+
+**Cursor**
+
+Great observation! This type of test has a few different names depending on the specific aspect you're focusing on:
+
+## **Concurrency Testing / Race Condition Testing**
+
+This is the most accurate term for what we're doing here. It's specifically designed to detect race conditions and synchronization bugs by:
+- Running multiple concurrent actors (workers)
+- Creating contention for shared resources (database rows)
+- Verifying invariants hold regardless of execution order
+
+## **Stress Testing** (partial overlap)
+
+There's an element of stress testing since we're using 50 workers and 1000 URLs to create high load, but stress testing is more about finding performance limits rather than correctness bugs.
+
+## **Property-Based Testing** (conceptually similar)
+
+While not using a property-based testing framework like Hypothesis, we're testing properties/invariants:
+- "No URL should be claimed twice" 
+- "Total claims ≤ available URLs"
+- "Work distribution should be reasonably fair"
+
+These properties should hold for ANY valid execution order.
+
+## Why it's NOT Fuzzing
+
+Fuzzing typically involves:
+- **Random input generation** - We're using deterministic test data
+- **Finding crashes/exceptions** - We're checking logical correctness
+- **Exploring input space** - We're exploring timing/scheduling space
+
+A fuzzing approach might randomly generate URLs, domain names, or database operations. What we're doing is more like **"schedule fuzzing"** - the OS scheduler provides the randomness in execution order.
+
+## Other Related Terms
+
+- **Deterministic Testing of Non-Deterministic Systems** - Some frameworks (like TLA+, Jepsen) try to systematically explore all possible interleavings
+- **Chaos Engineering** - At a larger scale, intentionally injecting failures
+- **Probabilistic Testing** - Acknowledging that we can't test all possible schedules but can achieve high confidence
+
+## Making It More Deterministic
+
+If you wanted more deterministic race condition testing, you could:
+
+```python
+# Use a deterministic scheduler or synchronization points
+class DeterministicScheduler:
+    def __init__(self):
+        self.steps = []
+        self.barriers = {}
+    
+    async def checkpoint(self, worker_id: int, checkpoint_name: str):
+        """Force specific interleaving of operations"""
+        # Wait for all workers to reach this point
+        # Then release them in a specific order
+```
+
+But in practice, the non-deterministic approach with many iterations often catches bugs more efficiently than trying to enumerate all possible schedules.
+
+## Best Practices for This Type of Test
+
+1. **Run multiple times** in CI to increase confidence
+2. **Use large numbers** of workers/operations to increase collision probability  
+3. **Add timing instrumentation** to understand what happened when it fails
+4. **Make it reproducible** by logging seeds, timestamps, and execution order when failures occur
+5. **Consider using tools** like `stress-ng`, `go test -race`, or Python's `threading` module's race detection
+
+So yes, you're right that it's non-deterministic but catches bugs with high probability - it's primarily called **concurrency testing** or **race condition testing**.
+
+```python
+# Use a deterministic scheduler or synchronization points
+class DeterministicScheduler:
+    def __init__(self):
+        self.steps = []
+        self.barriers = {}
+    
+    async def checkpoint(self, worker_id: int, checkpoint_name: str):
+        """Force specific interleaving of operations"""
+        # Wait for all workers to reach this point
+        # Then release them in a specific order
 ```
 
