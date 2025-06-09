@@ -23,12 +23,12 @@ class FrontierManager:
         seen = set()
         try:
             # Load from visited_urls
-            rows = await self.storage.db.fetch_all("SELECT url FROM visited_urls")
+            rows = await self.storage.db.fetch_all("SELECT url FROM visited_urls", query_name="populate_seen_from_visited")
             for row in rows:
                 seen.add(row[0])
             
             # Load from current frontier (in case of resume)
-            rows = await self.storage.db.fetch_all("SELECT url FROM frontier")
+            rows = await self.storage.db.fetch_all("SELECT url FROM frontier", query_name="populate_seen_from_frontier")
             for row in rows:
                 seen.add(row[0])
             
@@ -54,18 +54,33 @@ class FrontierManager:
             await self._clear_frontier_db()
             await self._load_seeds()
 
-    async def _mark_domain_as_seeded(self, domain: str):
-        """Marks a domain as seeded in the domain_metadata table."""
+    async def _mark_domains_as_seeded_batch(self, domains: list[str]):
+        """Marks a batch of domains as seeded in the domain_metadata table."""
+        if not domains:
+            return
+        
+        domain_tuples = [(d,) for d in domains]
         try:
             if self.storage.config.db_type == "postgresql":
-                await self.storage.db.execute("INSERT INTO domain_metadata (domain) VALUES (%s) ON CONFLICT DO NOTHING", (domain,))
-                await self.storage.db.execute("UPDATE domain_metadata SET is_seeded = 1 WHERE domain = %s", (domain,))
+                await self.storage.db.execute_many(
+                    "INSERT INTO domain_metadata (domain, is_seeded) VALUES (%s, 1) ON CONFLICT (domain) DO UPDATE SET is_seeded = 1",
+                    domain_tuples,
+                    query_name="mark_seeded_batch_upsert_pg"
+                )
             else:  # SQLite
-                await self.storage.db.execute("INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)", (domain,))
-                await self.storage.db.execute("UPDATE domain_metadata SET is_seeded = 1 WHERE domain = ?", (domain,))
-            logger.debug(f"Marked domain {domain} as seeded in DB.")
+                await self.storage.db.execute_many(
+                    "INSERT OR IGNORE INTO domain_metadata (domain) VALUES (?)",
+                    domain_tuples,
+                    query_name="mark_seeded_batch_insert_sqlite"
+                )
+                await self.storage.db.execute_many(
+                    "UPDATE domain_metadata SET is_seeded = 1 WHERE domain = ?",
+                    domain_tuples,
+                    query_name="mark_seeded_batch_update_sqlite"
+                )
+            logger.debug(f"Marked {len(domains)} domains as seeded in DB.")
         except Exception as e:
-            logger.error(f"DB error marking domain {domain} as seeded: {e}")
+            logger.error(f"DB error batch marking domains as seeded: {e}")
             raise
     
     async def _load_seeds(self):
@@ -74,35 +89,21 @@ class FrontierManager:
             logger.error(f"Seed file not found: {self.config.seed_file}")
             return
 
-        added_count = 0
-        urls = []
-        
-        async def _seed_worker(start, end):
-            nonlocal added_count
-            for url in urls[start:end]:
-                if await self.add_url(url):
-                    added_count += 1
-                # Also mark domain as is_seeded = 1 in domain_metadata table
-                domain = extract_domain(url)
-                if domain:
-                    await self._mark_domain_as_seeded(domain)
-        
         try:
             with open(self.config.seed_file, 'r') as f:
-                for line in f:
-                    url = line.strip()
-                    if url and not url.startswith("#"):
-                        urls.append(url)
+                urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+            if not urls:
+                logger.warning(f"Seed file {self.config.seed_file} is empty.")
+                return
+
+            # Mark all domains from seeds as seeded
+            seed_domains = {extract_domain(u) for u in urls if extract_domain(u)}
+            await self._mark_domains_as_seeded_batch(list(seed_domains))
             
-            num_per_worker = (len(urls) + self.config.max_workers - 1) // self.config.max_workers
-            seed_workers = []
-            for i in range(self.config.max_workers):
-                start = i * num_per_worker
-                end = min((i + 1) * num_per_worker, len(urls))
-                if start < len(urls):
-                    seed_workers.append(_seed_worker(start, end))
+            # Add all URLs to the frontier in one batch
+            added_count = await self.add_urls_batch(urls)
             
-            await asyncio.gather(*seed_workers)
             logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
         except IOError as e:
             logger.error(f"Error reading seed file {self.config.seed_file}: {e}")
@@ -110,69 +111,143 @@ class FrontierManager:
     async def _clear_frontier_db(self):
         """Clears the frontier table."""
         try:
-            await self.storage.db.execute("DELETE FROM frontier")
+            await self.storage.db.execute("DELETE FROM frontier", query_name="clear_frontier")
             logger.info("Cleared frontier table in database.")
             self.seen_urls.clear()
         except Exception as e:
             logger.error(f"DB error clearing frontier: {e}")
             raise
 
-    async def add_url(self, url: str, depth: int = 0) -> bool:
-        """Adds a normalized URL to the frontier if not already seen or invalid domain."""
-        normalized_url = normalize_url(url)
-        if not normalized_url:
-            return False
-
-        if normalized_url in self.seen_urls:
-            return False # Already processed or in frontier (in-memory check)
-
-        domain = extract_domain(normalized_url)
-        if not domain:
-            logger.warning(f"Could not extract domain from URL: {normalized_url}, skipping.")
-            return False
+    async def add_urls_batch(self, urls: list[str], depth: int = 0) -> int:
+        """Adds a batch of URLs to the frontier, designed for efficiency."""
+        # 1. Normalize and pre-filter
+        normalized_urls = {normalize_url(u) for u in urls}
+        # Remove None from failed normalizations and anything already seen in-memory
+        candidates = {u for u in normalized_urls if u and u not in self.seen_urls}
         
-        if not await self.politeness.is_url_allowed(normalized_url):
-            logger.debug(f"URL {normalized_url} disallowed by politeness, not adding.")
-            self.seen_urls.add(normalized_url) # Mark as seen to avoid re-checking politeness
-            return False
-
-        # Check if already visited
-        row = await self.storage.db.fetch_one(
-            "SELECT 1 FROM visited_urls WHERE url_sha256 = ?", 
-            (self.storage.get_url_sha256(normalized_url),)
-        )
-        if row:
-            self.seen_urls.add(normalized_url)
-            return False
-
-        # Try to add to frontier
-        try:
-            await self.storage.db.execute(
-                "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (normalized_url, domain, depth, int(time.time()), 0, None)
+        if not candidates:
+            return 0
+            
+        # 2. Politeness filtering
+        allowed_urls = []
+        for url in candidates:
+            # This is a performance optimization. By checking here, we avoid inserting
+            # known-disallowed URLs into the frontier table. It also populates the
+            # in-memory seen_urls set for disallowed links, preventing us from
+            # re-checking them every time they are discovered.
+            if await self.politeness.is_url_allowed(url):
+                allowed_urls.append(url)
+            else:
+                self.seen_urls.add(url) # Mark as seen to prevent re-checking
+        
+        if not allowed_urls:
+            return 0
+        
+        # 3. Bulk check against visited_urls table
+        # Create SHA256 hashes for the query
+        url_hashes_to_check = [self.storage.get_url_sha256(u) for u in allowed_urls]
+        
+        # Chunk the check for existing hashes to avoid very large IN clauses.
+        existing_hashes = set()
+        chunk_size = 500
+        
+        for i in range(0, len(url_hashes_to_check), chunk_size):
+            chunk = url_hashes_to_check[i:i + chunk_size]
+            
+            # Fetch hashes from the current chunk that already exist in visited_urls
+            rows = await self.storage.db.fetch_all(
+                f"SELECT url_sha256 FROM visited_urls WHERE url_sha256 IN ({','.join(['?' for _ in chunk])})",
+                tuple(chunk),
+                query_name="batch_check_visited"
             )
-            self.seen_urls.add(normalized_url)
-            return True
+            if rows:
+                for row in rows:
+                    existing_hashes.add(row[0])
+
+        # Filter out URLs that are already visited
+        new_urls_to_add = [u for u in allowed_urls if self.storage.get_url_sha256(u) not in existing_hashes]
+
+        if not new_urls_to_add:
+            return 0
+
+        # 4. Bulk insert new URLs into the frontier in chunks
+        added_count = 0
+        current_time = int(time.time())
+        
+        records_to_insert = []
+        for url in new_urls_to_add:
+            domain = extract_domain(url)
+            if domain:
+                records_to_insert.append((url, domain, depth, current_time, 0, None))
+        
+        if not records_to_insert:
+            return 0
+            
+        try:
+            for i in range(0, len(records_to_insert), chunk_size):
+                chunk_of_records = records_to_insert[i:i + chunk_size]
+                
+                if self.storage.config.db_type == "postgresql":
+                    await self.storage.db.execute_many(
+                        "INSERT INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (url) DO NOTHING",
+                        chunk_of_records,
+                        query_name="batch_insert_frontier_pg"
+                    )
+                else: # SQLite
+                    await self.storage.db.execute_many(
+                        "INSERT OR IGNORE INTO frontier (url, domain, depth, added_timestamp, priority_score, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        chunk_of_records,
+                        query_name="batch_insert_frontier_sqlite"
+                    )
+
+                # Update in-memory cache and count for the processed chunk
+                for record in chunk_of_records:
+                    self.seen_urls.add(record[0])
+                
+                added_count += len(chunk_of_records)
+            
         except Exception as e:
-            # Likely a unique constraint violation (URL already in frontier)
-            logger.debug(f"Could not add URL {normalized_url} to frontier: {e}")
-            self.seen_urls.add(normalized_url)
-            return False
+            # This can happen in a race condition if another worker adds the same URL between our checks and this insert.
+            logger.error(f"DB error during batch insert to frontier: {e}")
+
+        return added_count
+
+    async def is_empty(self) -> bool:
+        """Checks if the frontier is empty using an efficient query."""
+        try:
+            row = await self.storage.db.fetch_one("SELECT 1 FROM frontier LIMIT 1", query_name="is_frontier_empty")
+            return row is None
+        except Exception as e:
+            logger.error(f"Error checking if frontier is empty: {e}")
+            return True # Assume empty on error to be safe
 
     async def count_frontier(self) -> int:
-        """Counts the number of URLs currently in the frontier table."""
+        """
+        Estimates the number of URLs in the frontier.
+        For PostgreSQL, this uses a fast statistical estimate.
+        For SQLite, it performs a full count.
+        """
         try:
-            row = await self.storage.db.fetch_one("SELECT COUNT(*) FROM frontier")
-            return row[0] if row else 0
+            if self.storage.config.db_type == "postgresql":
+                # This is a very fast way to get an estimate from table statistics
+                row = await self.storage.db.fetch_one(
+                    "SELECT reltuples::BIGINT FROM pg_class WHERE relname = 'frontier'",
+                    query_name="count_frontier_pg_estimated"
+                )
+                return row[0] if row else 0
+            else: # SQLite
+                row = await self.storage.db.fetch_one("SELECT COUNT(*) FROM frontier", query_name="count_frontier_sqlite")
+                return row[0] if row else 0
         except Exception as e:
             logger.error(f"Error counting frontier: {e}")
             return 0
 
-    async def get_next_url(self) -> tuple[str, str, int] | None:
+    async def get_next_url(self) -> tuple[str, str, int, int] | None:
         """Gets the next URL to crawl from the frontier, respecting politeness rules.
         Uses atomic claim-and-read to minimize contention.
+        Returns a tuple of (url, domain, url_id, depth) or None.
         """
-        batch_size = 3  # Claim a small batch to amortize DB overhead
+        batch_size = 1  # Claim a small batch to amortize DB overhead
         claim_expiry_seconds = 300  # URLs claimed but not processed expire after 5 minutes
         
         # Get worker identifier for logging
@@ -193,8 +268,12 @@ class FrontierManager:
             selected_url_info = None
             
             # Process claimed URLs with politeness checks
-            for i, (url_id, url, domain) in enumerate(claimed_urls):
-                # Check if URL is allowed by robots.txt and manual exclusions
+            for i, (url_id, url, domain, depth) in enumerate(claimed_urls):
+                # This is a correctness check. It ensures that any URL pulled from the
+                # frontier, which may have been added hours or days ago, is re-validated
+                # against the LATEST politeness rules before we fetch it. This is
+                # crucial for long-running crawls or crawls that are paused and resumed
+                # after rule changes (e.g., an updated robots.txt or exclusion list).
                 if not await self.politeness.is_url_allowed(url):
                     logger.debug(f"URL {url} (ID: {url_id}) disallowed by politeness rules. Removing.")
                     await self._delete_url(url_id)
@@ -202,22 +281,23 @@ class FrontierManager:
                     continue
                 
                 # Check if we can fetch from this domain now
+                logger.debug(f"{worker_name} checking if URL ID {url_id} from domain {domain} is ready for fetch")
                 if await self.politeness.can_fetch_domain_now(domain):
                     await self.politeness.record_domain_fetch_attempt(domain)
                     logger.debug(f"{worker_name} processing URL ID {url_id} ({url}) from domain {domain}")
                     # Delete the URL since we're processing it
                     await self._delete_url(url_id)
-                    selected_url_info = (url, domain, url_id)
+                    selected_url_info = (url, domain, url_id, depth)
                     # Mark remaining URLs to be unclaimed
-                    urls_to_unclaim = [(uid, u, d) for uid, u, d in claimed_urls[i+1:]]
+                    urls_to_unclaim = [(uid, u, d, dep) for uid, u, d, dep in claimed_urls[i+1:]]
                     break
                 else:
                     # Domain not ready - unclaim this URL so another worker can try later
                     await self._unclaim_url(url_id)
-                    logger.debug(f"Domain {domain} not ready for fetch, unclaimed URL ID {url_id}")
+                    logger.debug(f"Domain {domain} not ready for fetch, {worker_name} unclaimed URL ID {url_id}")
             
             # Unclaim any remaining URLs if we found one to process
-            for url_id, url, domain in urls_to_unclaim:
+            for url_id, url, domain, depth in urls_to_unclaim:
                 await self._unclaim_url(url_id)
                 logger.debug(f"Unclaimed remaining URL ID {url_id} from batch")
             
@@ -227,52 +307,85 @@ class FrontierManager:
             logger.error(f"Error in get_next_url: {e}", exc_info=True)
             return None
 
-    async def _atomic_claim_urls(self, batch_size: int, claim_expiry_seconds: int) -> list[tuple[int, str, str]]:
-        """Atomically claims a batch of URLs using UPDATE...RETURNING.
-        Returns list of (id, url, domain) tuples for claimed URLs."""
-        claim_timestamp = int(time.time() * 1000000)  # Microsecond precision
-        expired_timestamp = claim_timestamp - (claim_expiry_seconds * 1000000)
-        
+    async def _atomic_claim_urls(self, batch_size: int, claim_expiry_seconds: int) -> list[tuple[int, str, str, int]]:
+        """Atomically claims a batch of URLs from the frontier."""
         try:
-            # First, release any expired claims
-            await self.storage.db.execute("""
-                UPDATE frontier 
-                SET claimed_at = NULL 
-                WHERE claimed_at IS NOT NULL AND claimed_at < ?
-            """, (expired_timestamp,), query_name="release_expired_claims")
-            
-            # Use FOR UPDATE SKIP LOCKED for true atomic claiming
-            # This prevents race conditions and deadlocks
+            claim_timestamp = int(time.time() * 1000) # Current time in milliseconds
+
             if self.storage.config.db_type == "postgresql":
-                # PostgreSQL supports FOR UPDATE SKIP LOCKED
-                claimed_urls = await self.storage.db.execute_returning("""
-                    WITH to_claim AS (
-                        SELECT id, url, domain 
-                        FROM frontier 
-                        WHERE claimed_at IS NULL
-                        ORDER BY added_timestamp ASC 
-                        LIMIT %s
+                # Calculate the threshold for considering a claim expired
+                expired_claim_timestamp_threshold = claim_timestamp - (claim_expiry_seconds * 1000)
+
+                # Try to claim unclaimed URLs first (most common case)
+                sql_query = '''
+                UPDATE frontier
+                SET claimed_at = %s
+                WHERE id = (
+                    SELECT id
+                    FROM frontier
+                    WHERE claimed_at IS NULL
+                    ORDER BY added_timestamp ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, url, domain, depth;
+                '''
+                
+                claimed_urls = await self.storage.db.execute_returning(
+                    sql_query,
+                    (claim_timestamp,),
+                    query_name="atomic_claim_urls_pg_unclaimed"
+                )
+                
+                # If no unclaimed URLs found, try expired ones
+                if not claimed_urls:
+                    sql_query = '''
+                    UPDATE frontier
+                    SET claimed_at = %s
+                    WHERE id = (
+                        SELECT id
+                        FROM frontier
+                        WHERE claimed_at IS NOT NULL AND claimed_at < %s
+                        ORDER BY added_timestamp ASC
+                        LIMIT 1
                         FOR UPDATE SKIP LOCKED
                     )
-                    UPDATE frontier 
-                    SET claimed_at = %s
-                    FROM to_claim
-                    WHERE frontier.id = to_claim.id
-                    RETURNING frontier.id, frontier.url, frontier.domain
-                """, (batch_size, claim_timestamp), query_name="atomic_claim_urls_pg")
+                    RETURNING id, url, domain, depth;
+                    '''
+                    
+                    claimed_urls = await self.storage.db.execute_returning(
+                        sql_query,
+                        (claim_timestamp, expired_claim_timestamp_threshold),
+                        query_name="atomic_claim_urls_pg_expired"
+                    )
             else:
-                # SQLite doesn't support FOR UPDATE SKIP LOCKED, use the original method
-                claimed_urls = await self.storage.db.execute_returning("""
+                # SQLite doesn't support FOR UPDATE SKIP LOCKED or complex CTEs as well.
+                # Keep the old explicit release and simpler claim for SQLite.
+                # This path will be less performant for high-volume crawling.
+                expired_timestamp = claim_timestamp - (claim_expiry_seconds * 1000)
+                await self.storage.db.execute("""
                     UPDATE frontier 
-                    SET claimed_at = ? 
-                    WHERE id IN (
-                        SELECT id FROM frontier 
+                    SET claimed_at = NULL 
+                    WHERE claimed_at IS NOT NULL AND claimed_at < ?
+                """, (expired_timestamp,), query_name="release_expired_claims")
+
+                # Original SQLite claiming logic
+                claimed_urls = await self.storage.db.execute_returning(
+                    """
+                    WITH to_claim_ids AS (
+                        SELECT id
+                        FROM frontier
                         WHERE claimed_at IS NULL
-                        ORDER BY added_timestamp ASC 
+                        ORDER BY added_timestamp ASC
                         LIMIT ?
                     )
-                    RETURNING id, url, domain
-                """, (claim_timestamp, batch_size), query_name="atomic_claim_urls_sqlite")
+                    UPDATE frontier
+                    SET claimed_at = ?
+                    WHERE id IN (SELECT id FROM to_claim_ids)
+                    RETURNING id, url, domain, depth
+                    """, (batch_size, claim_timestamp), # Corrected params for SQLite query
+                    query_name="atomic_claim_urls_sqlite"
+                )
             
             return claimed_urls
             

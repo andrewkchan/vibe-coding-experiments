@@ -114,71 +114,69 @@ async def frontier_manager(
         storage=storage_manager_for_frontier, 
         politeness=mock_politeness_enforcer_for_frontier
     )
+    # Patch the batch methods for inspection
+    fm._mark_domains_as_seeded_batch = AsyncMock()
+    fm.add_urls_batch = AsyncMock(side_effect=fm.add_urls_batch) # Keep original behavior but allow asserts
     return fm
 
 @pytest.mark.asyncio
-async def test_frontier_initialization_new(frontier_manager: FrontierManager, mock_politeness_enforcer_for_frontier: MagicMock):
+async def test_frontier_initialization_new(frontier_manager: FrontierManager):
     logger.info("Testing Frontier Initialization (New Crawl)")
-    # Ensure is_url_allowed is permissive during seed loading
-    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True 
     
+    # In the new implementation, initialize_frontier calls _load_seeds,
+    # which in turn calls the batch methods.
     await frontier_manager.initialize_frontier() 
-    assert await frontier_manager.count_frontier() == 2 
+    
+    # Assert that the batch methods were called by _load_seeds
+    frontier_manager._mark_domains_as_seeded_batch.assert_called_once()
+    frontier_manager.add_urls_batch.assert_called_once()
+    
+    # Check the domains that were marked as seeded
+    seeded_domains_call = frontier_manager._mark_domains_as_seeded_batch.call_args[0][0]
+    assert set(seeded_domains_call) == {"example.com", "example.org"}
+
+    # Check the URLs that were added to the frontier
+    urls_added_call = frontier_manager.add_urls_batch.call_args[0][0]
+    assert set(urls_added_call) == {"http://example.com/seed1", "http://example.org/seed2"}
+    
     logger.info("Frontier initialization (new) test passed.")
-    # Check that is_url_allowed was called for seeds
-    assert mock_politeness_enforcer_for_frontier.is_url_allowed.call_count >= 2 
 
 @pytest.mark.asyncio
-async def test_add_and_get_urls(frontier_manager: FrontierManager, mock_politeness_enforcer_for_frontier: MagicMock):
-    logger.info("Testing Add and Get URLs from Frontier")
-    # Permissive politeness for initialization and adding
+async def test_add_urls_batch(frontier_manager: FrontierManager, mock_politeness_enforcer_for_frontier: MagicMock):
+    logger.info("Testing batch adding of URLs to Frontier")
+    
+    # 1. Setup - Ensure frontier is empty and politeness is permissive
+    await frontier_manager._clear_frontier_db()
+    assert await frontier_manager.is_empty() is True
     mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
-    mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
 
-    await frontier_manager.initialize_frontier() 
-    initial_count = await frontier_manager.count_frontier()
-    assert initial_count == 2
+    # 2. Add a batch of new URLs
+    urls_to_add = ["http://test.com/batch1", "http://test.org/batch2", "http://test.com/batch1"]
+    added_count = await frontier_manager.add_urls_batch(urls_to_add)
 
-    # Test adding a new URL
-    await frontier_manager.add_url("http://test.com/page1")
-    assert await frontier_manager.count_frontier() == 3
-    # is_url_allowed should be called by add_url
-    # Initial calls for seeds + 1 for this add_url
-    assert mock_politeness_enforcer_for_frontier.is_url_allowed.call_count >= 3 
-
-    # Try adding a duplicate of a seed - should not increase count
-    current_is_allowed_calls = mock_politeness_enforcer_for_frontier.is_url_allowed.call_count
-    await frontier_manager.add_url("http://example.com/seed1")
-    assert await frontier_manager.count_frontier() == 3
-
-    # Get URLs
-    # For get_next_url, ensure politeness checks are permissive for testing FIFO logic here
-    mock_politeness_enforcer_for_frontier.is_url_allowed.reset_mock(return_value=True) # Reset and keep permissive
-    mock_politeness_enforcer_for_frontier.can_fetch_domain_now.reset_mock(return_value=True)
-    mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.reset_mock()
-
-    expected_order = ["http://example.com/seed1", "http://example.org/seed2", "http://test.com/page1"]
-    retrieved_urls = []
-
-    for i in range(len(expected_order)):
-        next_url_info = await frontier_manager.get_next_url()
-        assert next_url_info is not None, f"Expected URL, got None at iteration {i}"
-        retrieved_urls.append(next_url_info[0])
-        # Politeness checks for get_next_url
-        assert mock_politeness_enforcer_for_frontier.is_url_allowed.called
-        assert mock_politeness_enforcer_for_frontier.can_fetch_domain_now.called
-        assert mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.called
-        # Reset mocks for next iteration if asserting per-iteration calls
-        mock_politeness_enforcer_for_frontier.is_url_allowed.reset_mock(return_value=True)
-        mock_politeness_enforcer_for_frontier.can_fetch_domain_now.reset_mock(return_value=True)
-        mock_politeness_enforcer_for_frontier.record_domain_fetch_attempt.reset_mock()
-
-    assert retrieved_urls == expected_order
-    assert await frontier_manager.count_frontier() == 0
-
-    next_url_info = await frontier_manager.get_next_url()
-    assert next_url_info is None, "Frontier should be empty"
-    logger.info("Add and get URLs test passed with politeness mocks.")
+    # Assert that duplicates within the batch are handled and politeness was checked
+    assert added_count == 2
+    assert await frontier_manager.count_frontier() == 2
+    assert mock_politeness_enforcer_for_frontier.is_url_allowed.call_count == 2
+    
+    # 3. Add another batch, some new, some disallowed, some already seen
+    mock_politeness_enforcer_for_frontier.is_url_allowed.reset_mock()
+    
+    # Make one URL disallowed
+    def side_effect(url):
+        if "disallowed" in url:
+            return False
+        return True
+    mock_politeness_enforcer_for_frontier.is_url_allowed.side_effect = side_effect
+    
+    next_urls_to_add = ["http://new.com/page1", "http://test.org/batch2", "http://disallowed.com/page"]
+    added_count_2 = await frontier_manager.add_urls_batch(next_urls_to_add)
+    
+    assert added_count_2 == 1 # Only new.com/page1 should be added
+    assert await frontier_manager.count_frontier() == 3 # 2 from before + 1 new
+    assert mock_politeness_enforcer_for_frontier.is_url_allowed.call_count == 2 # disallowed.com and new.com (batch2 is in seen_urls)
+    
+    logger.info("Batch URL adding test passed.")
 
 @pytest.mark.asyncio
 async def test_frontier_resume_with_politeness(
@@ -211,7 +209,8 @@ async def test_frontier_resume_with_politeness(
     
     frontier_run1 = FrontierManager(config=cfg_run1, storage=storage_run1, politeness=mock_politeness_enforcer_for_frontier)
     await frontier_run1.initialize_frontier() 
-    await frontier_run1.add_url("http://persistent.com/page_from_run1")
+    # Use batch add for the test
+    await frontier_run1.add_urls_batch(["http://persistent.com/page_from_run1"])
     assert await frontier_run1.count_frontier() == 3
     
     url_to_retrieve = await frontier_run1.get_next_url()

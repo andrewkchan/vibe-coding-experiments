@@ -11,7 +11,7 @@ from .db_backends import DatabaseBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 4
 
 class StorageManager:
     def __init__(self, config: CrawlerConfig, db_backend: DatabaseBackend):
@@ -48,9 +48,9 @@ class StorageManager:
             # Check current schema version
             await self.db.execute("""
                 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)
-            """)
+            """, query_name="create_schema_version_table")
             
-            row = await self.db.fetch_one("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")
+            row = await self.db.fetch_one("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1", query_name="get_schema_version")
             current_version = row[0] if row else 0
 
             if current_version < DB_SCHEMA_VERSION:
@@ -68,7 +68,7 @@ class StorageManager:
                         priority_score REAL DEFAULT 0,
                         claimed_at BIGINT DEFAULT NULL
                     )
-                    """)
+                    """, query_name="create_frontier_table_pg")
                 else:  # SQLite
                     await self.db.execute("""
                     CREATE TABLE IF NOT EXISTS frontier (
@@ -80,25 +80,31 @@ class StorageManager:
                         priority_score REAL DEFAULT 0,
                         claimed_at INTEGER DEFAULT NULL
                     )
-                    """)
+                    """, query_name="create_frontier_table_sqlite")
                 
                 # Create indexes
-                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)")
-                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)")
+                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain ON frontier (domain)", query_name="create_idx_frontier_domain")
+                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_priority ON frontier (priority_score, added_timestamp)", query_name="create_idx_frontier_priority")
                 
                 # Add claimed_at column if upgrading from version 1 (SQLite only)
                 if current_version == 1 and self.config.db_type == "sqlite":
                     try:
-                        await self.db.execute("ALTER TABLE frontier ADD COLUMN claimed_at INTEGER DEFAULT NULL")
+                        await self.db.execute("ALTER TABLE frontier ADD COLUMN claimed_at INTEGER DEFAULT NULL", query_name="alter_frontier_add_claimed_at")
                         logger.info("Added claimed_at column to frontier table")
                     except:
                         # Column might already exist
                         pass
                 if self.config.db_type == "postgresql":
-                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_unclaimed_order_by_time ON frontier (added_timestamp ASC) WHERE claimed_at IS NULL")
-                else: # SQLite does not support partial indexes on ASC/DESC order for expressions, but can do it on columns
-                      # A simple index on claimed_at and added_timestamp is the fallback.
-                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_added_timestamp_sqlite ON frontier (claimed_at, added_timestamp)")
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_unclaimed_order_by_time ON frontier (added_timestamp ASC) WHERE claimed_at IS NULL", query_name="create_idx_frontier_unclaimed")
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_for_expiry ON frontier (claimed_at) WHERE claimed_at IS NOT NULL", query_name="create_idx_frontier_claimed_at_expiry")
+                    # New index for the implicit expiry logic (expired part of UNION ALL)
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_expired_order_by_time ON frontier (added_timestamp ASC) WHERE claimed_at IS NOT NULL", query_name="create_idx_frontier_expired")
+                else: # SQLite
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_added_timestamp_sqlite ON frontier (claimed_at, added_timestamp)", query_name="create_idx_frontier_claimed_at_added_ts")
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_sqlite ON frontier (claimed_at)", query_name="create_idx_frontier_claimed_at")
+                    # For SQLite, an index on added_timestamp would be beneficial for the parts of the UNION ALL equivalent.
+                    # Note: SQLite doesn't have partial indexes on expressions like PG for claimed_at IS NOT NULL.
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_added_timestamp_sqlite ON frontier (added_timestamp)", query_name="create_idx_frontier_added_ts")
 
                 # Visited URLs Table
                 await self.db.execute("""
@@ -113,8 +119,8 @@ class StorageManager:
                     content_storage_path TEXT,
                     redirected_to_url TEXT
                 )
-                """)
-                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_visited_domain ON visited_urls (domain)")
+                """, query_name="create_visited_urls_table")
+                await self.db.execute("CREATE INDEX IF NOT EXISTS idx_visited_domain ON visited_urls (domain)", query_name="create_idx_visited_domain")
 
                 # Domain Metadata Table
                 await self.db.execute("""
@@ -127,13 +133,13 @@ class StorageManager:
                     is_manually_excluded INTEGER DEFAULT 0,
                     is_seeded INTEGER DEFAULT 0
                 )
-                """)
+                """, query_name="create_domain_metadata_table")
                 
                 # Update schema version
                 if self.config.db_type == "postgresql":
-                    await self.db.execute("INSERT INTO schema_version (version) VALUES (%s) ON CONFLICT DO NOTHING", (DB_SCHEMA_VERSION,))
+                    await self.db.execute("INSERT INTO schema_version (version) VALUES (%s) ON CONFLICT DO NOTHING", (DB_SCHEMA_VERSION,), query_name="update_schema_version_pg")
                 else:  # SQLite
-                    await self.db.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (DB_SCHEMA_VERSION,))
+                    await self.db.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (DB_SCHEMA_VERSION,), query_name="update_schema_version_sqlite")
                 logger.info("Database tables created/updated successfully.")
             else:
                 logger.info(f"Database schema is up to date (version {current_version}).")
@@ -197,7 +203,7 @@ class StorageManager:
                 """, (
                     url_sha256, url, domain, crawled_timestamp, status_code, 
                     content_type, content_hash, content_storage_path_str, redirected_to_url
-                ))
+                ), query_name="add_visited_page_pg")
             else:  # SQLite
                 await self.db.execute("""
                 INSERT OR REPLACE INTO visited_urls 
@@ -206,7 +212,7 @@ class StorageManager:
                 """, (
                     url_sha256, url, domain, crawled_timestamp, status_code, 
                     content_type, content_hash, content_storage_path_str, redirected_to_url
-                ))
+                ), query_name="add_visited_page_sqlite")
             logger.info(f"Recorded visited URL: {url} (Status: {status_code})")
         except Exception as e:
             logger.error(f"DB error adding visited page {url}: {e}")

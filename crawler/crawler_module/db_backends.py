@@ -8,22 +8,13 @@ import asyncio
 import logging
 import sqlite3
 import time
-from typing import Any, List, Tuple, Optional, Dict, TYPE_CHECKING
+from typing import Any, List, Tuple, Optional, Dict
 from pathlib import Path
 from contextlib import asynccontextmanager
 import queue
 import threading
 import traceback
 from collections import defaultdict
-
-# Type checking imports
-if TYPE_CHECKING:
-    try:
-        import psycopg_pool
-        import psycopg
-    except ImportError:
-        psycopg_pool = None
-        psycopg = None
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +282,6 @@ class PostgreSQLBackend(DatabaseBackend):
         
         try:
             import psycopg_pool
-            import psycopg
             
             # Create async connection pool without opening it
             self._pool = psycopg_pool.AsyncConnectionPool(
@@ -364,8 +354,6 @@ class PostgreSQLBackend(DatabaseBackend):
         
                 self.connection_acquire_times.append(time_to_acquire)
         
-                if time_to_acquire > 1.0:
-                    logger.warning(f"Slow connection acquisition: {time_to_acquire:.2f}s")
                 logger.debug(f"Connection acquired in {time_to_acquire:.3f}s")
                 yield conn
         finally:
@@ -385,9 +373,9 @@ class PostgreSQLBackend(DatabaseBackend):
                 # This logs the total time from _get_connection entry, through acquire, use, and up to return.
                 # This is different from connection_active_hold_time.
                 total_context_duration = time.time() - start_time
-                if total_context_duration > CONNECTION_HOLD_THRESHOLD: # CONNECTION_HOLD_THRESHOLD might need re-evaluation
+                if total_context_duration > CONNECTION_HOLD_THRESHOLD:
                     logger.warning(f"Total context duration for _get_connection was {total_context_duration:.3f}s (threshold: {CONNECTION_HOLD_THRESHOLD}s). Active hold: {connection_active_hold_time:.3f}s.")
-                    logger.warning("Stack trace of long _get_connection context:") # Changed log message
+                    logger.warning("Stack trace of long _get_connection context:")
                     traceback.print_stack()
     
     async def execute(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> None:
@@ -407,13 +395,11 @@ class PostgreSQLBackend(DatabaseBackend):
         if "?" in query:
             query = query.replace("?", "%s")
         
-
         self._current_query_name = query_name
 
         async with self._get_connection() as conn:
             async with conn.cursor() as cur:
-                for params in params_list:
-                    await cur.execute(query, params)
+                await cur.executemany(query, params_list)
     
     async def fetch_one(self, query: str, params: Optional[Tuple] = None, query_name: Optional[str] = None) -> Optional[Tuple]:
         """Execute a query and return a single row."""

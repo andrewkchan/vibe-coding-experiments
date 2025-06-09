@@ -26,7 +26,7 @@ EMPTY_FRONTIER_SLEEP_SECONDS = 10
 # How often the main orchestrator loop checks status and stopping conditions
 ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 
-METRICS_LOG_INTERVAL_SECONDS = 20
+METRICS_LOG_INTERVAL_SECONDS = 60
 
 class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
@@ -68,7 +68,7 @@ class CrawlerOrchestrator:
                 # Estimate reasonable pool size based on workers
                 # Not all workers need a connection simultaneously
                 # Workers spend time fetching URLs, parsing, etc.
-                concurrent_db_fraction = 0.3  # Assume ~30% of workers need DB at once
+                concurrent_db_fraction = 0.7  # Assume ~70% of workers need DB at once
                 
                 min_pool = min(10, config.max_workers)
                 # Calculate max based on expected concurrent needs
@@ -102,6 +102,16 @@ class CrawlerOrchestrator:
         self.pages_crawled_in_interval: int = 0
         self.last_metrics_log_time: float = time.time()
 
+    async def _initialize_components(self):
+        """Initializes all crawler components that require async setup."""
+        logger.info("Initializing crawler components...")
+        await self.db_backend.initialize()
+        await self.storage.init_db_schema()
+        # Load politeness-related data that needs to be available before crawl starts
+        await self.politeness._load_manual_exclusions()
+        await self.frontier.initialize_frontier()
+        logger.info("Crawler components initialized.")
+
     async def _log_metrics(self):
         current_time = time.time()
         time_elapsed_seconds = current_time - self.last_metrics_log_time
@@ -132,7 +142,8 @@ class CrawlerOrchestrator:
                 if hold_times:
                     p50_hold = calculate_percentiles(hold_times, [50])[0]
                     p95_hold = calculate_percentiles(hold_times, [95])[0]
-                    logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): P50={p50_hold*1000:.2f}, P95={p95_hold*1000:.2f} (from {len(hold_times)} samples)")
+                    max_hold = max(hold_times)
+                    logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): P50={p50_hold*1000:.2f}, P95={p95_hold*1000:.2f}, MAX={max_hold*1000:.2f} (from {len(hold_times)} samples)")
                 # else: logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): No samples") # Optional: log if no samples
 
         # Reset for next interval
@@ -144,7 +155,7 @@ class CrawlerOrchestrator:
         logger.info(f"Worker-{worker_id}: Starting.")
         
         # Add small random delay to spread out initial DB access
-        startup_delay = (worker_id % 20) * 0.5  # 0-10 second delay based on worker ID
+        startup_delay = (worker_id % 20) * 0.25  # 0-5 second delay based on worker ID
         await asyncio.sleep(startup_delay)
         
         try:
@@ -152,18 +163,17 @@ class CrawlerOrchestrator:
                 next_url_info = await self.frontier.get_next_url()
 
                 if next_url_info is None:
-                    # Check if the frontier is truly empty (not just all domains on cooldown)
-                    current_frontier_size_for_worker = await self.frontier.count_frontier()
-                    if current_frontier_size_for_worker == 0:
-                        logger.info(f"Worker-{worker_id}: Frontier is confirmed empty by count. Waiting...")
+                    # Check if the frontier is truly empty before sleeping
+                    if await self.frontier.is_empty():
+                        logger.info(f"Worker-{worker_id}: Frontier is confirmed empty. Waiting...")
                     else:
-                        # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting... Frontier size: {current_frontier_size_for_worker}")
+                        # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting...")
                         pass # Still URLs, but none fetchable now
                     await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS) 
                     continue
 
-                url_to_crawl, domain, frontier_id = next_url_info
-                logger.info(f"Worker-{worker_id}: Processing URL ID {frontier_id}: {url_to_crawl} from domain {domain}")
+                url_to_crawl, domain, frontier_id, depth = next_url_info
+                logger.info(f"Worker-{worker_id}: Processing URL ID {frontier_id} at depth {depth}: {url_to_crawl} from domain {domain}")
 
                 fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
                 crawled_timestamp = int(time.time())
@@ -203,10 +213,8 @@ class CrawlerOrchestrator:
                         
                         if parse_data.extracted_links:
                             logger.debug(f"Worker-{worker_id}: Found {len(parse_data.extracted_links)} links on {fetch_result.final_url}")
-                            links_added_this_page = 0
-                            for link in parse_data.extracted_links:
-                                if await self.frontier.add_url(link):
-                                    links_added_this_page +=1
+                            # Batch add URLs to the frontier
+                            links_added_this_page = await self.frontier.add_urls_batch(list(parse_data.extracted_links), depth=depth + 1)
                             if links_added_this_page > 0:
                                 self.total_urls_added_to_frontier += links_added_this_page
                                 logger.info(f"Worker-{worker_id}: Added {links_added_this_page} new URLs to frontier from {fetch_result.final_url}. Total added: {self.total_urls_added_to_frontier}")
@@ -259,28 +267,15 @@ class CrawlerOrchestrator:
         current_process = psutil.Process(os.getpid())
 
         try:
-            # Initialize database
-            await self.db_backend.initialize()
-            await self.storage.init_db_schema()
-            
-            # Initialize frontier (loads seeds etc.)
-            await self.frontier.initialize_frontier()
-            initial_frontier_size = await self.frontier.count_frontier()
-            self.total_urls_added_to_frontier = initial_frontier_size
-            logger.info(f"Frontier initialized. Size: {initial_frontier_size}")
+            # Initialize components that need async setup
+            await self._initialize_components()
 
-            if initial_frontier_size == 0 and not self.config.resume:
-                logger.warning("No URLs in frontier after seed loading. Nothing to crawl.")
-                self._shutdown_event.set() # Ensure a clean shutdown path
-            elif initial_frontier_size == 0 and self.config.resume:
-                logger.warning("Resuming with an empty frontier. Crawler will wait for new URLs or shutdown if none appear.")
-            
             # Start worker tasks
             logger.info(f"Starting {self.config.max_workers} workers with staggered startup...")
             
             # Stagger worker startup to avoid thundering herd on DB pool
             workers_per_batch = 20  # Start 20 workers at a time
-            startup_delay = 10  # Delay between batches in seconds
+            startup_delay = 5  # Delay between batches in seconds
             
             for i in range(self.config.max_workers):
                 task = asyncio.create_task(self._worker(i + 1))
@@ -303,7 +298,8 @@ class CrawlerOrchestrator:
                 if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                     await self._log_metrics()
 
-                current_frontier_size = await self.frontier.count_frontier()
+                # Use the fast, estimated count for logging
+                estimated_frontier_size = await self.frontier.count_frontier()
                 active_workers = sum(1 for task in self.worker_tasks if not task.done())
                 
                 # Resource monitoring
@@ -327,7 +323,7 @@ class CrawlerOrchestrator:
 
                 status_parts = [
                     f"Crawled={self.pages_crawled_count}",
-                    f"Frontier={current_frontier_size}",
+                    f"Frontier={estimated_frontier_size}",
                     f"AddedToFrontier={self.total_urls_added_to_frontier}",
                     f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
                     f"DBPool({self.config.db_type})={pool_info}",
@@ -338,15 +334,15 @@ class CrawlerOrchestrator:
                 logger.info(f"Status: {', '.join(status_parts)}")
                 
                 # If frontier is empty and workers might be idle, it could be a natural end
-                # This condition needs to be careful not to prematurely shut down if workers are just between tasks.
-                # A more robust check would involve seeing if workers are truly blocked on an empty frontier for a while.
-                if current_frontier_size == 0 and self.pages_crawled_count > 0: # Check if any crawling happened
+                # Use the accurate is_empty() check for shutdown logic
+                if await self.frontier.is_empty() and self.pages_crawled_count > 0: # Check if any crawling happened
                     # Wait a bit to see if workers add more URLs or finish
                     logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring workers...")
                     await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2) # Wait longer than worker sleep
-                    current_frontier_size = await self.frontier.count_frontier()
-                    if current_frontier_size == 0 and not any(not task.done() for task in self.worker_tasks):
-                        logger.info("Frontier empty and all workers appear done. Signaling shutdown.")
+                    
+                    # Final, accurate check before shutdown
+                    if await self.frontier.is_empty():
+                        logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
                         self._shutdown_event.set()
                         break
 
