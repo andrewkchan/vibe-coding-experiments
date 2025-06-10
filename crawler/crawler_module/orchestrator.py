@@ -46,7 +46,7 @@ class CrawlerOrchestrator:
                 'sqlite',
                 db_path=data_dir_path / "crawler_state.db",
                 pool_size=config.max_workers,
-                timeout=30
+                timeout=60
             )
         else:  # PostgreSQL
             # For PostgreSQL, we need to be careful about connection limits
