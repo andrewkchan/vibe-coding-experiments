@@ -319,22 +319,20 @@ class FrontierManager:
                 # Calculate when a domain is ready (70 seconds have passed since last fetch)
                 domain_ready_threshold = current_time_seconds - 70
 
-                # Domain-aware claiming: only claim URLs from domains that are ready
+                # Domain-aware claiming with domain locking to prevent collisions
+                # First try: URLs from domains with metadata that are ready (with locking)
                 sql_query = '''
                 UPDATE frontier
                 SET claimed_at = %s
                 WHERE id = (
                     SELECT f.id
                     FROM frontier f
-                    LEFT JOIN domain_metadata dm ON f.domain = dm.domain
+                    INNER JOIN domain_metadata dm ON f.domain = dm.domain
                     WHERE f.claimed_at IS NULL
-                    AND (
-                        dm.last_scheduled_fetch_timestamp IS NULL 
-                        OR dm.last_scheduled_fetch_timestamp <= %s
-                    )
+                    AND dm.last_scheduled_fetch_timestamp <= %s
                     ORDER BY f.added_timestamp ASC
                     LIMIT 1
-                    FOR UPDATE OF f SKIP LOCKED
+                    FOR UPDATE OF f, dm SKIP LOCKED
                 )
                 RETURNING id, url, domain, depth;
                 '''
@@ -345,7 +343,7 @@ class FrontierManager:
                     query_name="atomic_claim_urls_pg_domain_aware"
                 )
                 
-                # If no unclaimed URLs found, try expired ones (also domain-aware)
+                # If no URLs from known domains, try new domains (no metadata yet)
                 if not claimed_urls:
                     sql_query = '''
                     UPDATE frontier
@@ -353,12 +351,10 @@ class FrontierManager:
                     WHERE id = (
                         SELECT f.id
                         FROM frontier f
-                        LEFT JOIN domain_metadata dm ON f.domain = dm.domain
-                        WHERE f.claimed_at IS NOT NULL 
-                        AND f.claimed_at < %s
-                        AND (
-                            dm.last_scheduled_fetch_timestamp IS NULL 
-                            OR dm.last_scheduled_fetch_timestamp <= %s
+                        WHERE f.claimed_at IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM domain_metadata dm 
+                            WHERE dm.domain = f.domain
                         )
                         ORDER BY f.added_timestamp ASC
                         LIMIT 1
@@ -369,8 +365,60 @@ class FrontierManager:
                     
                     claimed_urls = await self.storage.db.execute_returning(
                         sql_query,
+                        (claim_timestamp,),
+                        query_name="atomic_claim_urls_pg_new_domain"
+                    )
+                
+                # If still no URLs, try expired ones from known domains
+                if not claimed_urls:
+                    sql_query = '''
+                    UPDATE frontier
+                    SET claimed_at = %s
+                    WHERE id = (
+                        SELECT f.id
+                        FROM frontier f
+                        INNER JOIN domain_metadata dm ON f.domain = dm.domain
+                        WHERE f.claimed_at IS NOT NULL 
+                        AND f.claimed_at < %s
+                        AND dm.last_scheduled_fetch_timestamp <= %s
+                        ORDER BY f.added_timestamp ASC
+                        LIMIT 1
+                        FOR UPDATE OF f, dm SKIP LOCKED
+                    )
+                    RETURNING id, url, domain, depth;
+                    '''
+                    
+                    claimed_urls = await self.storage.db.execute_returning(
+                        sql_query,
                         (claim_timestamp, expired_claim_timestamp_threshold, domain_ready_threshold),
-                        query_name="atomic_claim_urls_pg_expired_domain_aware"
+                        query_name="atomic_claim_urls_pg_expired_known_domain"
+                    )
+                
+                # Finally, try expired URLs from new domains
+                if not claimed_urls:
+                    sql_query = '''
+                    UPDATE frontier
+                    SET claimed_at = %s
+                    WHERE id = (
+                        SELECT f.id
+                        FROM frontier f
+                        WHERE f.claimed_at IS NOT NULL 
+                        AND f.claimed_at < %s
+                        AND NOT EXISTS (
+                            SELECT 1 FROM domain_metadata dm 
+                            WHERE dm.domain = f.domain
+                        )
+                        ORDER BY f.added_timestamp ASC
+                        LIMIT 1
+                        FOR UPDATE OF f SKIP LOCKED
+                    )
+                    RETURNING id, url, domain, depth;
+                    '''
+                    
+                    claimed_urls = await self.storage.db.execute_returning(
+                        sql_query,
+                        (claim_timestamp, expired_claim_timestamp_threshold),
+                        query_name="atomic_claim_urls_pg_expired_new_domain"
                     )
             else:
                 # SQLite doesn't support FOR UPDATE SKIP LOCKED or complex CTEs as well.
