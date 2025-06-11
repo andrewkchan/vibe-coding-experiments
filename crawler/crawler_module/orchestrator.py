@@ -186,107 +186,116 @@ class CrawlerOrchestrator:
         
         try:
             while not self._shutdown_event.is_set():
-                next_url_info = await self.frontier.get_next_url()
+                try:
+                    next_url_info = await self.frontier.get_next_url()
 
-                if next_url_info is None:
-                    # Check if the frontier is truly empty before sleeping
-                    if await self.frontier.is_empty():
-                        logger.info(f"Worker-{worker_id}: Frontier is confirmed empty. Waiting...")
-                    else:
-                        # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting...")
-                        pass # Still URLs, but none fetchable now
-                    await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS) 
-                    continue
+                    if next_url_info is None:
+                        # Check if the frontier is truly empty before sleeping
+                        if await self.frontier.is_empty():
+                            logger.info(f"Worker-{worker_id}: Frontier is confirmed empty. Waiting...")
+                        else:
+                            # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting...")
+                            pass # Still URLs, but none fetchable now
+                        await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS) 
+                        continue
 
-                url_to_crawl, domain, frontier_id, depth = next_url_info
-                logger.info(f"Worker-{worker_id}: Processing URL ID {frontier_id} at depth {depth}: {url_to_crawl} from domain {domain}")
+                    url_to_crawl, domain, frontier_id, depth = next_url_info
+                    logger.info(f"Worker-{worker_id}: Processing URL ID {frontier_id} at depth {depth}: {url_to_crawl} from domain {domain}")
 
-                # Track fetch duration
-                fetch_start_time = time.time()
-                fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
-                fetch_duration = time.time() - fetch_start_time
-                fetch_duration_histogram.observe(fetch_duration)
-                
-                crawled_timestamp = int(time.time())
-
-                if fetch_result.error_message or fetch_result.status_code >= 400:
-                    logger.warning(f"Worker-{worker_id}: Fetch failed for {url_to_crawl}. Status: {fetch_result.status_code}, Error: {fetch_result.error_message}")
+                    # Track fetch duration
+                    fetch_start_time = time.time()
+                    fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
+                    fetch_duration = time.time() - fetch_start_time
+                    fetch_duration_histogram.observe(fetch_duration)
                     
-                    # Track error in Prometheus
-                    if fetch_result.error_message:
-                        errors_counter.labels(error_type='fetch_error').inc()
-                    else:
-                        errors_counter.labels(error_type=f'http_{fetch_result.status_code}').inc()
-                    
-                    # Record failed attempt
-                    await self.storage.add_visited_page(
-                        url=fetch_result.final_url, 
-                        domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
-                        status_code=fetch_result.status_code,
-                        crawled_timestamp=crawled_timestamp,
-                        content_type=fetch_result.content_type,
-                        redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
-                    )
-                else: # Successful fetch (2xx or 3xx that was followed)
-                    self.pages_crawled_count += 1
-                    pages_crawled_counter.inc()  # Increment Prometheus counter
-                    logger.info(f"Worker-{worker_id}: Successfully fetched {fetch_result.final_url} (Status: {fetch_result.status_code}). Total crawled: {self.pages_crawled_count}")
-                    
-                    content_storage_path_str: str | None = None
-                    parse_data: Optional[ParseResult] = None
+                    crawled_timestamp = int(time.time())
 
-                    if fetch_result.text_content and fetch_result.content_type and "html" in fetch_result.content_type.lower():
-                        logger.debug(f"Worker-{worker_id}: Parsing HTML content for {fetch_result.final_url}")
-                        parse_data = self.parser.parse_html_content(fetch_result.text_content, fetch_result.final_url)
+                    if fetch_result.error_message or fetch_result.status_code >= 400:
+                        logger.warning(f"Worker-{worker_id}: Fetch failed for {url_to_crawl}. Status: {fetch_result.status_code}, Error: {fetch_result.error_message}")
                         
-                        if parse_data.text_content:
-                            url_hash = self.storage.get_url_sha256(fetch_result.final_url)
-                            saved_path = await self.storage.save_content_to_file(url_hash, parse_data.text_content)
-                            if saved_path:
-                                # Store relative path from data_dir for portability
-                                try:
-                                    content_storage_path_str = str(saved_path.relative_to(self.config.data_dir))
-                                except ValueError: # Should not happen if content_dir is child of data_dir
-                                    content_storage_path_str = str(saved_path)
-                                logger.debug(f"Worker-{worker_id}: Saved content for {fetch_result.final_url} to {content_storage_path_str}")
+                        # Track error in Prometheus
+                        if fetch_result.error_message:
+                            errors_counter.labels(error_type='fetch_error').inc()
+                        else:
+                            errors_counter.labels(error_type=f'http_{fetch_result.status_code}').inc()
                         
-                        if parse_data.extracted_links:
-                            logger.debug(f"Worker-{worker_id}: Found {len(parse_data.extracted_links)} links on {fetch_result.final_url}")
-                            # Batch add URLs to the frontier
-                            links_added_this_page = await self.frontier.add_urls_batch(list(parse_data.extracted_links), depth=depth + 1)
-                            if links_added_this_page > 0:
-                                self.total_urls_added_to_frontier += links_added_this_page
-                                urls_added_counter.inc(links_added_this_page)  # Increment Prometheus counter
-                                logger.info(f"Worker-{worker_id}: Added {links_added_this_page} new URLs to frontier from {fetch_result.final_url}. Total added: {self.total_urls_added_to_frontier}")
-                    else:
-                        logger.debug(f"Worker-{worker_id}: Not HTML or no text content for {fetch_result.final_url} (Type: {fetch_result.content_type})")
-                    
-                    # Record success
-                    await self.storage.add_visited_page(
-                        url=fetch_result.final_url,
-                        domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
-                        status_code=fetch_result.status_code,
-                        crawled_timestamp=crawled_timestamp,
-                        content_type=fetch_result.content_type,
-                        content_text=parse_data.text_content if parse_data else None, # For hashing
-                        content_storage_path_str=content_storage_path_str,
-                        redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
-                    )
-                
-                # Check stopping conditions after processing a page
-                if self._check_stopping_conditions():
-                    self._shutdown_event.set()
-                    logger.info(f"Worker-{worker_id}: Stopping condition met, signaling shutdown.")
-                    break 
-                
-                await asyncio.sleep(0) # Yield control to event loop
+                        # Record failed attempt
+                        await self.storage.add_visited_page(
+                            url=fetch_result.final_url, 
+                            domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
+                            status_code=fetch_result.status_code,
+                            crawled_timestamp=crawled_timestamp,
+                            content_type=fetch_result.content_type,
+                            redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
+                        )
+                    else: # Successful fetch (2xx or 3xx that was followed)
+                        self.pages_crawled_count += 1
+                        pages_crawled_counter.inc()  # Increment Prometheus counter
+                        logger.info(f"Worker-{worker_id}: Successfully fetched {fetch_result.final_url} (Status: {fetch_result.status_code}). Total crawled: {self.pages_crawled_count}")
+                        
+                        content_storage_path_str: str | None = None
+                        parse_data: Optional[ParseResult] = None
 
-                self.pages_crawled_in_interval += 1
+                        if fetch_result.text_content and fetch_result.content_type and "html" in fetch_result.content_type.lower():
+                            logger.debug(f"Worker-{worker_id}: Parsing HTML content for {fetch_result.final_url}")
+                            parse_data = self.parser.parse_html_content(fetch_result.text_content, fetch_result.final_url)
+                            
+                            if parse_data.text_content:
+                                url_hash = self.storage.get_url_sha256(fetch_result.final_url)
+                                saved_path = await self.storage.save_content_to_file(url_hash, parse_data.text_content)
+                                if saved_path:
+                                    # Store relative path from data_dir for portability
+                                    try:
+                                        content_storage_path_str = str(saved_path.relative_to(self.config.data_dir))
+                                    except ValueError: # Should not happen if content_dir is child of data_dir
+                                        content_storage_path_str = str(saved_path)
+                                    logger.debug(f"Worker-{worker_id}: Saved content for {fetch_result.final_url} to {content_storage_path_str}")
+                            
+                            if parse_data.extracted_links:
+                                logger.debug(f"Worker-{worker_id}: Found {len(parse_data.extracted_links)} links on {fetch_result.final_url}")
+                                # Batch add URLs to the frontier
+                                links_added_this_page = await self.frontier.add_urls_batch(list(parse_data.extracted_links), depth=depth + 1)
+                                if links_added_this_page > 0:
+                                    self.total_urls_added_to_frontier += links_added_this_page
+                                    urls_added_counter.inc(links_added_this_page)  # Increment Prometheus counter
+                                    logger.info(f"Worker-{worker_id}: Added {links_added_this_page} new URLs to frontier from {fetch_result.final_url}. Total added: {self.total_urls_added_to_frontier}")
+                        else:
+                            logger.debug(f"Worker-{worker_id}: Not HTML or no text content for {fetch_result.final_url} (Type: {fetch_result.content_type})")
+                        
+                        # Record success
+                        await self.storage.add_visited_page(
+                            url=fetch_result.final_url,
+                            domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
+                            status_code=fetch_result.status_code,
+                            crawled_timestamp=crawled_timestamp,
+                            content_type=fetch_result.content_type,
+                            content_text=parse_data.text_content if parse_data else None, # For hashing
+                            content_storage_path_str=content_storage_path_str,
+                            redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
+                        )
+                    
+                    # Check stopping conditions after processing a page
+                    if self._check_stopping_conditions():
+                        self._shutdown_event.set()
+                        logger.info(f"Worker-{worker_id}: Stopping condition met, signaling shutdown.")
+                        break 
+                    
+                    await asyncio.sleep(0) # Yield control to event loop
+
+                    self.pages_crawled_in_interval += 1
+
+                except asyncio.CancelledError:
+                    # Re-raise to allow proper shutdown
+                    raise
+                except Exception as e:
+                    # Log the error but continue processing
+                    logger.error(f"Worker-{worker_id}: Error processing URL: {e}", exc_info=True)
+                    errors_counter.labels(error_type='worker_error').inc()
+                    # Small delay before continuing to avoid tight error loops
+                    await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             logger.info(f"Worker-{worker_id}: Cancelled.")
-        except Exception as e:
-            logger.error(f"Worker-{worker_id}: Unhandled exception: {e}", exc_info=True)
         finally:
             logger.info(f"Worker-{worker_id}: Shutting down.")
 
