@@ -43,6 +43,10 @@ ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 
 METRICS_LOG_INTERVAL_SECONDS = 60
 
+# Number of domain shards - fewer shards than workers reduces scanning overhead
+# while still preventing most domain collisions
+DOMAIN_SHARD_COUNT = 50
+
 class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
         self.config = config
@@ -187,7 +191,9 @@ class CrawlerOrchestrator:
         try:
             while not self._shutdown_event.is_set():
                 try:
-                    next_url_info = await self.frontier.get_next_url()
+                    # Calculate which domain shard this worker should handle
+                    shard_id = (worker_id - 1) % DOMAIN_SHARD_COUNT  # worker_id is 1-based, convert to 0-based
+                    next_url_info = await self.frontier.get_next_url(shard_id, DOMAIN_SHARD_COUNT)
 
                     if next_url_info is None:
                         # Check if the frontier is truly empty before sleeping
