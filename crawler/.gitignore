@@ -121,5 +121,10 @@ crawler_data/
 *.db-journal
 top-1M-domains.txt
 
+# Docker and monitoring
+docker-compose.override.yml
+monitoring/grafana/data/
+monitoring/prometheus/data/
+
 # Pytest cache
 .pytest_cache/

@@ -5,6 +5,7 @@ aiofiles
 cchardet==2.2.0a2
 tldextract
 psutil
+prometheus_client
 pytest
 pytest-asyncio
 httpx

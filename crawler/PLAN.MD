@@ -366,3 +366,39 @@ The crawler uses a database abstraction layer that:
 - Handles connection pooling appropriately for each database
 - Translates queries when needed (most SQL is compatible)
 - Allows easy switching between backends for testing vs. production 
+
+## 14. Monitoring and Metrics Collection
+
+The crawler includes integrated monitoring capabilities using Prometheus for metrics collection and Grafana for visualization.
+
+### 14.1. Metrics Architecture
+
+*   **Metrics Module (`metrics.py`):**
+    *   Uses `prometheus_client` library to expose metrics
+    *   Runs an HTTP server on port 8001 for Prometheus to scrape
+    *   Provides counters, gauges, and histograms for comprehensive monitoring
+
+*   **Integration with Orchestrator:**
+    *   Metrics are updated throughout the crawl lifecycle
+    *   Minimal performance overhead with asynchronous updates
+    *   Real-time visibility into crawler performance
+
+### 14.2. Available Metrics
+
+*   **Counters (monotonically increasing):**
+    *   `crawler_pages_crawled_total`: Total successful page fetches
+    *   `crawler_urls_added_total`: Total URLs added to frontier
+    *   `crawler_errors_total`: Errors by type (fetch_error, HTTP status codes)
+
+*   **Gauges (point-in-time values):**
+    *   `crawler_pages_per_second`: Current crawl rate
+    *   `crawler_frontier_size`: Current frontier size
+    *   `crawler_active_workers`: Number of active worker tasks
+    *   `crawler_memory_usage_bytes`: RSS memory usage
+    *   `crawler_open_fds`: Open file descriptors
+    *   `crawler_db_pool_available`: Available database connections
+
+*   **Histograms (distributions):**
+    *   `crawler_fetch_duration_seconds`: URL fetch time distribution
+    *   `crawler_db_connection_acquire_seconds`: Database connection acquisition time
+    *   `crawler_db_query_duration_seconds`: Database query execution time by query type

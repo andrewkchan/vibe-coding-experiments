@@ -125,6 +125,66 @@ The project uses `pytest` for testing. To run the tests:
     pytest -v
     ```
 
+## Monitoring with Prometheus and Grafana
+
+The crawler includes built-in metrics collection using Prometheus, with visualization through Grafana dashboards.
+
+### Quick Start
+
+1. **Install Docker and Docker Compose** (if not already installed)
+
+2. **Start the monitoring stack**:
+   ```bash
+   cd crawler
+   docker-compose up -d
+   ```
+   This starts Prometheus (port 9090) and Grafana (port 3000).
+
+3. **Run the crawler** - it will automatically expose metrics on port 8001:
+   ```bash
+   python main.py --seed-file seeds.txt --email your@email.com
+   ```
+
+4. **Access Grafana**:
+   - Open http://localhost:3000 in your browser
+   - Login with username: `admin`, password: `admin`
+   - The crawler dashboard is pre-configured and will show real-time metrics
+
+### Available Metrics
+
+The crawler tracks the following metrics:
+
+- **Crawl Performance**:
+  - Pages crawled per second
+  - Total pages crawled
+  - URLs added to frontier
+  - Frontier size
+
+- **Resource Usage**:
+  - Memory usage (RSS)
+  - Open file descriptors
+  - Active worker threads
+  - Database connection pool status
+
+- **Performance Metrics**:
+  - URL fetch duration (percentiles)
+  - Database connection acquisition time
+  - Database query execution time
+
+- **Error Tracking**:
+  - Errors by type (fetch errors, HTTP errors, etc.)
+
+### Stopping the Monitoring Stack
+
+```bash
+docker-compose down
+```
+
+To also remove the stored metrics data:
+```bash
+docker-compose down -v
+```
+
 ## Progress Inspection
 
 *   **Logs:** Check console output or redirect to a file. Log level is configurable.
