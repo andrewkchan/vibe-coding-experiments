@@ -1,5 +1,5 @@
 # Improving crawler robustness and throughput
-_Exported on 6/11/2025 at 01:28:03 PDT from Cursor (1.0.0)_
+_Exported on 6/11/2025 at 22:56:04 PDT from Cursor (1.0.0)_
 
 ---
 
@@ -1413,4 +1413,83 @@ Try running the crawler with this configuration and let me know how the performa
 ```python
    shard_id = (worker_id - 1) % DOMAIN_SHARD_COUNT
 ```
+
+---
+
+**User**
+
+From EXPLAIN ANALYZE with 50 shards, it looks like it's still scanning 20k+ rows and the total execution time is around the same. 
+
+Can you try reapplying the older index but hardcode it modulo 500? I'm curious how the performance is with this hardcoded index even though the approach is not scalable with number of workers.
+
+---
+
+**Cursor**
+
+Absolutely! Let's create a hardcoded index for modulo 500 to test the performance. Even though it's not scalable, it will help us understand if a properly matching index can significantly improve the query performance.
+
+```python
+                    # Index for domain sharding - index the hash value itself, not the modulo
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain_hash ON frontier ((hashtext(domain)::BIGINT), added_timestamp) WHERE claimed_at IS NULL", query_name="create_idx_frontier_domain_hash")
+                    # Drop the old incorrect index if it exists
+                    await self.db.execute("DROP INDEX IF EXISTS idx_frontier_domain_hash_shard", query_name="drop_old_domain_hash_shard_index")
+
+->
+
+                    # Hardcoded index for modulo 500 - not scalable but let's test performance
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain_mod_500 ON frontier ((MOD(hashtext(domain)::BIGINT, 500)), added_timestamp) WHERE claimed_at IS NULL", query_name="create_idx_frontier_domain_mod_500")
+                    # Drop old indexes
+                    await self.db.execute("DROP INDEX IF EXISTS idx_frontier_domain_hash_shard", query_name="drop_old_domain_hash_shard_index")
+                    await self.db.execute("DROP INDEX IF EXISTS idx_frontier_domain_hash", query_name="drop_old_domain_hash_index")
+```
+
+Now let's update the orchestrator to use 500 shards to match the hardcoded index:
+
+```python
+# Number of domain shards - fewer shards than workers reduces scanning overhead
+# while still preventing most domain collisions
+DOMAIN_SHARD_COUNT = 50
+
+->
+
+# Number of domain shards - hardcoded to 500 to match the database index
+# This is not scalable but we're testing performance with a matching index
+DOMAIN_SHARD_COUNT = 500
+```
+
+Let's also bump the schema version:
+
+```python
+DB_SCHEMA_VERSION = 7
+
+->
+
+DB_SCHEMA_VERSION = 8
+```
+
+Perfect! I've created a hardcoded index specifically for `MOD(hashtext(domain)::BIGINT, 500)` and updated the shard count back to 500 to match.
+
+## What changed:
+
+1. **New index**: `idx_frontier_domain_mod_500` on `((MOD(hashtext(domain)::BIGINT, 500)), added_timestamp)`
+2. **Shard count**: Set back to 500 to match the index
+3. **Schema version**: Bumped to 8 to trigger index creation
+
+## Why this should help:
+
+With the hardcoded modulo 500 index, PostgreSQL should be able to use an index scan instead of a sequential scan. The query planner can now:
+
+1. Go directly to the index entries for your worker's specific shard value
+2. Read them in `added_timestamp` order
+3. Skip the 99.8% of rows that don't match your shard
+
+## Expected EXPLAIN ANALYZE improvements:
+
+- Should see "Index Scan using idx_frontier_domain_mod_500" instead of scanning the full table
+- Rows scanned should drop from 20k+ to just a few hundred (depending on how many URLs are in your shard)
+- Execution time should drop significantly
+
+This approach isn't scalable (you'd need to recreate the index if you change worker count), but it will definitively show whether a proper index can solve the performance problem.
+
+Run the crawler and check the new EXPLAIN ANALYZE output - it should look much better!
 

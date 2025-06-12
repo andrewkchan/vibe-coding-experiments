@@ -43,9 +43,9 @@ ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 
 METRICS_LOG_INTERVAL_SECONDS = 60
 
-# Number of domain shards - fewer shards than workers reduces scanning overhead
-# while still preventing most domain collisions
-DOMAIN_SHARD_COUNT = 50
+# Number of domain shards - hardcoded to 500 to match the database index
+# This is not scalable but we're testing performance with a matching index
+DOMAIN_SHARD_COUNT = 500
 
 class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
