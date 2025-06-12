@@ -242,10 +242,16 @@ class FrontierManager:
             logger.error(f"Error counting frontier: {e}")
             return 0
 
-    async def get_next_url(self) -> tuple[str, str, int, int] | None:
+    async def get_next_url(self, worker_id: int = 0, total_workers: int = 1) -> tuple[str, str, int, int] | None:
         """Gets the next URL to crawl from the frontier, respecting politeness rules.
         Uses atomic claim-and-read to minimize contention.
-        Returns a tuple of (url, domain, url_id, depth) or None.
+        
+        Args:
+            worker_id: The ID of this worker (0-based)
+            total_workers: Total number of workers
+            
+        Returns:
+            A tuple of (url, domain, url_id, depth) or None.
         """
         batch_size = 1  # Claim a small batch to amortize DB overhead
         claim_expiry_seconds = 300  # URLs claimed but not processed expire after 5 minutes
@@ -256,7 +262,7 @@ class FrontierManager:
 
         try:
             # Atomically claim a batch of URLs
-            claimed_urls = await self._atomic_claim_urls(batch_size, claim_expiry_seconds)
+            claimed_urls = await self._atomic_claim_urls(batch_size, claim_expiry_seconds, worker_id, total_workers)
             
             if not claimed_urls:
                 return None
@@ -307,55 +313,74 @@ class FrontierManager:
             logger.error(f"Error in get_next_url: {e}", exc_info=True)
             return None
 
-    async def _atomic_claim_urls(self, batch_size: int, claim_expiry_seconds: int) -> list[tuple[int, str, str, int]]:
-        """Atomically claims a batch of URLs from the frontier."""
+    async def _atomic_claim_urls(self, batch_size: int, claim_expiry_seconds: int, worker_id: int = 0, total_workers: int = 1) -> list[tuple[int, str, str, int]]:
+        """Atomically claims a batch of URLs from the frontier for a specific worker's domain shard."""
         try:
             claim_timestamp = int(time.time() * 1000) # Current time in milliseconds
+            current_time_seconds = int(time.time())
 
             if self.storage.config.db_type == "postgresql":
                 # Calculate the threshold for considering a claim expired
                 expired_claim_timestamp_threshold = claim_timestamp - (claim_expiry_seconds * 1000)
+                # Calculate when a domain is ready (70 seconds have passed since last fetch)
+                domain_ready_threshold = current_time_seconds - 70
 
-                # Try to claim unclaimed URLs first (most common case)
+                # Domain-aware claiming with domain sharding
+                # Try unclaimed URLs (both with and without domain metadata)
                 sql_query = '''
                 UPDATE frontier
                 SET claimed_at = %s
                 WHERE id = (
-                    SELECT id
-                    FROM frontier
-                    WHERE claimed_at IS NULL
-                    ORDER BY added_timestamp ASC
+                    SELECT f.id
+                    FROM frontier f
+                    LEFT JOIN domain_metadata dm ON f.domain = dm.domain
+                    WHERE f.claimed_at IS NULL
+                    AND MOD(hashtext(f.domain)::BIGINT, %s) = %s
+                    AND (
+                        dm.domain IS NULL  -- New domain (no metadata)
+                        OR dm.last_scheduled_fetch_timestamp IS NULL  -- Never fetched
+                        OR dm.last_scheduled_fetch_timestamp <= %s  -- Ready to fetch
+                    )
+                    ORDER BY f.added_timestamp ASC
                     LIMIT 1
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF f SKIP LOCKED
                 )
                 RETURNING id, url, domain, depth;
                 '''
                 
                 claimed_urls = await self.storage.db.execute_returning(
                     sql_query,
-                    (claim_timestamp,),
+                    (claim_timestamp, total_workers, worker_id, domain_ready_threshold),
                     query_name="atomic_claim_urls_pg_unclaimed"
                 )
                 
-                # If no unclaimed URLs found, try expired ones
+                # If no unclaimed URLs, try expired ones (both with and without domain metadata)
                 if not claimed_urls:
                     sql_query = '''
                     UPDATE frontier
                     SET claimed_at = %s
                     WHERE id = (
-                        SELECT id
-                        FROM frontier
-                        WHERE claimed_at IS NOT NULL AND claimed_at < %s
-                        ORDER BY added_timestamp ASC
+                        SELECT f.id
+                        FROM frontier f
+                        LEFT JOIN domain_metadata dm ON f.domain = dm.domain
+                        WHERE f.claimed_at IS NOT NULL 
+                        AND f.claimed_at < %s
+                        AND MOD(hashtext(f.domain)::BIGINT, %s) = %s
+                        AND (
+                            dm.domain IS NULL  -- New domain (no metadata)
+                            OR dm.last_scheduled_fetch_timestamp IS NULL  -- Never fetched
+                            OR dm.last_scheduled_fetch_timestamp <= %s  -- Ready to fetch
+                        )
+                        ORDER BY f.added_timestamp ASC
                         LIMIT 1
-                        FOR UPDATE SKIP LOCKED
+                        FOR UPDATE OF f SKIP LOCKED
                     )
                     RETURNING id, url, domain, depth;
                     '''
                     
                     claimed_urls = await self.storage.db.execute_returning(
                         sql_query,
-                        (claim_timestamp, expired_claim_timestamp_threshold),
+                        (claim_timestamp, expired_claim_timestamp_threshold, total_workers, worker_id, domain_ready_threshold),
                         query_name="atomic_claim_urls_pg_expired"
                     )
             else:

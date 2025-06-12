@@ -78,7 +78,7 @@ class DatabaseBackend(abc.ABC):
 class SQLiteBackend(DatabaseBackend):
     """SQLite implementation of the database backend."""
     
-    def __init__(self, db_path: str | Path, pool_size: int = 10, timeout: int = 30):
+    def __init__(self, db_path: str | Path, pool_size: int = 10, timeout: int = 60):
         self.db_path = str(db_path)
         self.pool_size = pool_size
         self.timeout = timeout
@@ -288,7 +288,7 @@ class PostgreSQLBackend(DatabaseBackend):
                 self.db_url,
                 min_size=self.min_size,
                 max_size=self.max_size,
-                timeout=30,
+                timeout=60,
                 # Configure for high concurrency
                 configure=self._configure_connection,
                 open=False  # Don't open in constructor
@@ -480,7 +480,7 @@ def create_backend(db_type: str, **kwargs) -> DatabaseBackend:
         return SQLiteBackend(
             db_path=kwargs['db_path'],
             pool_size=kwargs.get('pool_size', 10),
-            timeout=kwargs.get('timeout', 30)
+            timeout=kwargs.get('timeout', 60)
         )
     elif db_type.lower() in ('postgresql', 'postgres', 'pg'):
         return PostgreSQLBackend(

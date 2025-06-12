@@ -11,7 +11,7 @@ from .db_backends import DatabaseBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
-DB_SCHEMA_VERSION = 4
+DB_SCHEMA_VERSION = 8
 
 class StorageManager:
     def __init__(self, config: CrawlerConfig, db_backend: DatabaseBackend):
@@ -99,6 +99,13 @@ class StorageManager:
                     await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_for_expiry ON frontier (claimed_at) WHERE claimed_at IS NOT NULL", query_name="create_idx_frontier_claimed_at_expiry")
                     # New index for the implicit expiry logic (expired part of UNION ALL)
                     await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_expired_order_by_time ON frontier (added_timestamp ASC) WHERE claimed_at IS NOT NULL", query_name="create_idx_frontier_expired")
+                    # Index for domain-aware claiming to optimize JOIN with domain_metadata
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain_claimed_at ON frontier (domain, claimed_at, added_timestamp)", query_name="create_idx_frontier_domain_claimed")
+                    # Hardcoded index for modulo 500 - not scalable but let's test performance
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_domain_mod_500 ON frontier ((MOD(hashtext(domain)::BIGINT, 500)), added_timestamp) WHERE claimed_at IS NULL", query_name="create_idx_frontier_domain_mod_500")
+                    # Drop old indexes
+                    await self.db.execute("DROP INDEX IF EXISTS idx_frontier_domain_hash_shard", query_name="drop_old_domain_hash_shard_index")
+                    await self.db.execute("DROP INDEX IF EXISTS idx_frontier_domain_hash", query_name="drop_old_domain_hash_index")
                 else: # SQLite
                     await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_added_timestamp_sqlite ON frontier (claimed_at, added_timestamp)", query_name="create_idx_frontier_claimed_at_added_ts")
                     await self.db.execute("CREATE INDEX IF NOT EXISTS idx_frontier_claimed_at_sqlite ON frontier (claimed_at)", query_name="create_idx_frontier_claimed_at")
