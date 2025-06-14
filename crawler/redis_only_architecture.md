@@ -25,7 +25,9 @@ PostgreSQL is being used as a high-concurrency queue, which it's not designed fo
 4. **Arrived at hybrid solution** → Redis coordination + file storage
 
 ### The Solution: Hybrid Architecture
-- **Redis** (3GB RAM): Handles coordination, scheduling, and visited URL tracking
+- **Redis** (4.5GB RAM): Handles coordination, scheduling, and URL tracking
+  - Bloom filter for "seen" URLs (fast deduplication of 160M+ URLs)
+  - Exact storage for "visited" URLs (7.5M URLs we actually fetched)
 - **Files** (32GB disk): One append-only file per domain for URL storage
 - **Result**: Microsecond scheduling latency with unlimited frontier size
 
@@ -88,13 +90,32 @@ domains:ready → ZSET {
 }
 ```
 
-#### Visited URLs (Bloom Filter)
+#### Seen URLs (Bloom Filter for Deduplication)
 ```redis
-# Use RedisBloom for memory efficiency
-visited:bloom → BLOOM FILTER (0.1% false positive rate)
+# Use RedisBloom for fast "have we seen this URL before?" checks
+seen:bloom → BLOOM FILTER (0.1% false positive rate)
 
 # For 160M URLs at 0.1% FPR: ~2GB memory
-BF.RESERVE visited:bloom 0.001 160000000
+BF.RESERVE seen:bloom 0.001 160000000
+```
+
+#### Visited URLs (Exact Set)
+```redis
+# Exact record of URLs we've actually fetched/attempted
+# Stored as hash for metadata
+visited:{url_hash} → HASH {
+    url: "https://example.com/page",
+    status_code: 200,
+    fetched_at: 1699564800,
+    content_path: "content/a5/b7c9d2e4f6.txt",
+    error: null
+}
+
+# Also maintain a sorted set for time-based queries
+visited:by_time → ZSET {
+    "url_hash1": timestamp1,
+    "url_hash2": timestamp2
+}
 ```
 
 #### Active Domains (Set)
@@ -105,12 +126,14 @@ domains:active → SET {domain1, domain2, ...}
 
 ## Memory Usage (Revised)
 
-For 160M URLs across 1M domains:
+For 160M URLs across 1M domains, 7.5M visited:
 - Domain metadata: 1M domains × 500 bytes = 500MB
 - Domain ready queue: 1M domains × 50 bytes = 50MB
-- Visited bloom filter: 2GB (0.1% false positive rate)
+- Seen bloom filter: 2GB (0.1% false positive rate)
+- Visited URL hashes: 7.5M × 200 bytes = 1.5GB
+- Visited time index: 7.5M × 50 bytes = 375MB
 - Active domains set: ~10K domains × 50 bytes = 500KB
-- **Total Redis memory: ~3GB** (vs 32GB for full frontier)
+- **Total Redis memory: ~4.5GB** (vs 32GB for full frontier)
 
 File storage:
 - Frontier files: 160M URLs × 200 bytes = 32GB on disk
@@ -174,12 +197,14 @@ class HybridFrontierManager:
         frontier_path = self._get_frontier_path(domain)
         domain_key = f"domain:{domain}"
         
-        # Filter out visited URLs
+        # Filter out seen URLs
         new_urls = []
         for url, depth in urls:
-            # Check bloom filter
-            if not await self.redis.execute_command('BF.EXISTS', 'visited:bloom', url):
+            # Check bloom filter for fast deduplication
+            if not await self.redis.execute_command('BF.EXISTS', 'seen:bloom', url):
                 new_urls.append((url, depth))
+                # Mark as seen
+                await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
         
         if not new_urls:
             return 0
@@ -277,9 +302,31 @@ class HybridFrontierManager:
         
         return None
     
-    async def mark_visited(self, url: str):
-        """Mark URL as visited in bloom filter."""
-        await self.redis.execute_command('BF.ADD', 'visited:bloom', url)
+    async def mark_visited(self, url: str, status_code: int, 
+                          content_path: str = None, error: str = None):
+        """Mark URL as visited with metadata."""
+        url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+        timestamp = int(time.time())
+        
+        # Store visited metadata
+        await self.redis.hset(f'visited:{url_hash}', mapping={
+            'url': url,
+            'status_code': status_code,
+            'fetched_at': timestamp,
+            'content_path': content_path or '',
+            'error': error or ''
+        })
+        
+        # Add to time-based index
+        await self.redis.zadd('visited:by_time', {url_hash: timestamp})
+        
+        # Also mark in seen bloom filter (in case of direct visits)
+        await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
+    
+    async def is_visited(self, url: str) -> bool:
+        """Check if URL has been visited (exact check)."""
+        url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+        return await self.redis.exists(f'visited:{url_hash}')
 ```
 
 ### Migration from PostgreSQL
@@ -295,23 +342,74 @@ class PostgreSQLToHybridMigrator:
         """Migrate data from PostgreSQL to hybrid storage."""
         print("Starting migration...")
         
-        # 1. Create bloom filter
-        print("Creating bloom filter for visited URLs...")
+        # 1. Create bloom filter for seen URLs
+        print("Creating bloom filter for seen URLs...")
+        # Estimate: visited + frontier + some growth room
         visited_count = await self.pg.fetchval("SELECT COUNT(*) FROM visited_urls")
+        frontier_count = await self.pg.fetchval("SELECT COUNT(*) FROM frontier")
+        total_seen = visited_count + frontier_count
         await self.redis.execute_command(
-            'BF.RESERVE', 'visited:bloom', 0.001, visited_count * 2
+            'BF.RESERVE', 'seen:bloom', 0.001, int(total_seen * 1.5)
         )
         
-        # 2. Migrate visited URLs
+        # 2. Migrate visited URLs (exact records)
         print(f"Migrating {visited_count} visited URLs...")
-        async for batch in self.pg.cursor("SELECT url FROM visited_urls"):
-            pipe = self.redis.pipeline()
-            for row in batch:
-                pipe.execute_command('BF.ADD', 'visited:bloom', row['url'])
-            await pipe.execute()
+        batch_size = 10000
+        offset = 0
         
-        # 3. Migrate frontier URLs
-        print("Migrating frontier URLs...")
+        while offset < visited_count:
+            rows = await self.pg.fetch("""
+                SELECT url, url_sha256, crawled_timestamp, http_status_code,
+                       content_storage_path, redirected_to_url
+                FROM visited_urls
+                ORDER BY crawled_timestamp
+                LIMIT $1 OFFSET $2
+            """, batch_size, offset)
+            
+            pipe = self.redis.pipeline()
+            for row in rows:
+                url_hash = row['url_sha256'][:16]  # Use first 16 chars
+                
+                # Store visited metadata
+                pipe.hset(f'visited:{url_hash}', mapping={
+                    'url': row['url'],
+                    'status_code': row['http_status_code'] or 0,
+                    'fetched_at': row['crawled_timestamp'],
+                    'content_path': row['content_storage_path'] or '',
+                    'error': ''
+                })
+                
+                # Add to time index
+                pipe.zadd('visited:by_time', {url_hash: row['crawled_timestamp']})
+                
+                # Mark as seen
+                pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+            
+            await pipe.execute()
+            offset += batch_size
+            print(f"Migrated {min(offset, visited_count)}/{visited_count} visited URLs")
+        
+        # 3. Mark all frontier URLs as seen
+        print("Marking frontier URLs as seen...")
+        frontier_batch_size = 50000
+        frontier_offset = 0
+        
+        while frontier_offset < frontier_count:
+            rows = await self.pg.fetch("""
+                SELECT url FROM frontier
+                LIMIT $1 OFFSET $2
+            """, frontier_batch_size, frontier_offset)
+            
+            pipe = self.redis.pipeline()
+            for row in rows:
+                pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+            await pipe.execute()
+            
+            frontier_offset += frontier_batch_size
+            print(f"Marked {min(frontier_offset, frontier_count)}/{frontier_count} frontier URLs as seen")
+        
+        # 4. Migrate frontier URLs to files
+        print("Migrating frontier URLs to files...")
         frontier_count = await self.pg.fetchval("SELECT COUNT(*) FROM frontier")
         
         batch_size = 10000
@@ -331,7 +429,7 @@ class PostgreSQLToHybridMigrator:
             offset += batch_size
             print(f"Migrated {min(offset, frontier_count)}/{frontier_count} frontier URLs")
         
-        # 4. Migrate domain metadata
+        # 5. Migrate domain metadata
         print("Migrating domain metadata...")
         domains = await self.pg.fetch("""
             SELECT domain, robots_txt_content, robots_txt_expires_timestamp,
@@ -358,16 +456,15 @@ class PostgreSQLToHybridMigrator:
 ### Phase 1: Setup and Testing (Day 1)
 - [ ] Install Redis with RedisBloom module
 - [ ] Configure Redis persistence (AOF + RDB)
-- [ ] Write unit tests for HybridFrontierManager
-- [ ] Test file I/O performance with mock data
-- [ ] Benchmark Redis operations at scale
 
 ### Phase 2: Code Implementation (Days 2-3)
 - [ ] Implement HybridFrontierManager class
+- [ ] Write unit tests for HybridFrontierManager
 - [ ] Implement file-based frontier storage
 - [ ] Add bloom filter integration
 - [ ] Update FetcherManager to use new frontier
 - [ ] Update PolitenessEnforcer for Redis
+- [ ] Update PolitenessEnforcer unit tests
 - [ ] Implement PostgreSQL migration script
 - [ ] Add monitoring/metrics for new system
 
@@ -376,10 +473,8 @@ class PostgreSQLToHybridMigrator:
 - [ ] Calculate required disk space
 - [ ] Set up Redis with sufficient memory
 - [ ] Test migration script on small dataset
-- [ ] Plan downtime window
 
 ### Phase 4: Migration Execution (Day 5)
-- [ ] Stop crawler gracefully
 - [ ] Run migration script
 - [ ] Verify data integrity
 - [ ] Start crawler with new system

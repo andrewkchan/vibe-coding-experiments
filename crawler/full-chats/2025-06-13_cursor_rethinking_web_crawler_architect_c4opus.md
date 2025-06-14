@@ -1,5 +1,5 @@
 # Rethinking web crawler architecture
-_Exported on 6/14/2025 at 16:00:30 PDT from Cursor (1.0.0)_
+_Exported on 6/14/2025 at 16:13:34 PDT from Cursor (1.0.0)_
 
 ---
 
@@ -2333,4 +2333,372 @@ I've added an "Executive Summary for Implementation" section at the top of the d
 The summary emphasizes that this isn't just a performance optimization - it's fixing a fundamental architectural mismatch where we were using PostgreSQL as a queue for 500 concurrent workers, which is well beyond its design parameters.
 
 The implementing agent will understand both the "what" (hybrid Redis+files architecture) and the "why" (PostgreSQL contention at scale), which should help them make good decisions during implementation.
+
+---
+
+**User**
+
+Oh also reading through the plan, we want a fast "seen" check for the 160M URLs which can be probabilistic, but we also want a separate non-probabilistic set for URLs that we've actually visited, does that sound right to you? We should either do that, or change the fetched content dumping scheme to include the full URL in the filename or file metadata. I think having a separate set is better (also lets us track visited URLs that didn't successfully fetch).
+
+---
+
+**Cursor**
+
+You're absolutely right! That's a critical distinction I missed. We need:
+
+1. **"Seen" URLs** (160M+): For deduplication when adding to frontier - bloom filter is perfect
+2. **"Visited" URLs** (~7.5M): For knowing exactly what we've crawled - needs to be exact
+
+Let me update the architecture:
+
+```markdown
+#### Visited URLs (Bloom Filter)
+```redis
+# Use RedisBloom for memory efficiency
+visited:bloom → BLOOM FILTER (0.1% false positive rate)
+
+# For 160M URLs at 0.1% FPR: ~2GB memory
+BF.RESERVE visited:bloom 0.001 160000000
+```
+
+->
+
+#### Seen URLs (Bloom Filter for Deduplication)
+```redis
+# Use RedisBloom for fast "have we seen this URL before?" checks
+seen:bloom → BLOOM FILTER (0.1% false positive rate)
+
+# For 160M URLs at 0.1% FPR: ~2GB memory
+BF.RESERVE seen:bloom 0.001 160000000
+```
+
+#### Visited URLs (Exact Set)
+```redis
+# Exact record of URLs we've actually fetched/attempted
+# Stored as hash for metadata
+visited:{url_hash} → HASH {
+    url: "https://example.com/page",
+    status_code: 200,
+    fetched_at: 1699564800,
+    content_path: "content/a5/b7c9d2e4f6.txt",
+    error: null
+}
+
+# Also maintain a sorted set for time-based queries
+visited:by_time → ZSET {
+    "url_hash1": timestamp1,
+    "url_hash2": timestamp2
+}
+```
+```
+
+```markdown
+## Memory Usage (Revised)
+
+For 160M URLs across 1M domains:
+- Domain metadata: 1M domains × 500 bytes = 500MB
+- Domain ready queue: 1M domains × 50 bytes = 50MB
+- Visited bloom filter: 2GB (0.1% false positive rate)
+- Active domains set: ~10K domains × 50 bytes = 500KB
+- **Total Redis memory: ~3GB** (vs 32GB for full frontier)
+
+->
+
+## Memory Usage (Revised)
+
+For 160M URLs across 1M domains, 7.5M visited:
+- Domain metadata: 1M domains × 500 bytes = 500MB
+- Domain ready queue: 1M domains × 50 bytes = 50MB
+- Seen bloom filter: 2GB (0.1% false positive rate)
+- Visited URL hashes: 7.5M × 200 bytes = 1.5GB
+- Visited time index: 7.5M × 50 bytes = 375MB
+- Active domains set: ~10K domains × 50 bytes = 500KB
+- **Total Redis memory: ~4.5GB** (vs 32GB for full frontier)
+```
+
+```markdown
+        # Filter out visited URLs
+        new_urls = []
+        for url, depth in urls:
+            # Check bloom filter
+            if not await self.redis.execute_command('BF.EXISTS', 'visited:bloom', url):
+                new_urls.append((url, depth))
+
+->
+
+        # Filter out seen URLs
+        new_urls = []
+        for url, depth in urls:
+            # Check bloom filter for fast deduplication
+            if not await self.redis.execute_command('BF.EXISTS', 'seen:bloom', url):
+                new_urls.append((url, depth))
+                # Mark as seen
+                await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
+```
+
+```markdown
+    async def mark_visited(self, url: str):
+        """Mark URL as visited in bloom filter."""
+        await self.redis.execute_command('BF.ADD', 'visited:bloom', url)
+
+->
+
+    async def mark_visited(self, url: str, status_code: int, 
+                          content_path: str = None, error: str = None):
+        """Mark URL as visited with metadata."""
+        url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+        timestamp = int(time.time())
+        
+        # Store visited metadata
+        await self.redis.hset(f'visited:{url_hash}', mapping={
+            'url': url,
+            'status_code': status_code,
+            'fetched_at': timestamp,
+            'content_path': content_path or '',
+            'error': error or ''
+        })
+        
+        # Add to time-based index
+        await self.redis.zadd('visited:by_time', {url_hash: timestamp})
+        
+        # Also mark in seen bloom filter (in case of direct visits)
+        await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
+    
+    async def is_visited(self, url: str) -> bool:
+        """Check if URL has been visited (exact check)."""
+        url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+        return await self.redis.exists(f'visited:{url_hash}')
+```
+
+```markdown
+        # 1. Create bloom filter
+        print("Creating bloom filter for visited URLs...")
+        visited_count = await self.pg.fetchval("SELECT COUNT(*) FROM visited_urls")
+        await self.redis.execute_command(
+            'BF.RESERVE', 'visited:bloom', 0.001, visited_count * 2
+        )
+        
+        # 2. Migrate visited URLs
+        print(f"Migrating {visited_count} visited URLs...")
+        async for batch in self.pg.cursor("SELECT url FROM visited_urls"):
+            pipe = self.redis.pipeline()
+            for row in batch:
+                pipe.execute_command('BF.ADD', 'visited:bloom', row['url'])
+            await pipe.execute()
+
+->
+
+        # 1. Create bloom filter for seen URLs
+        print("Creating bloom filter for seen URLs...")
+        # Estimate: visited + frontier + some growth room
+        visited_count = await self.pg.fetchval("SELECT COUNT(*) FROM visited_urls")
+        frontier_count = await self.pg.fetchval("SELECT COUNT(*) FROM frontier")
+        total_seen = visited_count + frontier_count
+        await self.redis.execute_command(
+            'BF.RESERVE', 'seen:bloom', 0.001, int(total_seen * 1.5)
+        )
+        
+        # 2. Migrate visited URLs (exact records)
+        print(f"Migrating {visited_count} visited URLs...")
+        batch_size = 10000
+        offset = 0
+        
+        while offset < visited_count:
+            rows = await self.pg.fetch("""
+                SELECT url, url_sha256, crawled_timestamp, http_status_code,
+                       content_storage_path, redirected_to_url
+                FROM visited_urls
+                ORDER BY crawled_timestamp
+                LIMIT $1 OFFSET $2
+            """, batch_size, offset)
+            
+            pipe = self.redis.pipeline()
+            for row in rows:
+                url_hash = row['url_sha256'][:16]  # Use first 16 chars
+                
+                # Store visited metadata
+                pipe.hset(f'visited:{url_hash}', mapping={
+                    'url': row['url'],
+                    'status_code': row['http_status_code'] or 0,
+                    'fetched_at': row['crawled_timestamp'],
+                    'content_path': row['content_storage_path'] or '',
+                    'error': ''
+                })
+                
+                # Add to time index
+                pipe.zadd('visited:by_time', {url_hash: row['crawled_timestamp']})
+                
+                # Mark as seen
+                pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+            
+            await pipe.execute()
+            offset += batch_size
+            print(f"Migrated {min(offset, visited_count)}/{visited_count} visited URLs")
+```
+
+```markdown
+### The Solution: Hybrid Architecture
+- **Redis** (3GB RAM): Handles coordination, scheduling, and visited URL tracking
+- **Files** (32GB disk): One append-only file per domain for URL storage
+- **Result**: Microsecond scheduling latency with unlimited frontier size
+
+->
+
+### The Solution: Hybrid Architecture
+- **Redis** (4.5GB RAM): Handles coordination, scheduling, and URL tracking
+  - Bloom filter for "seen" URLs (fast deduplication of 160M+ URLs)
+  - Exact storage for "visited" URLs (7.5M URLs we actually fetched)
+- **Files** (32GB disk): One append-only file per domain for URL storage
+- **Result**: Microsecond scheduling latency with unlimited frontier size
+```
+
+```markdown
+            # 3. Migrate frontier URLs
+            print("Migrating frontier URLs...")
+
+->
+
+            # 3. Mark all frontier URLs as seen
+            print("Marking frontier URLs as seen...")
+            frontier_batch_size = 50000
+            frontier_offset = 0
+            
+            while frontier_offset < frontier_count:
+                rows = await self.pg.fetch("""
+                    SELECT url FROM frontier
+                    LIMIT $1 OFFSET $2
+                """, frontier_batch_size, frontier_offset)
+                
+                pipe = self.redis.pipeline()
+                for row in rows:
+                    pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+                await pipe.execute()
+                
+                frontier_offset += frontier_batch_size
+                print(f"Marked {min(frontier_offset, frontier_count)}/{frontier_count} frontier URLs as seen")
+            
+            # 4. Migrate frontier URLs to files
+            print("Migrating frontier URLs to files...")
+```
+
+```markdown
+            offset += batch_size
+            print(f"Migrated {min(offset, visited_count)}/{visited_count} visited URLs")
+        
+                    # 3. Mark all frontier URLs as seen
+            print("Marking frontier URLs as seen...")
+            frontier_batch_size = 50000
+            frontier_offset = 0
+            
+            while frontier_offset < frontier_count:
+                rows = await self.pg.fetch("""
+                    SELECT url FROM frontier
+                    LIMIT $1 OFFSET $2
+                """, frontier_batch_size, frontier_offset)
+                
+                pipe = self.redis.pipeline()
+                for row in rows:
+                    pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+                await pipe.execute()
+                
+                frontier_offset += frontier_batch_size
+                print(f"Marked {min(frontier_offset, frontier_count)}/{frontier_count} frontier URLs as seen")
+            
+            # 4. Migrate frontier URLs to files
+            print("Migrating frontier URLs to files...")
+        frontier_count = await self.pg.fetchval("SELECT COUNT(*) FROM frontier")
+
+->
+
+            offset += batch_size
+            print(f"Migrated {min(offset, visited_count)}/{visited_count} visited URLs")
+        
+        # 3. Mark all frontier URLs as seen
+        print("Marking frontier URLs as seen...")
+        frontier_batch_size = 50000
+        frontier_offset = 0
+        
+        while frontier_offset < frontier_count:
+            rows = await self.pg.fetch("""
+                SELECT url FROM frontier
+                LIMIT $1 OFFSET $2
+            """, frontier_batch_size, frontier_offset)
+            
+            pipe = self.redis.pipeline()
+            for row in rows:
+                pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+            await pipe.execute()
+            
+            frontier_offset += frontier_batch_size
+            print(f"Marked {min(frontier_offset, frontier_count)}/{frontier_count} frontier URLs as seen")
+        
+        # 4. Migrate frontier URLs to files
+        print("Migrating frontier URLs to files...")
+        frontier_count = await self.pg.fetchval("SELECT COUNT(*) FROM frontier")
+```
+
+```markdown
+// ... existing code ...
+            offset += batch_size
+            print(f"Migrated {min(offset, frontier_count)}/{frontier_count} frontier URLs")
+        
+        # 5. Migrate domain metadata
+        print("Migrating domain metadata...")
+        domains = await self.pg.fetch("""
+            SELECT domain, robots_txt_content, robots_txt_expires_timestamp,
+                   is_manually_excluded, last_scheduled_fetch_timestamp
+            FROM domain_metadata
+        """)
+// ... existing code ...
+```
+
+---
+
+**User**
+
+continue
+
+---
+
+**Cursor**
+
+Perfect! To summarize the key distinction for the implementing agent:
+
+## Critical Design Decision: Seen vs Visited URLs
+
+### Two Separate Data Structures Needed
+
+1. **"Seen" URLs (Bloom Filter)**
+   - Purpose: Fast deduplication when adding URLs to frontier
+   - Size: 160M+ URLs (all URLs ever encountered)
+   - Storage: `seen:bloom` - probabilistic bloom filter (2GB)
+   - Used when: Checking if we should add a URL to the frontier
+   - Includes: All visited URLs + all frontier URLs + any duplicates we've filtered
+
+2. **"Visited" URLs (Exact Storage)**
+   - Purpose: Know exactly what we've crawled, including failures
+   - Size: ~7.5M URLs (only URLs we actually fetched)
+   - Storage: `visited:{url_hash}` - Redis hashes with metadata
+   - Used when: 
+     - Generating reports
+     - Resuming crawls
+     - Mapping URLs to downloaded content
+   - Tracks: Status codes, fetch timestamps, content paths, errors
+
+### Why This Matters
+
+- **Without exact visited tracking**: Can't map URLs to their downloaded content files
+- **Without bloom filter**: Would need 32GB+ RAM to track all seen URLs exactly
+- **Benefit**: Can track failed fetches (404s, timeouts) in visited set
+- **Trade-off**: Accept 0.1% false positive rate on deduplication to save 30GB RAM
+
+### Implementation Note
+
+The current PostgreSQL schema already maintains this distinction:
+- `visited_urls` table = exact records (becomes Redis `visited:*`)
+- `seen_urls` in-memory set = deduplication (becomes `seen:bloom`)
+
+The migration preserves this separation, ensuring we don't lose the ability to map URLs to their content files or track failed fetches.
+
+This design gives us the best of both worlds: memory-efficient deduplication with exact crawl history tracking.
 
