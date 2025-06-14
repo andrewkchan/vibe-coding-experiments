@@ -19,22 +19,86 @@ class FrontierManager:
         self.seen_urls: Set[str] = set()  # In-memory set for quick checks during a session
 
     async def _populate_seen_urls_from_db(self) -> Set[str]:
-        """Loads all URLs from visited_urls and frontier tables."""
+        """Loads all URLs from visited_urls and frontier tables in chunks to avoid OOM."""
         seen = set()
+        chunk_size = 500000  # Load 500k URLs at a time
+        
         try:
-            # Load from visited_urls
-            rows = await self.storage.db.fetch_all("SELECT url FROM visited_urls", query_name="populate_seen_from_visited")
-            for row in rows:
-                seen.add(row[0])
+            # Load from visited_urls in chunks
+            offset = 0
+            visited_count = 0
+            while True:
+                if self.storage.config.db_type == "postgresql":
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM visited_urls ORDER BY url_sha256 LIMIT %s OFFSET %s",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_visited_chunked"
+                    )
+                else:  # SQLite
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM visited_urls ORDER BY url_sha256 LIMIT ? OFFSET ?",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_visited_chunked"
+                    )
+                
+                if not rows:
+                    break
+                    
+                for row in rows:
+                    seen.add(row[0])
+                
+                visited_count += len(rows)
+                offset += chunk_size
+                
+                if len(rows) < chunk_size:
+                    break
+                    
+                # Log progress for large datasets
+                if visited_count % 1_000_000 == 0:
+                    logger.info(f"Progress: Loaded {visited_count} URLs from visited_urls...")
             
-            # Load from current frontier (in case of resume)
-            rows = await self.storage.db.fetch_all("SELECT url FROM frontier", query_name="populate_seen_from_frontier")
-            for row in rows:
-                seen.add(row[0])
+            logger.info(f"Loaded {visited_count} URLs from visited_urls table")
             
-            logger.info(f"Loaded {len(seen)} URLs for seen_urls set.")
+            # Load from current frontier in chunks (in case of resume)
+            offset = 0
+            frontier_count = 0
+            while True:
+                if self.storage.config.db_type == "postgresql":
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM frontier ORDER BY id LIMIT %s OFFSET %s",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_frontier_chunked"
+                    )
+                else:  # SQLite
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM frontier ORDER BY id LIMIT ? OFFSET ?",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_frontier_chunked"
+                    )
+                
+                if not rows:
+                    break
+                    
+                for row in rows:
+                    seen.add(row[0])
+                
+                frontier_count += len(rows)
+                offset += chunk_size
+                
+                if len(rows) < chunk_size:
+                    break
+                    
+                # Log progress for large datasets
+                if frontier_count % 1_000_000 == 0:
+                    logger.info(f"Progress: Loaded {frontier_count} URLs from frontier...")
+            
+            logger.info(f"Loaded {frontier_count} URLs from frontier table")
+            logger.info(f"Total: Loaded {len(seen)} unique URLs for seen_urls set")
+            
         except Exception as e:
-            logger.error(f"Error loading for seen_urls set: {e}")
+            logger.error(f"Error loading seen_urls set: {e}")
+            raise  # Re-raise to handle the error at a higher level
+        
         return seen
 
     async def initialize_frontier(self):
