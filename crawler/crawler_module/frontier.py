@@ -21,7 +21,7 @@ class FrontierManager:
     async def _populate_seen_urls_from_db(self) -> Set[str]:
         """Loads all URLs from visited_urls and frontier tables in chunks to avoid OOM."""
         seen = set()
-        chunk_size = 500000  # Load 500k URLs at a time
+        chunk_size = 1_000_000
         
         try:
             # Load from visited_urls in chunks
