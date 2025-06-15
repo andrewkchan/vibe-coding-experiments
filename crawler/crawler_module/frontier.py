@@ -840,21 +840,17 @@ class HybridFrontierManager:
         Returns None if no URLs are available OR if politeness rules prevent fetching.
         The caller is responsible for retrying.
         """
-        # Try to atomically claim domains from the queue
-        max_attempts = 100  # Limit attempts to avoid infinite loop
+        # Atomically pop a domain from the front of the queue
+        domain = await self.redis.lpop('domains:queue')  # type: ignore[misc]
         
-        for _ in range(max_attempts):
-            # Atomically pop a domain from the front of the queue
-            domain = await self.redis.lpop('domains:queue')  # type: ignore[misc]
-            
-            if not domain:
-                return None  # Queue is empty
-                
+        if not domain:
+            return None  # Queue is empty
+        
+        try:
             # Check if we can fetch from this domain now
             # This is where PolitenessEnforcer decides based on its rules
             if not await self.politeness.can_fetch_domain_now(domain):
-                # Domain not ready, put it back at the end of the queue
-                await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
+                # Domain not ready
                 return None
                 
             # Get URL from this domain
@@ -867,23 +863,18 @@ class HybridFrontierManager:
                 if not await self.politeness.is_url_allowed(url):
                     logger.debug(f"URL {url} disallowed by politeness rules")
                     self.seen_urls.add(url)
-                    # Put domain back and try next one
-                    await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
-                    continue
+                    # Put domain back, caller decides whether to retry
+                    return None
                     
                 # Record the fetch attempt in PolitenessEnforcer
                 await self.politeness.record_domain_fetch_attempt(domain)
                 
-                # Put domain back at the end of the queue for future URLs
-                await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
-                
                 # Return URL with a dummy ID (for interface compatibility)
                 return (url, domain, -1, depth)
-            else:
-                # No more URLs for this domain, don't put it back
-                logger.debug(f"Domain {domain} has no more URLs, removing from queue")
-                
-        # Tried many domains but none were ready or had valid URLs
+        finally:
+            # Domain always goes back to the end of the queue, regardless of success or failure
+            await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
+        
         return None
     
     async def _get_url_from_domain(self, domain: str) -> Optional[Tuple[str, str, int]]:
