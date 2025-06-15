@@ -456,3 +456,81 @@ async def test_atomic_domain_claiming_high_concurrency(
     """)
     
     logger.info("Atomic domain claiming test passed.")
+
+@pytest.mark.asyncio
+async def test_frontier_resume_with_politeness(
+    temp_test_frontier_dir: Path,
+    frontier_test_config_obj: FrontierTestConfig,
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    redis_client: redis.Redis
+):
+    """Test that frontier state persists correctly when resuming a crawl."""
+    logger.info("Testing Frontier Resume Functionality with Politeness Mocks")
+    
+    # Permissive politeness for all operations in this test
+    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
+    mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
+    
+    # --- First run: populate and get one URL ---
+    cfg_run1_dict = vars(frontier_test_config_obj).copy()
+    cfg_run1_dict['resume'] = False  # Ensure it's a new run
+    cfg_run1 = CrawlerConfig(**cfg_run1_dict)
+    
+    frontier_run1 = HybridFrontierManager(
+        config=cfg_run1,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_client
+    )
+    
+    await frontier_run1.initialize_frontier()
+    # Seeds will be loaded: http://example.com/seed1, http://example.org/seed2
+    
+    # Add one more URL
+    await frontier_run1.add_urls_batch(["http://persistent.com/page_from_run1"])
+    assert await frontier_run1.count_frontier() == 3
+    
+    # Get one URL (should be from first domain in queue)
+    url_to_retrieve = await frontier_run1.get_next_url()
+    assert url_to_retrieve is not None
+    assert await frontier_run1.count_frontier() == 2
+    
+    # Note which URL was retrieved
+    retrieved_url = url_to_retrieve[0]
+    logger.info(f"First run retrieved URL: {retrieved_url}")
+    
+    # --- Second run: resume ---
+    cfg_run2_dict = vars(frontier_test_config_obj).copy()
+    cfg_run2_dict['resume'] = True
+    cfg_run2 = CrawlerConfig(**cfg_run2_dict)
+    
+    frontier_run2 = HybridFrontierManager(
+        config=cfg_run2,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_client
+    )
+    
+    # Initialize with resume=True - should preserve existing frontier
+    await frontier_run2.initialize_frontier()
+    
+    # Should still have 2 URLs
+    assert await frontier_run2.count_frontier() == 2
+    
+    # Get the remaining URLs
+    remaining_urls = []
+    next_url = await frontier_run2.get_next_url()
+    assert next_url is not None
+    remaining_urls.append(next_url[0])
+    
+    next_url = await frontier_run2.get_next_url()
+    assert next_url is not None
+    remaining_urls.append(next_url[0])
+    
+    # Verify we got the expected URLs (the two that weren't retrieved in run1)
+    all_urls = {"http://example.com/seed1", "http://example.org/seed2", "http://persistent.com/page_from_run1"}
+    expected_remaining = all_urls - {retrieved_url}
+    assert set(remaining_urls) == expected_remaining
+    
+    # Frontier should be empty now
+    assert await frontier_run2.count_frontier() == 0
+    
+    logger.info("Frontier resume test passed with politeness mocks.")
