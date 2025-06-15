@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from unittest.mock import MagicMock, AsyncMock
 import redis.asyncio as redis
+from collections import defaultdict
+from typing import List, Dict
 
 from crawler_module.frontier import HybridFrontierManager
 from crawler_module.config import CrawlerConfig
@@ -272,18 +274,19 @@ async def test_domain_ready_queue(
     ]
     await hybrid_frontier_manager.add_urls_batch(urls)
     
-    # Check domains in ready queue
-    ready_domains = await redis_client.zrange('domains:ready', 0, -1)
-    assert set(ready_domains) == {"domain1.com", "domain2.com"}
+    # Check domains in queue
+    queued_domains = await redis_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
+    # Convert to set to ignore order and potential duplicates
+    assert set(queued_domains) == {"domain1.com", "domain2.com"}
     
-    # Get a URL from domain1
+    # Get a URL from a domain
     result = await hybrid_frontier_manager.get_next_url()
     assert result is not None
     url, domain, _, _ = result
     
-    # After fetching, domain should have updated ready time
-    domain1_score = await redis_client.zscore('domains:ready', domain)
-    assert domain1_score > time.time()  # Should be scheduled for future
+    # After fetching, domain should still be in the queue (at the end)
+    updated_queue = await redis_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
+    assert domain in updated_queue  # Domain should still be there
     
     logger.info("Domain ready queue test passed.")
 
@@ -305,4 +308,155 @@ async def test_frontier_error_handling(
     added = await hybrid_frontier_manager.add_urls_batch(weird_urls)
     # Should handle gracefully, likely 0 added due to domain extraction failure
     
-    logger.info("Frontier error handling test passed.") 
+    logger.info("Frontier error handling test passed.")
+
+@pytest.mark.asyncio
+async def test_atomic_domain_claiming_high_concurrency(
+    temp_test_frontier_dir: Path,
+    frontier_test_config_obj: FrontierTestConfig,
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    redis_client: redis.Redis
+):
+    """Test that URLs are claimed exactly once under high concurrency.
+    
+    This verifies that our Redis-based atomic domain claiming mechanism
+    prevents race conditions when multiple workers compete for URLs.
+    """
+    logger.info("Testing atomic domain claiming under high concurrency")
+    
+    # Setup
+    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
+    mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
+    
+    # Create config for this test
+    config = CrawlerConfig(**vars(frontier_test_config_obj))
+    
+    # Prepare test URLs across multiple domains
+    # With domain-level politeness, each domain can only serve one URL at a time
+    # So we need many domains with few URLs each for concurrent testing
+    num_domains = 100
+    urls_per_domain = 2
+    test_urls = []
+    
+    for domain_idx in range(num_domains):
+        domain = f"test{domain_idx}.com"
+        for url_idx in range(urls_per_domain):
+            test_urls.append(f"http://{domain}/page{url_idx}")
+    
+    total_urls = len(test_urls)
+    logger.info(f"Created {total_urls} test URLs across {num_domains} domains")
+    
+    # Create a single frontier manager to populate the data
+    seed_frontier = HybridFrontierManager(
+        config=config,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_client
+    )
+    
+    # Initialize but clear any existing data to start fresh
+    await seed_frontier._clear_frontier()
+    added = await seed_frontier.add_urls_batch(test_urls)
+    assert added == total_urls, f"Failed to add all test URLs: {added}/{total_urls}"
+    
+    # Create multiple frontier managers (simulating workers)
+    num_workers = 50
+    workers = []
+    for i in range(num_workers):
+        fm = HybridFrontierManager(
+            config=config,
+            politeness=mock_politeness_enforcer_for_frontier,
+            redis_client=redis_client
+        )
+        # Don't initialize frontier for workers - they share the same data
+        workers.append((i, fm))
+    
+    # Track claims by worker
+    claims_by_worker: Dict[int, List[str]] = defaultdict(list)
+    all_claimed_urls: List[str] = []
+    
+    async def worker_task(worker_id: int, frontier: HybridFrontierManager, max_claims: int):
+        """Simulates a worker claiming and processing URLs."""
+        local_claims = []
+        for _ in range(max_claims):
+            result = await frontier.get_next_url(worker_id=worker_id, total_workers=num_workers)
+            
+            if result:
+                url, domain, url_id, depth = result
+                local_claims.append(url)
+                # Simulate minimal processing time
+                await asyncio.sleep(0.001)
+            else:
+                # No more URLs available
+                break
+        
+        return worker_id, local_claims
+    
+    # Run all workers concurrently
+    start_time = time.time()
+    tasks = [
+        worker_task(worker_id, frontier, 10)  # Each worker tries to claim up to 10 URLs
+        for worker_id, frontier in workers
+    ]
+    
+    results = await asyncio.gather(*tasks)
+    total_time = time.time() - start_time
+    
+    # Process results
+    for worker_id, claims in results:
+        claims_by_worker[worker_id] = claims
+        all_claimed_urls.extend(claims)
+    
+    # Assertions
+    
+    # 1. No URL should be claimed by multiple workers
+    unique_urls = set(all_claimed_urls)
+    duplicates = len(all_claimed_urls) - len(unique_urls)
+    assert duplicates == 0, \
+        f"Race condition detected! {duplicates} URLs were claimed multiple times"
+    
+    # 2. Total claims should not exceed available URLs
+    assert len(all_claimed_urls) <= total_urls, \
+        f"Claimed {len(all_claimed_urls)} URLs but only {total_urls} were available"
+    
+    # 3. With domain-level politeness, we expect to get at least one URL per domain
+    # in the first pass (workers can't get multiple URLs from same domain due to 70s delay)
+    min_expected = min(num_domains, total_urls)  # At least one per domain
+    assert len(all_claimed_urls) >= min_expected, \
+        f"Only {len(all_claimed_urls)} URLs claimed, expected at least {min_expected} (one per domain)"
+    
+    # 4. Verify work distribution
+    claims_per_worker = [len(claims) for claims in claims_by_worker.values() if claims]
+    workers_with_claims = len(claims_per_worker)
+    
+    if claims_per_worker:
+        min_claims = min(claims_per_worker)
+        max_claims = max(claims_per_worker)
+        avg_claims = sum(claims_per_worker) / len(claims_per_worker)
+        
+        logger.info(f"Work distribution: min={min_claims}, max={max_claims}, avg={avg_claims:.1f}")
+        logger.info(f"Workers that got URLs: {workers_with_claims}/{num_workers}")
+    
+    # 5. Verify remaining URLs in frontier (should be roughly one per domain due to politeness)
+    remaining_count = await seed_frontier.count_frontier()
+    # We expect approximately (urls_per_domain - 1) * num_domains URLs remaining
+    expected_remaining = (urls_per_domain - 1) * num_domains
+    assert remaining_count <= expected_remaining, \
+        f"Frontier has {remaining_count} URLs, expected at most {expected_remaining}"
+    
+    # 6. Verify no domains are stuck in active state
+    active_domains = await redis_client.smembers('domains:active')  # type: ignore
+    assert len(active_domains) == 0, f"Domains still marked as active: {active_domains}"
+    
+    logger.info(f"""
+    Redis Atomic Claim Test Results:
+    - Total URLs: {total_urls}
+    - Workers: {num_workers}
+    - Workers that claimed URLs: {workers_with_claims}
+    - Total claimed: {len(all_claimed_urls)}
+    - Unique claims: {len(unique_urls)}
+    - Total time: {total_time:.2f}s
+    - URLs/second: {len(all_claimed_urls) / total_time:.0f}
+    - No race conditions detected ✓
+    """)
+    
+    logger.info("Atomic domain claiming test passed.")

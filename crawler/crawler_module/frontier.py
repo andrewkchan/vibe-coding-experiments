@@ -613,8 +613,7 @@ class HybridFrontierManager:
             if cursor == 0:
                 break
         
-        pipe.delete('domains:ready')
-        pipe.delete('domains:active')
+        pipe.delete('domains:queue')
         await pipe.execute()
         
         # Clear frontier files
@@ -762,11 +761,19 @@ class HybridFrontierManager:
             pipe = self.redis.pipeline()
             
             # Get current size
-            current_size = await self.redis.hget(domain_key, 'frontier_size')
+            current_size_result = self.redis.hget(domain_key, 'frontier_size')
+            if asyncio.iscoroutine(current_size_result):
+                current_size = await current_size_result
+            else:
+                current_size = current_size_result
             new_size = int(current_size or 0) + len(new_urls)
             
             # Get is_seeded status
-            is_seeded = await self.redis.hget(domain_key, 'is_seeded')
+            is_seeded_result = self.redis.hget(domain_key, 'is_seeded')
+            if asyncio.iscoroutine(is_seeded_result):
+                is_seeded = await is_seeded_result
+            else:
+                is_seeded = is_seeded_result
             
             # Update metadata
             pipe.hset(domain_key, mapping={
@@ -778,8 +785,9 @@ class HybridFrontierManager:
             # Initialize offset if needed
             pipe.hsetnx(domain_key, 'frontier_offset', '0')
             
-            # Add to ready queue with current time (domain is immediately available)
-            pipe.zadd('domains:ready', {domain: current_time}, nx=True)
+            # Add domain to queue
+            # Note: This might add duplicates, but we handle that when popping
+            pipe.rpush('domains:queue', domain)
             
             await pipe.execute()
             
@@ -787,8 +795,8 @@ class HybridFrontierManager:
     
     async def is_empty(self) -> bool:
         """Check if frontier is empty."""
-        # Check if there are any domains in the ready queue
-        count = await self.redis.zcard('domains:ready')
+        # Check if there are any domains in the queue
+        count = await self.redis.llen('domains:queue')  # type: ignore[misc]
         return count == 0
     
     async def count_frontier(self) -> int:
@@ -827,77 +835,55 @@ class HybridFrontierManager:
         return total
     
     async def get_next_url(self, worker_id: int = 0, total_workers: int = 1) -> Optional[Tuple[str, str, int, int]]:
-        """Get next URL to crawl."""
-        max_retries = 10
-        retry_count = 0
+        """Get next URL to crawl.
         
-        while retry_count < max_retries:
-            retry_count += 1
+        Returns None if no URLs are available OR if politeness rules prevent fetching.
+        The caller is responsible for retrying.
+        """
+        # Try to atomically claim domains from the queue
+        max_attempts = 100  # Limit attempts to avoid infinite loop
+        
+        for _ in range(max_attempts):
+            # Atomically pop a domain from the front of the queue
+            domain = await self.redis.lpop('domains:queue')  # type: ignore[misc]
             
-            # Get domains that are ready to be crawled
-            current_time = time.time()
-            ready_domains = await self.redis.zrangebyscore(
-                'domains:ready', 0, current_time, start=0, num=100
-            )
-            
-            if not ready_domains:
+            if not domain:
+                return None  # Queue is empty
+                
+            # Check if we can fetch from this domain now
+            # This is where PolitenessEnforcer decides based on its rules
+            if not await self.politeness.can_fetch_domain_now(domain):
+                # Domain not ready, put it back at the end of the queue
+                await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
                 return None
                 
-            # Try to claim a domain
-            for domain in ready_domains:
-                # Check if domain is already being processed
-                is_active = await self.redis.sismember('domains:active', domain)
-                if is_active:
-                    continue
-                    
-                # Try to atomically claim the domain
-                added = await self.redis.sadd('domains:active', domain)
-                if added == 0:  # Another worker claimed it
-                    continue
-                    
-                try:
-                    # Get URL from this domain
-                    url_data = await self._get_url_from_domain(domain)
-                    
-                    if url_data:
-                        url, extracted_domain, depth = url_data
-                        
-                        # Double-check politeness rules
-                        if not await self.politeness.is_url_allowed(url):
-                            logger.debug(f"URL {url} disallowed by politeness rules")
-                            self.seen_urls.add(url)
-                            continue
-                            
-                        # Check if we can fetch from this domain now
-                        if await self.politeness.can_fetch_domain_now(domain):
-                            await self.politeness.record_domain_fetch_attempt(domain)
-                            
-                            # Update domain's next fetch time (70 seconds from now)
-                            next_fetch_time = current_time + 70
-                            await self.redis.zadd('domains:ready', {domain: next_fetch_time}, xx=True)
-                            
-                            # Remove from active set
-                            await self.redis.srem('domains:active', domain)
-                            
-                            # Return URL with a dummy ID (for interface compatibility)
-                            return (url, domain, -1, depth)
-                        else:
-                            # Domain not ready yet, update ready time
-                            # This shouldn't happen if politeness is working correctly
-                            logger.warning(f"Domain {domain} in ready queue but not ready per politeness")
-                            next_fetch_time = current_time + 70
-                            await self.redis.zadd('domains:ready', {domain: next_fetch_time}, xx=True)
-                    else:
-                        # No more URLs for this domain, remove from ready queue
-                        await self.redis.zrem('domains:ready', domain)
-                        
-                finally:
-                    # Always remove from active set
-                    await self.redis.srem('domains:active', domain)
-                    
-            # Small delay before retry
-            await asyncio.sleep(0.1)
+            # Get URL from this domain
+            url_data = await self._get_url_from_domain(domain)
             
+            if url_data:
+                url, extracted_domain, depth = url_data
+                
+                # Double-check URL-level politeness rules
+                if not await self.politeness.is_url_allowed(url):
+                    logger.debug(f"URL {url} disallowed by politeness rules")
+                    self.seen_urls.add(url)
+                    # Put domain back and try next one
+                    await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
+                    continue
+                    
+                # Record the fetch attempt in PolitenessEnforcer
+                await self.politeness.record_domain_fetch_attempt(domain)
+                
+                # Put domain back at the end of the queue for future URLs
+                await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
+                
+                # Return URL with a dummy ID (for interface compatibility)
+                return (url, domain, -1, depth)
+            else:
+                # No more URLs for this domain, don't put it back
+                logger.debug(f"Domain {domain} has no more URLs, removing from queue")
+                
+        # Tried many domains but none were ready or had valid URLs
         return None
     
     async def _get_url_from_domain(self, domain: str) -> Optional[Tuple[str, str, int]]:
@@ -905,7 +891,7 @@ class HybridFrontierManager:
         domain_key = f"domain:{domain}"
         
         # Get file info from Redis
-        file_info = await self.redis.hmget(
+        file_info = await self.redis.hmget(  # type: ignore[misc]
             domain_key, 
             ['file_path', 'frontier_offset', 'frontier_size']
         )
@@ -933,7 +919,7 @@ class HybridFrontierManager:
                     if line:
                         # Update offset
                         new_offset = offset + 1
-                        await self.redis.hset(domain_key, 'frontier_offset', new_offset)
+                        await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
                         
                         # Parse URL data
                         parts = line.split('|')
