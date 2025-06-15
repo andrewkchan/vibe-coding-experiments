@@ -272,29 +272,25 @@ class PostgreSQLToHybridMigrator:
 - [X] Write unit tests for HybridFrontierManager
 - [X] Implement file-based frontier storage
 - [X] Add bloom filter integration
-- [ ] Update FetcherManager to use new frontier
 - [ ] Update PolitenessEnforcer for Redis
 - [ ] Update PolitenessEnforcer unit tests
+- [ ] Update StorageManager (add_visited_page) for Redis
+- [ ] Update StorageManager unit tests
+- [ ] Update CrawlerOrchestrator to use new frontier and politeness
 - [ ] Implement PostgreSQL migration script
 - [ ] Add monitoring/metrics for new system
 
 ### Phase 3: Migration Preparation (Day 4)
 - [ ] Backup PostgreSQL database
-- [ ] Calculate required disk space
-- [ ] Set up Redis with sufficient memory
-- [ ] Test migration script on small dataset
-
-### Phase 4: Migration Execution (Day 5)
 - [ ] Run migration script
 - [ ] Verify data integrity
 - [ ] Start crawler with new system
 - [ ] Monitor performance
 
-### Phase 5: Optimization (Day 6+)
+### Phase 5: Optimization (Day 5+)
 - [ ] Tune Redis configuration
 - [ ] Optimize file I/O (buffering, async)
-- [ ] Add frontier compaction (remove consumed URLs)
-- [ ] Implement frontier file rotation
+- [ ] Add frontier compaction/rotation (remove consumed URLs)
 - [ ] Add S3 backup for frontier files
 
 ## Performance Expectations
