@@ -47,7 +47,7 @@ async def redis_client():
     
     # Cleanup after test
     await client.flushdb()
-    await client.close()
+    await client.aclose()
 
 @pytest_asyncio.fixture
 async def temp_test_frontier_dir(tmp_path: Path) -> Path:
