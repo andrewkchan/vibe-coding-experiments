@@ -62,8 +62,8 @@ def extract_domain(url: str) -> str | None:
             url_to_extract = "http://" + url_to_extract
             
         extracted = tldextract.extract(url_to_extract)
-        if extracted.registered_domain:
-            return extracted.registered_domain
+        if extracted.top_domain_under_public_suffix:
+            return extracted.top_domain_under_public_suffix
         return None
     except Exception:
         # tldextract can sometimes fail on very malformed inputs
