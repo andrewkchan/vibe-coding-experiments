@@ -419,7 +419,7 @@ async def test_atomic_domain_claiming_high_concurrency(
         f"Claimed {len(all_claimed_urls)} URLs but only {total_urls} were available"
     
     # 3. With domain-level politeness, we expect to get at least one URL per domain
-    # in the first pass (workers can't get multiple URLs from same domain due to 70s delay)
+    # in the first pass
     min_expected = min(num_domains, total_urls)  # At least one per domain
     assert len(all_claimed_urls) >= min_expected, \
         f"Only {len(all_claimed_urls)} URLs claimed, expected at least {min_expected} (one per domain)"
@@ -442,10 +442,6 @@ async def test_atomic_domain_claiming_high_concurrency(
     expected_remaining = (urls_per_domain - 1) * num_domains
     assert remaining_count <= expected_remaining, \
         f"Frontier has {remaining_count} URLs, expected at most {expected_remaining}"
-    
-    # 6. Verify no domains are stuck in active state
-    active_domains = await redis_client.smembers('domains:active')  # type: ignore
-    assert len(active_domains) == 0, f"Domains still marked as active: {active_domains}"
     
     logger.info(f"""
     Redis Atomic Claim Test Results:

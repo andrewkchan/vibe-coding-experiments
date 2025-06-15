@@ -81,11 +81,11 @@ domain:{domain} → HASH {
 }
 ```
 
-#### Domain Ready Queue (Sorted Set)
+#### Domain Queue (Redis list)
 ```redis
-domains:ready → ZSET {
-    "example.com": 1699564800,    # domain: next_fetch_timestamp
-    "site.org": 1699564870,
+domains:queue → LIST {
+    "example.com",
+    "site.org",
     ...
 }
 ```
@@ -118,12 +118,6 @@ visited:by_time → ZSET {
 }
 ```
 
-#### Active Domains (Set)
-```redis
-# Domains currently being processed by workers
-domains:active → SET {domain1, domain2, ...}
-```
-
 ## Memory Usage (Revised)
 
 For 160M URLs across 1M domains, 7.5M visited:
@@ -142,192 +136,8 @@ File storage:
 ## Implementation
 
 ### Frontier Manager
-```python
-import os
-import redis
-import aiofiles
-from pathlib import Path
-from typing import Optional, Tuple, List
-import hashlib
-import asyncio
 
-class HybridFrontierManager:
-    def __init__(self, redis_client: redis.Redis, data_dir: Path):
-        self.redis = redis_client
-        self.frontier_dir = data_dir / "frontiers"
-        self.frontier_dir.mkdir(exist_ok=True)
-        self.write_locks = {}  # Per-domain write locks
-        
-    def _get_frontier_path(self, domain: str) -> Path:
-        """Get file path for domain's frontier."""
-        # Use first 2 chars of hash for subdirectory (256 subdirs)
-        domain_hash = hashlib.md5(domain.encode()).hexdigest()
-        subdir = domain_hash[:2]
-        path = self.frontier_dir / subdir / f"{domain}.frontier"
-        path.parent.mkdir(exist_ok=True)
-        return path
-    
-    async def add_urls_batch(self, urls: List[Tuple[str, str, int]], batch_id: str = None) -> int:
-        """Add URLs to frontier files."""
-        # Group URLs by domain
-        urls_by_domain = {}
-        for url, domain, depth in urls:
-            if domain not in urls_by_domain:
-                urls_by_domain[domain] = []
-            urls_by_domain[domain].append((url, depth))
-        
-        added_total = 0
-        pipe = self.redis.pipeline()
-        
-        for domain, domain_urls in urls_by_domain.items():
-            # Get or create write lock for this domain
-            if domain not in self.write_locks:
-                self.write_locks[domain] = asyncio.Lock()
-            
-            async with self.write_locks[domain]:
-                added = await self._add_urls_to_domain(domain, domain_urls, pipe)
-                added_total += added
-        
-        # Execute Redis updates
-        await pipe.execute()
-        return added_total
-    
-    async def _add_urls_to_domain(self, domain: str, urls: List[Tuple[str, int]], pipe) -> int:
-        """Add URLs to a specific domain's frontier file."""
-        frontier_path = self._get_frontier_path(domain)
-        domain_key = f"domain:{domain}"
-        
-        # Filter out seen URLs
-        new_urls = []
-        for url, depth in urls:
-            # Check bloom filter for fast deduplication
-            if not await self.redis.execute_command('BF.EXISTS', 'seen:bloom', url):
-                new_urls.append((url, depth))
-                # Mark as seen
-                await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
-        
-        if not new_urls:
-            return 0
-        
-        # Append to frontier file
-        async with aiofiles.open(frontier_path, 'a') as f:
-            for url, depth in new_urls:
-                line = f"{url}|{depth}|1.0|{int(time.time())}\n"
-                await f.write(line)
-        
-        # Update Redis metadata
-        current_size = pipe.hget(domain_key, 'frontier_size') or 0
-        new_size = int(current_size) + len(new_urls)
-        
-        pipe.hset(domain_key, mapping={
-            'frontier_size': new_size,
-            'file_path': str(frontier_path.relative_to(self.frontier_dir))
-        })
-        
-        # Initialize offset if needed
-        pipe.hsetnx(domain_key, 'frontier_offset', 0)
-        
-        # Add to ready queue if not present
-        pipe.zadd('domains:ready', {domain: time.time()}, nx=True)
-        
-        return len(new_urls)
-    
-    async def get_next_url(self, worker_id: int) -> Optional[Tuple[str, str, int]]:
-        """Get next URL to crawl."""
-        while True:
-            # Get ready domains
-            current_time = time.time()
-            ready_domains = await self.redis.zrangebyscore(
-                'domains:ready', 0, current_time, start=0, num=100
-            )
-            
-            if not ready_domains:
-                return None
-            
-            # Try to claim a domain
-            for domain in ready_domains:
-                # Atomic check-and-set to claim domain
-                if await self.redis.sadd('domains:active', domain):
-                    # Successfully claimed domain
-                    url_data = await self._get_url_from_domain(domain)
-                    
-                    if url_data:
-                        # Update domain's next fetch time
-                        await self.redis.zadd('domains:ready', 
-                                            {domain: current_time + 70})
-                        # Remove from active set
-                        await self.redis.srem('domains:active', domain)
-                        return url_data
-                    else:
-                        # No URLs left for this domain
-                        await self.redis.zrem('domains:ready', domain)
-                        await self.redis.srem('domains:active', domain)
-            
-            # All domains were claimed by other workers
-            await asyncio.sleep(0.1)
-    
-    async def _get_url_from_domain(self, domain: str) -> Optional[Tuple[str, str, int]]:
-        """Read next URL from domain's frontier file."""
-        domain_key = f"domain:{domain}"
-        
-        # Get file info from Redis
-        file_info = await self.redis.hmget(domain_key, 
-                                         ['file_path', 'frontier_offset', 'frontier_size'])
-        
-        if not file_info[0]:  # No file path
-            return None
-            
-        file_path = self.frontier_dir / file_info[0].decode()
-        offset = int(file_info[1] or 0)
-        size = int(file_info[2] or 0)
-        
-        if offset >= size:  # All URLs consumed
-            return None
-        
-        # Read URL from file at offset
-        async with aiofiles.open(file_path, 'r') as f:
-            await f.seek(offset)
-            line = await f.readline()
-            
-            if line:
-                # Update offset
-                new_offset = await f.tell()
-                await self.redis.hset(domain_key, 'frontier_offset', new_offset)
-                
-                # Parse URL data
-                parts = line.strip().split('|')
-                if len(parts) >= 4:
-                    url, depth, priority, timestamp = parts
-                    return url, domain, int(depth)
-        
-        return None
-    
-    async def mark_visited(self, url: str, status_code: int, 
-                          content_path: str = None, error: str = None):
-        """Mark URL as visited with metadata."""
-        url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-        timestamp = int(time.time())
-        
-        # Store visited metadata
-        await self.redis.hset(f'visited:{url_hash}', mapping={
-            'url': url,
-            'status_code': status_code,
-            'fetched_at': timestamp,
-            'content_path': content_path or '',
-            'error': error or ''
-        })
-        
-        # Add to time-based index
-        await self.redis.zadd('visited:by_time', {url_hash: timestamp})
-        
-        # Also mark in seen bloom filter (in case of direct visits)
-        await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
-    
-    async def is_visited(self, url: str) -> bool:
-        """Check if URL has been visited (exact check)."""
-        url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-        return await self.redis.exists(f'visited:{url_hash}')
-```
+See `HybridFrontierManager` in `frontier.py`.
 
 ### Migration from PostgreSQL
 
