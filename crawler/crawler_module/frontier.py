@@ -535,8 +535,8 @@ class HybridFrontierManager:
         """Initialize the frontier, loading seeds or resuming from existing data."""
         # Initialize bloom filter if it doesn't exist
         try:
-            # Check if bloom filter exists
-            exists = await self.redis.execute_command('BF.EXISTS', 'seen:bloom', 'test')
+            # Try to get bloom filter info - will fail if it doesn't exist
+            await self.redis.execute_command('BF.INFO', 'seen:bloom')
             logger.info("Bloom filter already exists, using existing filter")
         except:
             # Create bloom filter for seen URLs
@@ -570,7 +570,7 @@ class HybridFrontierManager:
         visited_count = 0
         cursor = 0
         
-        while cursor:
+        while True:
             cursor, keys = await self.redis.scan(
                 cursor, match='visited:*', count=1000
             )
@@ -590,6 +590,10 @@ class HybridFrontierManager:
             if len(self.seen_urls) >= 1_000_000:
                 logger.warning("In-memory seen_urls cache reached 1M limit")
                 break
+            
+            # Exit when cursor returns to 0    
+            if cursor == 0:
+                break
                 
         logger.info(f"Loaded {visited_count} URLs into in-memory seen_urls cache")
     
@@ -600,12 +604,14 @@ class HybridFrontierManager:
         
         # Clear domain metadata and ready queue
         cursor = 0
-        while cursor:
+        while True:
             cursor, keys = await self.redis.scan(
                 cursor, match='domain:*', count=1000
             )
             if keys:
                 pipe.delete(*keys)
+            if cursor == 0:
+                break
         
         pipe.delete('domains:ready')
         pipe.delete('domains:active')
@@ -659,8 +665,16 @@ class HybridFrontierManager:
     async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
         """Add URLs to frontier files."""
         # 1. Normalize and pre-filter
-        normalized_urls = {normalize_url(u) for u in urls}
-        candidates = {u for u in normalized_urls if u and u not in self.seen_urls}
+        normalized_urls = set()
+        for u in urls:
+            try:
+                normalized = normalize_url(u)
+                if normalized:
+                    normalized_urls.add(normalized)
+            except Exception as e:
+                logger.debug(f"Failed to normalize URL {u}: {e}")
+                
+        candidates = {u for u in normalized_urls if u not in self.seen_urls}
         
         if not candidates:
             return 0
@@ -783,7 +797,7 @@ class HybridFrontierManager:
         cursor = 0
         
         # Sum up frontier sizes from all domains
-        while cursor:
+        while True:
             cursor, keys = await self.redis.scan(
                 cursor, match='domain:*', count=1000
             )
@@ -805,6 +819,10 @@ class HybridFrontierManager:
                     # For now, assume offset tracks line count
                     remaining = max(0, size - offset)
                     total += remaining
+            
+            # Exit when cursor returns to 0
+            if cursor == 0:
+                break
                     
         return total
     

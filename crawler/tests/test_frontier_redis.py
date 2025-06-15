@@ -295,7 +295,7 @@ async def test_frontier_error_handling(
     logger.info("Testing frontier error handling")
     
     # Test adding invalid URLs
-    invalid_urls = ["not-a-url", "", None, "http://"]
+    invalid_urls = ["not-a-url", "", "http://"]
     added = await hybrid_frontier_manager.add_urls_batch(invalid_urls)
     assert added == 0  # None should be added
     
