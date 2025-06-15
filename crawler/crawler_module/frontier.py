@@ -667,20 +667,10 @@ class HybridFrontierManager:
         if not candidates:
             return 0
             
-        # 2. Politeness filtering
-        allowed_urls = []
-        for url in candidates:
-            if await self.politeness.is_url_allowed(url):
-                allowed_urls.append(url)
-
-        if not allowed_urls:
-            return 0
-            
-        # 3. Check against bloom filter and visited URLs
+        # 2. Check against bloom filter and visited URLs
         new_urls = []
-        pipe = self.redis.pipeline()
         
-        for url in allowed_urls:
+        for url in candidates:
             # Check bloom filter
             exists = await self.redis.execute_command('BF.EXISTS', 'seen:bloom', url)
             if not exists:
@@ -692,10 +682,19 @@ class HybridFrontierManager:
                     
         if not new_urls:
             return 0
+        
+        # 3. Politeness filtering
+        allowed_urls = []
+        for url in new_urls:
+            if await self.politeness.is_url_allowed(url):
+                allowed_urls.append(url)
+
+        if not allowed_urls:
+            return 0
             
         # 4. Group URLs by domain
         urls_by_domain: Dict[str, List[Tuple[str, int]]] = {}
-        for url in new_urls:
+        for url in allowed_urls:
             domain = extract_domain(url)
             if domain:
                 if domain not in urls_by_domain:
