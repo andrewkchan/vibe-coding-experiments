@@ -520,7 +520,6 @@ class HybridFrontierManager:
         self.frontier_dir = config.data_dir / "frontiers"
         self.frontier_dir.mkdir(exist_ok=True)
         self.write_locks: Dict[str, asyncio.Lock] = {}  # Per-domain write locks
-        self.seen_urls: Set[str] = set()  # In-memory cache for quick checks
         
     def _get_frontier_path(self, domain: str) -> Path:
         """Get file path for domain's frontier."""
@@ -583,13 +582,7 @@ class HybridFrontierManager:
                 
                 for url in urls:
                     if url:
-                        self.seen_urls.add(url)
                         visited_count += 1
-                        
-            # Limit in-memory cache size
-            if len(self.seen_urls) >= 1_000_000:
-                logger.warning("In-memory seen_urls cache reached 1M limit")
-                break
             
             # Exit when cursor returns to 0    
             if cursor == 0:
@@ -621,8 +614,6 @@ class HybridFrontierManager:
             shutil.rmtree(self.frontier_dir)
             self.frontier_dir.mkdir(exist_ok=True)
             
-        # Clear in-memory cache
-        self.seen_urls.clear()
         logger.info("Cleared all frontier data")
     
     async def _load_seeds(self):
@@ -664,16 +655,14 @@ class HybridFrontierManager:
     async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
         """Add URLs to frontier files."""
         # 1. Normalize and pre-filter
-        normalized_urls = set()
+        candidates = set()
         for u in urls:
             try:
                 normalized = normalize_url(u)
                 if normalized:
-                    normalized_urls.add(normalized)
+                    candidates.add(normalized)
             except Exception as e:
                 logger.debug(f"Failed to normalize URL {u}: {e}")
-                
-        candidates = {u for u in normalized_urls if u not in self.seen_urls}
         
         if not candidates:
             return 0
@@ -683,9 +672,7 @@ class HybridFrontierManager:
         for url in candidates:
             if await self.politeness.is_url_allowed(url):
                 allowed_urls.append(url)
-            else:
-                self.seen_urls.add(url)  # Mark as seen to prevent re-checking
-                
+
         if not allowed_urls:
             return 0
             
@@ -742,7 +729,6 @@ class HybridFrontierManager:
                 # Check if it was already there (BF.ADD returns 0 if already existed)
                 # For simplicity, we'll just add all URLs and rely on file deduplication
                 new_urls.append((url, depth))
-                self.seen_urls.add(url)  # Update in-memory cache
                 
             if not new_urls:
                 return 0
@@ -862,7 +848,6 @@ class HybridFrontierManager:
                 # Double-check URL-level politeness rules
                 if not await self.politeness.is_url_allowed(url):
                     logger.debug(f"URL {url} disallowed by politeness rules")
-                    self.seen_urls.add(url)
                     # Put domain back, caller decides whether to retry
                     return None
                     

@@ -268,10 +268,10 @@ class PostgreSQLToHybridMigrator:
 - [X] Configure Redis persistence (AOF + RDB)
 
 ### Phase 2: Code Implementation (Days 2-3)
-- [ ] Implement HybridFrontierManager class
-- [ ] Write unit tests for HybridFrontierManager
-- [ ] Implement file-based frontier storage
-- [ ] Add bloom filter integration
+- [X] Implement HybridFrontierManager class
+- [X] Write unit tests for HybridFrontierManager
+- [X] Implement file-based frontier storage
+- [X] Add bloom filter integration
 - [ ] Update FetcherManager to use new frontier
 - [ ] Update PolitenessEnforcer for Redis
 - [ ] Update PolitenessEnforcer unit tests
