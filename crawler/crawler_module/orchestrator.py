@@ -2,17 +2,19 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Set, Optional, Dict, List
+from typing import Set, Optional, Dict, List, Union
 import os # For process ID
 import psutil
 import random
 from collections import defaultdict
+import redis.asyncio as redis
 
 from .config import CrawlerConfig
 from .storage import StorageManager
+from .redis_storage import RedisStorageManager
 from .fetcher import Fetcher, FetchResult
-from .politeness import PolitenessEnforcer
-from .frontier import FrontierManager
+from .politeness import PolitenessEnforcer, RedisPolitenessEnforcer
+from .frontier import FrontierManager, HybridFrontierManager
 from .parser import PageParser, ParseResult
 from .utils import extract_domain # For getting domain for storage
 from .db_backends import create_backend, PostgreSQLBackend
@@ -59,58 +61,80 @@ class CrawlerOrchestrator:
             logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
             raise # Stop if we can't create data directory
 
-        # Initialize database backend
-        if config.db_type == 'sqlite':
-            self.db_backend = create_backend(
-                'sqlite',
-                db_path=data_dir_path / "crawler_state.db",
-                pool_size=config.max_workers,
-                timeout=60
-            )
-        else:  # PostgreSQL
-            # For PostgreSQL, we need to be careful about connection limits
-            # PostgreSQL default max_connections is often 100
-            # We need to leave some connections for monitoring and other processes
-            
-            # Check for manual pool size override
-            pool_size_override = os.environ.get('CRAWLER_PG_POOL_SIZE')
-            if pool_size_override:
-                try:
-                    max_pool = int(pool_size_override)
-                    min_pool = min(10, max_pool)
-                    logger.info(f"Using manual PostgreSQL pool size: min={min_pool}, max={max_pool}")
-                except ValueError:
-                    logger.warning(f"Invalid CRAWLER_PG_POOL_SIZE value: {pool_size_override}, using automatic sizing")
-                    pool_size_override = None
-            
-            if not pool_size_override:
-                # Estimate reasonable pool size based on workers
-                # Not all workers need a connection simultaneously
-                # Workers spend time fetching URLs, parsing, etc.
-                concurrent_db_fraction = 0.7  # Assume ~70% of workers need DB at once
-                
-                min_pool = min(10, config.max_workers)
-                # Calculate max based on expected concurrent needs
-                estimated_concurrent = int(config.max_workers * concurrent_db_fraction)
-                # Leave 20 connections for psql, monitoring, etc.
-                safe_max = 80  # Assuming max_connections=100
-                max_pool = min(max(estimated_concurrent, 20), safe_max)
-                
-                logger.info(f"PostgreSQL pool configuration: min={min_pool}, max={max_pool} "
-                           f"(for {config.max_workers} workers)")
-            
-            self.db_backend = create_backend(
-                'postgresql',
-                db_url=config.db_url,
-                min_size=min_pool,
-                max_size=max_pool
-            )
-        
-        self.storage: StorageManager = StorageManager(config, self.db_backend)
+        # Initialize fetcher and parser (common to all backends)
         self.fetcher: Fetcher = Fetcher(config)
-        self.politeness: PolitenessEnforcer = PolitenessEnforcer(config, self.storage, self.fetcher)
-        self.frontier: FrontierManager = FrontierManager(config, self.storage, self.politeness)
         self.parser: PageParser = PageParser()
+        
+        # Initialize backend-specific components
+        if config.db_type == 'redis':
+            # Initialize Redis client
+            self.redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+            self.db_backend = None  # No SQL backend for Redis
+            
+            # Use Redis-based components
+            self.storage: Union[StorageManager, RedisStorageManager] = RedisStorageManager(config, self.redis_client)
+            self.politeness: Union[PolitenessEnforcer, RedisPolitenessEnforcer] = RedisPolitenessEnforcer(config, self.redis_client, self.fetcher)
+            # HybridFrontierManager expects a PolitenessEnforcer-compatible object
+            self.frontier: Union[FrontierManager, HybridFrontierManager] = HybridFrontierManager(
+                config, 
+                self.politeness,  # type: ignore[arg-type]  # RedisPolitenessEnforcer implements same interface
+                self.redis_client
+            )
+            
+        else:
+            # SQL-based backends (SQLite or PostgreSQL)
+            self.redis_client = None
+            
+            if config.db_type == 'sqlite':
+                self.db_backend = create_backend(
+                    'sqlite',
+                    db_path=data_dir_path / "crawler_state.db",
+                    pool_size=config.max_workers,
+                    timeout=60
+                )
+            else:  # PostgreSQL
+                # For PostgreSQL, we need to be careful about connection limits
+                # PostgreSQL default max_connections is often 100
+                # We need to leave some connections for monitoring and other processes
+                
+                # Check for manual pool size override
+                pool_size_override = os.environ.get('CRAWLER_PG_POOL_SIZE')
+                if pool_size_override:
+                    try:
+                        max_pool = int(pool_size_override)
+                        min_pool = min(10, max_pool)
+                        logger.info(f"Using manual PostgreSQL pool size: min={min_pool}, max={max_pool}")
+                    except ValueError:
+                        logger.warning(f"Invalid CRAWLER_PG_POOL_SIZE value: {pool_size_override}, using automatic sizing")
+                        pool_size_override = None
+                
+                if not pool_size_override:
+                    # Estimate reasonable pool size based on workers
+                    # Not all workers need a connection simultaneously
+                    # Workers spend time fetching URLs, parsing, etc.
+                    concurrent_db_fraction = 0.7  # Assume ~70% of workers need DB at once
+                    
+                    min_pool = min(10, config.max_workers)
+                    # Calculate max based on expected concurrent needs
+                    estimated_concurrent = int(config.max_workers * concurrent_db_fraction)
+                    # Leave 20 connections for psql, monitoring, etc.
+                    safe_max = 80  # Assuming max_connections=100
+                    max_pool = min(max(estimated_concurrent, 20), safe_max)
+                    
+                    logger.info(f"PostgreSQL pool configuration: min={min_pool}, max={max_pool} "
+                               f"(for {config.max_workers} workers)")
+                
+                self.db_backend = create_backend(
+                    'postgresql',
+                    db_url=config.db_url,
+                    min_size=min_pool,
+                    max_size=max_pool
+                )
+            
+            # Initialize SQL-based components
+            self.storage = StorageManager(config, self.db_backend)
+            self.politeness = PolitenessEnforcer(config, self.storage, self.fetcher)
+            self.frontier = FrontierManager(config, self.storage, self.politeness)
 
         self.pages_crawled_count: int = 0
         self.start_time: float = 0.0
@@ -124,11 +148,22 @@ class CrawlerOrchestrator:
     async def _initialize_components(self):
         """Initializes all crawler components that require async setup."""
         logger.info("Initializing crawler components...")
-        await self.db_backend.initialize()
-        await self.storage.init_db_schema()
-        # Load politeness-related data that needs to be available before crawl starts
-        await self.politeness._load_manual_exclusions()
-        await self.frontier.initialize_frontier()
+        
+        if self.config.db_type == 'redis':
+            # Redis-based initialization
+            await self.storage.init_db_schema()  # Sets schema version
+            # RedisPolitenesEnforcer loads exclusions differently
+            if hasattr(self.politeness, '_load_manual_exclusions'):
+                await self.politeness._load_manual_exclusions()
+            await self.frontier.initialize_frontier()
+        else:
+            # SQL-based initialization
+            await self.db_backend.initialize()
+            await self.storage.init_db_schema()
+            # Load politeness-related data that needs to be available before crawl starts
+            await self.politeness._load_manual_exclusions()
+            await self.frontier.initialize_frontier()
+            
         logger.info("Crawler components initialized.")
 
     async def _log_metrics(self):
@@ -142,8 +177,12 @@ class CrawlerOrchestrator:
         # Update Prometheus gauge
         pages_per_second_gauge.set(pages_per_second)
 
-        # Ensure db_backend is PostgreSQLBackend for these specific metrics lists
-        if isinstance(self.db_backend, PostgreSQLBackend): # type: ignore
+        # DB-specific metrics
+        if self.config.db_type == 'redis':
+            # Redis doesn't have connection pool metrics in the same way
+            # Could add Redis-specific metrics here if needed
+            pass
+        elif isinstance(self.db_backend, PostgreSQLBackend): # type: ignore
             # Connection Acquire Times
             acquire_times = list(self.db_backend.connection_acquire_times) # Copy for processing
             self.db_backend.connection_acquire_times.clear()
@@ -386,7 +425,11 @@ class CrawlerOrchestrator:
                 
                 # Connection pool info - different for each backend
                 pool_info = "N/A"
-                if self.config.db_type == 'sqlite' and hasattr(self.db_backend, '_pool'):
+                if self.config.db_type == 'redis':
+                    # Redis connection info
+                    pool_info = "Redis"
+                    # Could add Redis connection pool stats if needed
+                elif self.config.db_type == 'sqlite' and hasattr(self.db_backend, '_pool'):
                     pool_info = f"available={self.db_backend._pool.qsize()}"
                     db_pool_available_gauge.set(self.db_backend._pool.qsize())
                 elif self.config.db_type == 'postgresql':
@@ -451,8 +494,12 @@ class CrawlerOrchestrator:
             logger.info("Performing final cleanup...")
             await self.fetcher.close_session()
             
-            # Close the database
+            # Close storage and database connections
             await self.storage.close()
+            
+            # Close Redis connection if using Redis backend
+            if self.config.db_type == 'redis' and self.redis_client:
+                await self.redis_client.aclose()
             
             logger.info(f"Crawl finished. Total pages crawled: {self.pages_crawled_count}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

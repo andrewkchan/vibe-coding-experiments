@@ -90,8 +90,8 @@ def parse_args() -> CrawlerConfig:
         "--db-type",
         type=str,
         default=DEFAULT_DB_TYPE,
-        choices=["sqlite", "postgresql"],
-        help=f"Database backend to use (default: {DEFAULT_DB_TYPE}). Use 'postgresql' for high concurrency."
+        choices=["sqlite", "postgresql", "redis"],
+        help=f"Database backend to use (default: {DEFAULT_DB_TYPE}). Use 'postgresql' for high concurrency, 'redis' for hybrid Redis+file storage."
     )
     parser.add_argument(
         "--db-url",
@@ -116,6 +116,10 @@ def parse_args() -> CrawlerConfig:
     if args.db_type == "postgresql" and args.pg_pool_size:
         import os
         os.environ['CRAWLER_PG_POOL_SIZE'] = str(args.pg_pool_size)
+    
+    # Redis doesn't require db_url as it uses default localhost:6379
+    if args.db_type == "redis" and args.db_url:
+        parser.error("--db-url is not used with Redis backend (uses localhost:6379 by default)")
     
     # Construct User-Agent
     # Example: MyEducationalCrawler/1.0 (+http://example.com/crawler-info; mailto:user@example.com)
