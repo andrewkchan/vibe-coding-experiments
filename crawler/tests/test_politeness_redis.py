@@ -311,31 +311,31 @@ async def test_is_url_allowed_seeded_urls_only(redis_client: redis.Redis, mock_f
 @pytest.mark.asyncio
 async def test_get_crawl_delay_from_robots_agent_specific(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "delaytest.com"
-    agent_delay = 10
-    robots_text = f"User-agent: {dummy_config.user_agent}\nCrawl-delay: {agent_delay}"
-    
-    # Mock _get_robots_for_domain to return a parser with this rule
-    rerp = RobotExclusionRulesParser()
-    rerp.user_agent = dummy_config.user_agent
-    rerp.parse(robots_text)
-    redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
+    for agent_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
+        robots_text = f"User-agent: {dummy_config.user_agent}\nCrawl-delay: {agent_delay}"
+        
+        # Mock _get_robots_for_domain to return a parser with this rule
+        rerp = RobotExclusionRulesParser()
+        rerp.user_agent = dummy_config.user_agent
+        rerp.parse(robots_text)
+        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
 
-    delay = await redis_politeness_enforcer.get_crawl_delay(domain)
-    assert delay == max(float(agent_delay), float(MIN_CRAWL_DELAY_SECONDS))
+        delay = await redis_politeness_enforcer.get_crawl_delay(domain)
+        assert delay == max(float(agent_delay), float(MIN_CRAWL_DELAY_SECONDS))
 
 @pytest.mark.asyncio
 async def test_get_crawl_delay_from_robots_wildcard(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "wildcarddelay.com"
-    wildcard_delay = 5
-    robots_text = f"User-agent: AnotherBot\nCrawl-delay: 50\nUser-agent: *\nCrawl-delay: {wildcard_delay}"
+    for wildcard_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
+        robots_text = f"User-agent: AnotherBot\nCrawl-delay: 50\nUser-agent: *\nCrawl-delay: {wildcard_delay}"
 
-    rerp = RobotExclusionRulesParser()
-    rerp.user_agent = dummy_config.user_agent
-    rerp.parse(robots_text)
-    redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
+        rerp = RobotExclusionRulesParser()
+        rerp.user_agent = dummy_config.user_agent
+        rerp.parse(robots_text)
+        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
 
-    delay = await redis_politeness_enforcer.get_crawl_delay(domain)
-    assert delay == max(float(wildcard_delay), float(MIN_CRAWL_DELAY_SECONDS))
+        delay = await redis_politeness_enforcer.get_crawl_delay(domain)
+        assert delay == max(float(wildcard_delay), float(MIN_CRAWL_DELAY_SECONDS))
 
 @pytest.mark.asyncio
 async def test_get_crawl_delay_default_no_robots_rule(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
@@ -353,16 +353,16 @@ async def test_get_crawl_delay_default_no_robots_rule(redis_politeness_enforcer:
 @pytest.mark.asyncio
 async def test_get_crawl_delay_respects_min_crawl_delay(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "shortdelay.com"
-    short_robot_delay = 1  # Shorter than MIN_CRAWL_DELAY_SECONDS
-    robots_text = f"User-agent: *\nCrawl-delay: {short_robot_delay}"
+    for robot_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
+        robots_text = f"User-agent: *\nCrawl-delay: {robot_delay}"
 
-    rerp = RobotExclusionRulesParser()
-    rerp.user_agent = dummy_config.user_agent
-    rerp.parse(robots_text)
-    redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
+        rerp = RobotExclusionRulesParser()
+        rerp.user_agent = dummy_config.user_agent
+        rerp.parse(robots_text)
+        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
 
-    delay = await redis_politeness_enforcer.get_crawl_delay(domain)
-    assert delay == float(MIN_CRAWL_DELAY_SECONDS)
+        delay = await redis_politeness_enforcer.get_crawl_delay(domain)
+        assert delay == max(float(robot_delay), float(MIN_CRAWL_DELAY_SECONDS))
 
 # --- Tests for can_fetch_domain_now (async) ---
 @pytest.mark.asyncio
