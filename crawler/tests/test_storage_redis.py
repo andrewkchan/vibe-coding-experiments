@@ -202,11 +202,6 @@ async def test_add_visited_page(redis_storage_manager: RedisStorageManager, redi
     assert visited_data['error'] == ''
     assert 'redirected_to_url' not in visited_data  # Not set when None
     
-    # Check time index
-    score = await redis_client.zscore('visited:by_time', expected_url_hash)
-    assert score is not None
-    assert int(score) == crawled_timestamp
-    
     logger.info("Add visited page test passed.")
 
 
@@ -290,9 +285,5 @@ async def test_add_visited_page_update_existing(redis_storage_manager: RedisStor
     assert int(visited_data['fetched_at']) == second_timestamp
     assert visited_data['content_type'] == "text/html"
     assert visited_data['content_path'] == content_storage_path_str
-    
-    # Check time index was updated
-    score = await redis_client.zscore('visited:by_time', expected_url_hash)
-    assert int(score) == second_timestamp
     
     logger.info("Update existing visited page test passed.") 

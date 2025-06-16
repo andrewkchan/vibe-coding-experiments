@@ -110,12 +110,6 @@ visited:{url_hash} → HASH {
     content_path: "content/a5/b7c9d2e4f6.txt",
     error: null
 }
-
-# Also maintain a sorted set for time-based queries
-visited:by_time → ZSET {
-    "url_hash1": timestamp1,
-    "url_hash2": timestamp2
-}
 ```
 
 ## Memory Usage (Revised)
@@ -188,9 +182,6 @@ class PostgreSQLToHybridMigrator:
                     'content_path': row['content_storage_path'] or '',
                     'error': ''
                 })
-                
-                # Add to time index
-                pipe.zadd('visited:by_time', {url_hash: row['crawled_timestamp']})
                 
                 # Mark as seen
                 pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])

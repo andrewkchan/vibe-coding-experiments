@@ -121,9 +121,6 @@ class RedisStorageManager:
             # Store visited metadata in hash
             pipe.hset(f'visited:{url_hash}', mapping=visited_data)
             
-            # Add to time-sorted index
-            pipe.zadd('visited:by_time', {url_hash: crawled_timestamp})
-            
             # Mark URL as seen in bloom filter (if it exists)
             # Note: In production, the bloom filter should be created during migration
             # For now, we'll try to add and ignore if it doesn't exist
@@ -139,7 +136,6 @@ class RedisStorageManager:
                 logger.warning(f"Bloom filter 'seen:bloom' not found. URL {url} not added to bloom filter.")
                 # Still store the visited data without bloom filter
                 await self.redis.hset(f'visited:{url_hash}', mapping=visited_data)
-                await self.redis.zadd('visited:by_time', {url_hash: crawled_timestamp})
             else:
                 logger.error(f"Redis error adding visited page {url}: {e}")
                 raise
