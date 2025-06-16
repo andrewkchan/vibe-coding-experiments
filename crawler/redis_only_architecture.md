@@ -274,8 +274,8 @@ class PostgreSQLToHybridMigrator:
 - [X] Add bloom filter integration
 - [X] Update PolitenessEnforcer for Redis
 - [X] Update PolitenessEnforcer unit tests
-- [ ] Update StorageManager (add_visited_page) for Redis
-- [ ] Update StorageManager unit tests
+- [X] Update StorageManager (add_visited_page) for Redis
+- [X] Update StorageManager unit tests
 - [ ] Update CrawlerOrchestrator to use new frontier and politeness
 - [ ] Implement PostgreSQL migration script
 - [ ] Add monitoring/metrics for new system

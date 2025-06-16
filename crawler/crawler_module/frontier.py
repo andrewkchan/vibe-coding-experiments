@@ -542,9 +542,9 @@ class HybridFrontierManager:
             # Estimate: visited + frontier + some growth room (default to 10M for new crawls)
             try:
                 await self.redis.execute_command(
-                    'BF.RESERVE', 'seen:bloom', 0.001, 10_000_000
+                    'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
                 )
-                logger.info("Created new bloom filter for 10M URLs with 0.1% FPR")
+                logger.info("Created new bloom filter for 160M URLs with 0.1% FPR")
             except:
                 logger.warning("Could not create bloom filter - it may already exist")
         
