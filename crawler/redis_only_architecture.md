@@ -272,8 +272,8 @@ class PostgreSQLToHybridMigrator:
 - [X] Write unit tests for HybridFrontierManager
 - [X] Implement file-based frontier storage
 - [X] Add bloom filter integration
-- [ ] Update PolitenessEnforcer for Redis
-- [ ] Update PolitenessEnforcer unit tests
+- [X] Update PolitenessEnforcer for Redis
+- [X] Update PolitenessEnforcer unit tests
 - [ ] Update StorageManager (add_visited_page) for Redis
 - [ ] Update StorageManager unit tests
 - [ ] Update CrawlerOrchestrator to use new frontier and politeness
