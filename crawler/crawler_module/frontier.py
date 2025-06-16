@@ -171,8 +171,17 @@ class FrontierManager:
             seed_domains = {extract_domain(u) for u in urls if extract_domain(u)}
             await self._mark_domains_as_seeded_batch(list(seed_domains))
             
-            # Add all URLs to the frontier in one batch
-            added_count = await self.add_urls_batch(urls)
+            logger.info(f"Adding {len(urls)} URLs to the frontier")
+            async def add_urls_batch_worker(urls: list[str]):
+                added_count = await self.add_urls_batch(urls)
+                return added_count
+            seed_tasks = []
+            chunk_size = (len(urls) + self.config.max_workers - 1) // self.config.max_workers
+            for i in range(self.config.max_workers):
+                url_chunk = urls[i*chunk_size:(i+1)*chunk_size]
+                seed_tasks.append(add_urls_batch_worker(url_chunk))
+            added_counts = await asyncio.gather(*seed_tasks)
+            added_count = sum(added_counts)
             
             logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
         except IOError as e:
@@ -618,6 +627,7 @@ class HybridFrontierManager:
     
     async def _load_seeds(self):
         """Load seed URLs from file."""
+        logger.info(f"Loading seeds from {self.config.seed_file}")
         if not self.config.seed_file.exists():
             logger.error(f"Seed file not found: {self.config.seed_file}")
             return
@@ -635,7 +645,21 @@ class HybridFrontierManager:
             await self._mark_domains_as_seeded_batch(list(seed_domains))
             
             # Add URLs to frontier
-            added_count = await self.add_urls_batch(urls)
+            logger.info(f"Adding {len(urls)} URLs to the frontier")
+            async def add_urls_batch_worker(worker_id: int, urls: list[str]) -> int:
+                subchunk_size = 100
+                added_count = 0
+                for i in range(0, len(urls), subchunk_size):
+                    added_count += await self.add_urls_batch(urls[i:i+subchunk_size])
+                    logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
+                return added_count
+            seed_tasks = []
+            chunk_size = (len(urls) + self.config.max_workers - 1) // self.config.max_workers
+            for i in range(self.config.max_workers):
+                url_chunk = urls[i*chunk_size:(i+1)*chunk_size]
+                seed_tasks.append(add_urls_batch_worker(i, url_chunk))
+            added_counts = await asyncio.gather(*seed_tasks)
+            added_count = sum(added_counts)
             logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
             
         except IOError as e:
@@ -647,8 +671,10 @@ class HybridFrontierManager:
             return
             
         pipe = self.redis.pipeline()
-        for domain in domains:
+        for i, domain in enumerate(domains):
             pipe.hset(f'domain:{domain}', 'is_seeded', '1')
+            if i % 10_000 == 0:
+                logger.info(f"Mark {i}/{len(domains)} domains as seeded")
         await pipe.execute()
         logger.debug(f"Marked {len(domains)} domains as seeded")
     
@@ -718,7 +744,6 @@ class HybridFrontierManager:
         async with self.write_locks[domain]:
             frontier_path = self._get_frontier_path(domain)
             domain_key = f"domain:{domain}"
-            current_time = int(time.time())
             
             # Filter out URLs already in bloom filter
             new_urls = []

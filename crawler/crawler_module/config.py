@@ -21,7 +21,7 @@ class CrawlerConfig:
     resume: bool
     user_agent: str # Will be constructed
     seeded_urls_only: bool
-    db_type: str # sqlite or postgresql
+    db_type: str # sqlite, postgresql, or redis
     db_url: str | None # PostgreSQL connection URL
 
 def parse_args() -> CrawlerConfig:
