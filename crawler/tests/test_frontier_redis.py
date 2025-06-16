@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from unittest.mock import MagicMock, AsyncMock
 import redis.asyncio as redis
 from collections import defaultdict
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from crawler_module.frontier import HybridFrontierManager
 from crawler_module.config import CrawlerConfig
@@ -211,19 +211,72 @@ async def test_frontier_file_persistence(
     )
     
     await frontier_run1.initialize_frontier()
-    await frontier_run1.add_urls_batch(["http://persistent.com/page_from_run1"])
+    
+    # Add URLs with different depths
+    test_urls = [
+        ("http://persistent.com/page1", 0),
+        ("http://persistent.com/page2", 1),
+        ("http://example.net/page1", 2)
+    ]
+    
+    # Add URLs with specified depths
+    for url, depth in test_urls:
+        await frontier_run1.add_urls_batch([url], depth=depth)
     
     # Check that frontier files were created
     frontier_dir = cfg_run1.data_dir / "frontiers"
     assert frontier_dir.exists()
     
-    # Get one URL
+    # Find and read the frontier files to verify their contents
+    frontier_files = list(frontier_dir.glob("*/*.frontier"))
+    assert len(frontier_files) > 0, "No frontier files were created"
+    
+    # Read all URLs from files
+    urls_from_files: Dict[str, List[Tuple[str, int]]] = {}
+    for file_path in frontier_files:
+        domain_name = file_path.stem  # filename without extension
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+            urls_from_files[domain_name] = []
+            for line in lines:
+                line = line.strip()
+                if line:
+                    parts = line.split('|')
+                    assert len(parts) == 2, f"Expected 2 parts in line '{line}', got {len(parts)}"
+                    url, depth_str = parts
+                    urls_from_files[domain_name].append((url, int(depth_str)))
+    
+    # Verify persistent.com file contains the right URLs with correct depths
+    assert "persistent.com" in urls_from_files
+    persistent_urls = urls_from_files["persistent.com"]
+    assert len(persistent_urls) == 2
+    assert ("http://persistent.com/page1", 0) in persistent_urls
+    assert ("http://persistent.com/page2", 1) in persistent_urls
+    
+    # Verify example.net file
+    assert "example.net" in urls_from_files
+    example_net_urls = urls_from_files["example.net"]
+    assert len(example_net_urls) == 1
+    assert ("http://example.net/page1", 2) in example_net_urls
+    
+    # Also verify seed URLs were written (from initialize_frontier)
+    assert "example.com" in urls_from_files
+    assert "example.org" in urls_from_files
+    
+    # Get one URL and verify the offset is updated
     url_retrieved = await frontier_run1.get_next_url()
     assert url_retrieved is not None
     
-    # Check remaining count
+    # Check Redis metadata for the domain we just fetched from
+    retrieved_domain = url_retrieved[1]
+    domain_metadata = await redis_client.hgetall(f"domain:{retrieved_domain}")  # type: ignore[misc]
+    assert "frontier_offset" in domain_metadata
+    assert int(domain_metadata["frontier_offset"]) == 1  # Should have read 1 URL
+    
+    # Calculate total URLs from all seed URLs + test URLs
+    total_urls = 2 + len(test_urls)  # 2 seed URLs + 3 test URLs
     remaining_count = await frontier_run1.count_frontier()
-    assert remaining_count == 2  # Started with 3 (2 seeds + 1 added)
+    assert remaining_count == total_urls - 1  # One URL was retrieved
     
     logger.info("Frontier file persistence test passed.")
 

@@ -735,8 +735,8 @@ class HybridFrontierManager:
             # Append to frontier file
             lines_to_write = []
             for url, depth in new_urls:
-                # Format: url|depth|priority|added_timestamp
-                line = f"{url}|{depth}|1.0|{current_time}\n"
+                # Format: url|depth
+                line = f"{url}|{depth}\n"
                 lines_to_write.append(line)
                 
             async with aiofiles.open(frontier_path, 'a') as f:
@@ -898,8 +898,8 @@ class HybridFrontierManager:
                         
                         # Parse URL data
                         parts = line.split('|')
-                        if len(parts) >= 4:
-                            url, depth_str, priority, timestamp = parts[:4]
+                        if len(parts) >= 2:
+                            url, depth_str = parts[:2]
                             return url, domain, int(depth_str)
                             
         except Exception as e:

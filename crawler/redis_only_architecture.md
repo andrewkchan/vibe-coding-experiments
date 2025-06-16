@@ -58,9 +58,9 @@ Use Redis for coordination and metadata, with file-based storage for the actual 
 ```
 # File structure: crawler_data/frontiers/{domain_hash}/{domain}.frontier
 # Format: One URL entry per line
-url|depth|priority|added_timestamp
-https://example.com/page1|0|1.0|1699564800
-https://example.com/page2|1|0.9|1699564900
+url|depth
+https://example.com/page1|0
+https://example.com/page2|1
 
 # Append new URLs to end
 # Read from current offset position
@@ -151,9 +151,8 @@ class PostgreSQLToHybridMigrator:
         # Estimate: visited + frontier + some growth room
         visited_count = await self.pg.fetchval("SELECT COUNT(*) FROM visited_urls")
         frontier_count = await self.pg.fetchval("SELECT COUNT(*) FROM frontier")
-        total_seen = visited_count + frontier_count
         await self.redis.execute_command(
-            'BF.RESERVE', 'seen:bloom', 0.001, int(total_seen * 1.5)
+            'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
         )
         
         # 2. Migrate visited URLs (exact records)
