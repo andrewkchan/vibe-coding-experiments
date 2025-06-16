@@ -2,6 +2,7 @@ import logging
 import time
 from pathlib import Path
 from urllib.parse import urljoin
+from urllib.robotparser import RobotFileParser
 from robotexclusionrulesparser import RobotExclusionRulesParser # type: ignore
 import asyncio
 from collections import OrderedDict
@@ -153,31 +154,31 @@ class PolitenessEnforcer:
         logger.info(f"Attempting to fetch robots.txt for {domain} (HTTP first)")
         fetch_result_http: FetchResult = await self.fetcher.fetch_url(robots_url_http, is_robots_txt=True)
 
-        robots_content: str | None = None
+        fetched_content: str | None = None
         if fetch_result_http.status_code == 200 and fetch_result_http.text_content is not None:
-            robots_content = fetch_result_http.text_content
+            fetched_content = fetch_result_http.text_content
         else:
             logger.debug(f"robots.txt not found or error on HTTP for {domain}. Trying HTTPS.")
             fetch_result_https: FetchResult = await self.fetcher.fetch_url(robots_url_https, is_robots_txt=True)
             if fetch_result_https.status_code == 200 and fetch_result_https.text_content is not None:
-                robots_content = fetch_result_https.text_content
+                fetched_content = fetch_result_https.text_content
             else:
                 logger.debug(f"Failed to fetch robots.txt for {domain} via HTTPS. Assuming allow all.")
-                robots_content = "" # Treat as empty, meaning allow all
-        if '\0' in robots_content:
+                fetched_content = "" # Treat as empty, meaning allow all
+        if '\0' in fetched_content:
             # The robots.txt is malformed, and Postgres will reject it.
             # Treat as empty, meaning allow all.
             # TODO: Handle this by storing byte field in DB instead.
             logger.debug(f"robots.txt for {domain} contains null byte. Assuming allow all.")
-            robots_content = ""
+            fetched_content = ""
 
         # Cache the newly fetched content
-        await self._update_robots_cache(domain, robots_content, fetched_timestamp, expires_timestamp)
+        await self._update_robots_cache(domain, fetched_content, fetched_timestamp, expires_timestamp)
 
         # Parse and cache in memory
         rerp = RobotExclusionRulesParser()
-        rerp.parse(robots_content)
-        rerp.source_content = robots_content
+        rerp.parse(fetched_content)
+        rerp.source_content = fetched_content
         self.robots_parsers[domain] = rerp
         return rerp
 
@@ -325,7 +326,7 @@ class RedisPolitenessEnforcer:
         self.config = config
         self.redis = redis_client
         self.fetcher = fetcher
-        self.robots_parsers: dict[str, RobotExclusionRulesParser] = {}  # In-memory cache for parsed robots.txt
+        self.robots_parsers: dict[str, RobotFileParser] = {}  # In-memory cache for parsed robots.txt
         
         # In-memory exclusion cache (LRU-style)
         self.exclusion_cache_max_size = 100_000
@@ -398,7 +399,7 @@ class RedisPolitenessEnforcer:
             logger.error(f"Redis error caching robots.txt for {domain}: {e}")
             raise
     
-    async def _get_robots_for_domain(self, domain: str) -> RobotExclusionRulesParser | None:
+    async def _get_robots_for_domain(self, domain: str) -> RobotFileParser | None:
         """Fetches (async), parses, and caches robots.txt for a domain."""
         # 1. Check in-memory cache first
         if domain in self.robots_parsers:
@@ -410,11 +411,12 @@ class RedisPolitenessEnforcer:
         
         if robots_content is not None and expires_timestamp is not None and expires_timestamp > current_time:
             logger.debug(f"Loaded fresh robots.txt for {domain} from Redis.")
-            rerp = RobotExclusionRulesParser()
-            rerp.parse(robots_content)
-            rerp.source_content = robots_content
-            self.robots_parsers[domain] = rerp
-            return rerp
+            rfp = RobotFileParser()
+            rfp.parse(robots_content.split('\n'))
+            # Store the content for reference
+            rfp._content = robots_content  # type: ignore[attr-defined]
+            self.robots_parsers[domain] = rfp
+            return rfp
         
         # 3. If not in caches or caches are stale, fetch from the web
         fetched_timestamp = int(time.time())
@@ -446,11 +448,11 @@ class RedisPolitenessEnforcer:
         await self._update_robots_cache(domain, fetched_robots_content, fetched_timestamp, expires_timestamp)
         
         # Parse and cache in memory
-        rerp = RobotExclusionRulesParser()
-        rerp.parse(fetched_robots_content)
-        rerp.source_content = fetched_robots_content
-        self.robots_parsers[domain] = rerp
-        return rerp
+        rfp = RobotFileParser()
+        rfp.parse(fetched_robots_content.split('\n'))
+        rfp._content = fetched_robots_content  # type: ignore[attr-defined]
+        self.robots_parsers[domain] = rfp
+        return rfp
     
     async def _check_manual_exclusion(self, domain: str) -> bool:
         """Returns True if domain is manually excluded or (if seeded_urls_only) not seeded.
@@ -501,29 +503,29 @@ class RedisPolitenessEnforcer:
             return False
         
         # If not manually excluded, check robots.txt
-        rerp = await self._get_robots_for_domain(domain)
-        if rerp:
-            is_allowed_by_robots = rerp.is_allowed(self.config.user_agent, url)
+        rfp = await self._get_robots_for_domain(domain)
+        if rfp:
+            is_allowed_by_robots = rfp.can_fetch(self.config.user_agent, url)
             if not is_allowed_by_robots:
                 logger.debug(f"URL disallowed by robots.txt for {domain}: {url}")
             return is_allowed_by_robots
         
         logger.warning(f"No robots.txt parser available for {domain} after checks. Allowing URL: {url}")
-        return True  # Default to allow if RERP is None
+        return True  # Default to allow if RFP is None
     
     async def get_crawl_delay(self, domain: str) -> float:
         """Gets the crawl delay for a domain."""
-        rerp = await self._get_robots_for_domain(domain)
+        rfp = await self._get_robots_for_domain(domain)
         delay = None
-        if rerp:
-            agent_delay = rerp.get_crawl_delay(self.config.user_agent)
+        if rfp:
+            agent_delay = rfp.crawl_delay(self.config.user_agent)
             if agent_delay is not None:
                 delay = float(agent_delay)
                 logger.debug(f"Using {delay}s crawl delay from robots.txt for {domain} (agent: {self.config.user_agent})")
         
         if delay is None:
-            if rerp and rerp.get_crawl_delay("*") is not None:
-                wildcard_delay = rerp.get_crawl_delay("*")
+            if rfp and rfp.crawl_delay("*") is not None:
+                wildcard_delay = rfp.crawl_delay("*")
                 if wildcard_delay is not None:
                     delay = float(wildcard_delay)
                     logger.debug(f"Using {delay}s crawl delay from robots.txt for {domain} (wildcard agent)")

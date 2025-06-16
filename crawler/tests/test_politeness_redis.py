@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 from unittest.mock import MagicMock, AsyncMock, patch
 import redis.asyncio as redis
-from robotexclusionrulesparser import RobotExclusionRulesParser  # type: ignore
+from urllib.robotparser import RobotFileParser
 
 from crawler_module.politeness import RedisPolitenessEnforcer, DEFAULT_ROBOTS_TXT_TTL, MIN_CRAWL_DELAY_SECONDS  # type: ignore
 from crawler_module.config import CrawlerConfig  # type: ignore
@@ -23,7 +23,7 @@ def dummy_config(tmp_path: Path) -> CrawlerConfig:
         max_duration=None,
         log_level="DEBUG",
         resume=False,
-        user_agent="TestCrawler/1.0 (pytest)",
+        user_agent="TestCrawler/1.0",
         seeded_urls_only=False,
         db_type="postgresql",  # Changed to indicate we're using Redis architecture
         db_url=None
@@ -100,14 +100,14 @@ async def test_load_manual_exclusions_with_file(
 async def test_get_robots_from_memory_cache(redis_politeness_enforcer: RedisPolitenessEnforcer):
     """Tests that if a parser is in memory, Redis is not hit."""
     domain = "example.com"
-    mock_rerp = MagicMock(spec=RobotExclusionRulesParser)
-    redis_politeness_enforcer.robots_parsers[domain] = mock_rerp
+    mock_rfp = MagicMock(spec=RobotFileParser)
+    redis_politeness_enforcer.robots_parsers[domain] = mock_rfp
 
     # Act
-    rerp = await redis_politeness_enforcer._get_robots_for_domain(domain)
+    rfp = await redis_politeness_enforcer._get_robots_for_domain(domain)
 
     # Assert
-    assert rerp == mock_rerp
+    assert rfp == mock_rfp
     # No Redis or fetcher calls should be made
     redis_politeness_enforcer.fetcher.fetch_url.assert_not_called()
 
@@ -128,17 +128,17 @@ async def test_get_robots_from_redis_cache_fresh(redis_politeness_enforcer: Redi
     })
     
     # Act
-    rerp = await redis_politeness_enforcer._get_robots_for_domain(domain)
+    rfp = await redis_politeness_enforcer._get_robots_for_domain(domain)
     
     # Assert
     # 1. Web was NOT fetched
     redis_politeness_enforcer.fetcher.fetch_url.assert_not_called()
     # 2. Parser is correct
-    assert rerp is not None
-    assert rerp.is_allowed(dummy_config.user_agent, f"http://{domain}/private") is False
+    assert rfp is not None
+    assert rfp.can_fetch(dummy_config.user_agent, f"http://{domain}/private") is False
     # 3. In-memory cache is now populated
     assert domain in redis_politeness_enforcer.robots_parsers
-    assert redis_politeness_enforcer.robots_parsers[domain] == rerp
+    assert redis_politeness_enforcer.robots_parsers[domain] == rfp
 
 @pytest.mark.asyncio
 async def test_get_robots_redis_cache_stale_then_fetch_success(redis_politeness_enforcer: RedisPolitenessEnforcer):
@@ -161,10 +161,10 @@ async def test_get_robots_redis_cache_stale_then_fetch_success(redis_politeness_
     )
 
     # Act
-    rerp = await redis_politeness_enforcer._get_robots_for_domain(domain)
+    rfp = await redis_politeness_enforcer._get_robots_for_domain(domain)
 
     # Assert
-    assert rerp is not None
+    assert rfp is not None
     # 1. Web was fetched (since Redis was stale)
     redis_politeness_enforcer.fetcher.fetch_url.assert_called_once()
     # 2. Redis was updated with the new content
@@ -232,11 +232,11 @@ async def test_get_robots_http_404_https_404(redis_politeness_enforcer: RedisPol
     redis_politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_result_404, fetch_result_404]
 
     # Act
-    rerp = await redis_politeness_enforcer._get_robots_for_domain(domain)
+    rfp = await redis_politeness_enforcer._get_robots_for_domain(domain)
 
     # Assert
-    assert rerp is not None
-    assert rerp.is_allowed(redis_politeness_enforcer.config.user_agent, "/") is True
+    assert rfp is not None
+    assert rfp.can_fetch(redis_politeness_enforcer.config.user_agent, "/") is True
     assert redis_politeness_enforcer.fetcher.fetch_url.call_count == 2
     # Redis should be updated with an empty string to cache the "not found" result
     stored_content = await redis_politeness_enforcer.redis.hget(f'domain:{domain}', 'robots_txt')
@@ -268,16 +268,17 @@ async def test_is_url_allowed_by_robots(redis_politeness_enforcer: RedisPolitene
     domain = "robotsallowed.com"
     allowed_url = f"http://{domain}/allowed"
     disallowed_url = f"http://{domain}/disallowed"
-    robots_text = f"User-agent: {dummy_config.user_agent}\nDisallow: /disallowed"
+    # Use simplified user agent without parentheses for RobotFileParser compatibility
+    robots_text = "User-agent: TestCrawler\nDisallow: /disallowed"
 
     # Setup: Ensure not manually excluded (prime cache correctly)
     redis_politeness_enforcer.exclusion_cache[domain] = False
     redis_politeness_enforcer.exclusion_cache_order[domain] = None
     
-    # Mock _get_robots_for_domain to return a pre-configured parser
-    rerp_instance = RobotExclusionRulesParser()
-    rerp_instance.parse(robots_text)
-    redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp_instance)
+    # Create a RobotFileParser and parse the robots.txt
+    rfp = RobotFileParser()
+    rfp.parse(robots_text.split('\n'))
+    redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
     # Test Allowed URL
     assert await redis_politeness_enforcer.is_url_allowed(allowed_url) is True
@@ -312,13 +313,16 @@ async def test_is_url_allowed_seeded_urls_only(redis_client: redis.Redis, mock_f
 async def test_get_crawl_delay_from_robots_agent_specific(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
     domain = "delaytest.com"
     for agent_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
-        robots_text = f"User-agent: {dummy_config.user_agent}\nCrawl-delay: {agent_delay}"
+        # Use simplified user agent for robots.txt (without version/parens)
+        robots_text = f"User-agent: TestCrawler\nCrawl-delay: {agent_delay}"
         
-        # Mock _get_robots_for_domain to return a parser with this rule
-        rerp = RobotExclusionRulesParser()
-        rerp.user_agent = dummy_config.user_agent
-        rerp.parse(robots_text)
-        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
+        # Create a RobotFileParser and parse the robots.txt
+        rfp = RobotFileParser()
+        rfp.parse(robots_text.split('\n'))
+        rfp._content = robots_text  # type: ignore[attr-defined]
+        
+        # Mock _get_robots_for_domain to return our parser
+        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
         delay = await redis_politeness_enforcer.get_crawl_delay(domain)
         assert delay == max(float(agent_delay), float(MIN_CRAWL_DELAY_SECONDS))
@@ -329,10 +333,13 @@ async def test_get_crawl_delay_from_robots_wildcard(redis_politeness_enforcer: R
     for wildcard_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
         robots_text = f"User-agent: AnotherBot\nCrawl-delay: 50\nUser-agent: *\nCrawl-delay: {wildcard_delay}"
 
-        rerp = RobotExclusionRulesParser()
-        rerp.user_agent = dummy_config.user_agent
-        rerp.parse(robots_text)
-        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
+        # Create a RobotFileParser and parse the robots.txt
+        rfp = RobotFileParser()
+        rfp.parse(robots_text.split('\n'))
+        rfp._content = robots_text  # type: ignore[attr-defined]
+        
+        # Mock _get_robots_for_domain to return our parser
+        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
         delay = await redis_politeness_enforcer.get_crawl_delay(domain)
         assert delay == max(float(wildcard_delay), float(MIN_CRAWL_DELAY_SECONDS))
@@ -342,10 +349,9 @@ async def test_get_crawl_delay_default_no_robots_rule(redis_politeness_enforcer:
     domain = "nodelayrule.com"
     robots_text = "User-agent: *\nDisallow: /"
 
-    rerp = RobotExclusionRulesParser()
-    rerp.user_agent = dummy_config.user_agent
-    rerp.parse(robots_text)
-    redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
+    rfp = RobotFileParser()
+    rfp.parse(robots_text.split('\n'))
+    redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
     delay = await redis_politeness_enforcer.get_crawl_delay(domain)
     assert delay == float(MIN_CRAWL_DELAY_SECONDS)
@@ -356,10 +362,13 @@ async def test_get_crawl_delay_respects_min_crawl_delay(redis_politeness_enforce
     for robot_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
         robots_text = f"User-agent: *\nCrawl-delay: {robot_delay}"
 
-        rerp = RobotExclusionRulesParser()
-        rerp.user_agent = dummy_config.user_agent
-        rerp.parse(robots_text)
-        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rerp)
+        # Create a RobotFileParser and parse the robots.txt
+        rfp = RobotFileParser()
+        rfp.parse(robots_text.split('\n'))
+        rfp._content = robots_text  # type: ignore[attr-defined]
+        
+        # Mock _get_robots_for_domain to return our parser
+        redis_politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
         delay = await redis_politeness_enforcer.get_crawl_delay(domain)
         assert delay == max(float(robot_delay), float(MIN_CRAWL_DELAY_SECONDS))
@@ -488,11 +497,11 @@ async def test_robots_txt_with_null_byte(redis_politeness_enforcer: RedisPoliten
     )
     
     # Get robots for domain
-    rerp = await redis_politeness_enforcer._get_robots_for_domain(domain)
+    rfp = await redis_politeness_enforcer._get_robots_for_domain(domain)
     
     # Should treat as empty (allow all)
-    assert rerp is not None
-    assert rerp.is_allowed(redis_politeness_enforcer.config.user_agent, "/private") is True
+    assert rfp is not None
+    assert rfp.can_fetch(redis_politeness_enforcer.config.user_agent, "/private") is True
     
     # Check that empty string was cached
     stored_content = await redis_politeness_enforcer.redis.hget(f'domain:{domain}', 'robots_txt')
