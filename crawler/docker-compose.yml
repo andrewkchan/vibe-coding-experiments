@@ -42,8 +42,8 @@ services:
       - redis-data:/data
     command: >
       redis-server
-      --maxmemory 12gb
-      --maxmemory-policy allkeys-lru
+      --maxmemory 24gb
+      --maxmemory-policy noeviction
       --save 900 1
       --save 300 10
       --save 60 10000
