@@ -269,6 +269,7 @@ class PostgreSQLToHybridMigrator:
 - [X] Update CrawlerOrchestrator to use new frontier and politeness
 - [ ] Implement PostgreSQL migration script
 - [ ] Add monitoring/metrics for new system
+- [ ] Update docs
 
 ### Phase 3: Migration Preparation (Day 4)
 - [ ] Backup PostgreSQL database

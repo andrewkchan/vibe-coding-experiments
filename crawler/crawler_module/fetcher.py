@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import aiohttp
+import time
 import cchardet # For fast character encoding detection
 from aiohttp.client_reqrep import ClientResponse as AiohttpClientResponse # Correct import
 
@@ -78,10 +79,17 @@ class Fetcher:
                 content_type = response.headers.get('Content-Type')
                 
                 text_content: Optional[str] = None
-                if content_bytes:
+                if content_bytes and content_type and content_type.startswith('text/'):
                     # Try to decode using cchardet for speed and accuracy
                     try:
+                        start_time = time.time()
                         detected_encoding = cchardet.detect(content_bytes)['encoding']
+                        end_time = time.time()
+                        if end_time - start_time > 0.5:
+                            logger.warning(f"ENCODER: Encoding detection time: {end_time - start_time} seconds for content of size {len(content_bytes)} bytes")
+                            logger.warning(f"ENCODER: Detected encoding: {detected_encoding}")
+                            logger.warning(f"ENCODER: Content type: {content_type}")
+                            logger.warning(f"ENCODER: URL: {actual_final_url}")
                         if detected_encoding:
                             text_content = content_bytes.decode(detected_encoding, errors='replace')
                         else:
