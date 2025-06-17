@@ -1,8 +1,14 @@
 import logging
 import time
 from pathlib import Path
-from typing import Set
+from typing import Set, Optional, Tuple, List, Dict
 import asyncio
+import os
+import redis.asyncio as redis
+import aiofiles  # type: ignore
+import hashlib
+import json
+import shutil
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -19,22 +25,86 @@ class FrontierManager:
         self.seen_urls: Set[str] = set()  # In-memory set for quick checks during a session
 
     async def _populate_seen_urls_from_db(self) -> Set[str]:
-        """Loads all URLs from visited_urls and frontier tables."""
+        """Loads all URLs from visited_urls and frontier tables in chunks to avoid OOM."""
         seen = set()
+        chunk_size = 1_000_000
+        
         try:
-            # Load from visited_urls
-            rows = await self.storage.db.fetch_all("SELECT url FROM visited_urls", query_name="populate_seen_from_visited")
-            for row in rows:
-                seen.add(row[0])
+            # Load from visited_urls in chunks
+            offset = 0
+            visited_count = 0
+            while True:
+                if self.storage.config.db_type == "postgresql":
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM visited_urls ORDER BY url_sha256 LIMIT %s OFFSET %s",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_visited_chunked"
+                    )
+                else:  # SQLite
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM visited_urls ORDER BY url_sha256 LIMIT ? OFFSET ?",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_visited_chunked"
+                    )
+                
+                if not rows:
+                    break
+                    
+                for row in rows:
+                    seen.add(row[0])
+                
+                visited_count += len(rows)
+                offset += chunk_size
+                
+                if len(rows) < chunk_size:
+                    break
+                    
+                # Log progress for large datasets
+                if visited_count % 1_000_000 == 0:
+                    logger.info(f"Progress: Loaded {visited_count} URLs from visited_urls...")
             
-            # Load from current frontier (in case of resume)
-            rows = await self.storage.db.fetch_all("SELECT url FROM frontier", query_name="populate_seen_from_frontier")
-            for row in rows:
-                seen.add(row[0])
+            logger.info(f"Loaded {visited_count} URLs from visited_urls table")
             
-            logger.info(f"Loaded {len(seen)} URLs for seen_urls set.")
+            # Load from current frontier in chunks (in case of resume)
+            offset = 0
+            frontier_count = 0
+            while True:
+                if self.storage.config.db_type == "postgresql":
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM frontier ORDER BY id LIMIT %s OFFSET %s",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_frontier_chunked"
+                    )
+                else:  # SQLite
+                    rows = await self.storage.db.fetch_all(
+                        "SELECT url FROM frontier ORDER BY id LIMIT ? OFFSET ?",
+                        (chunk_size, offset),
+                        query_name="populate_seen_from_frontier_chunked"
+                    )
+                
+                if not rows:
+                    break
+                    
+                for row in rows:
+                    seen.add(row[0])
+                
+                frontier_count += len(rows)
+                offset += chunk_size
+                
+                if len(rows) < chunk_size:
+                    break
+                    
+                # Log progress for large datasets
+                if frontier_count % 1_000_000 == 0:
+                    logger.info(f"Progress: Loaded {frontier_count} URLs from frontier...")
+            
+            logger.info(f"Loaded {frontier_count} URLs from frontier table")
+            logger.info(f"Total: Loaded {len(seen)} unique URLs for seen_urls set")
+            
         except Exception as e:
-            logger.error(f"Error loading for seen_urls set: {e}")
+            logger.error(f"Error loading seen_urls set: {e}")
+            raise  # Re-raise to handle the error at a higher level
+        
         return seen
 
     async def initialize_frontier(self):
@@ -101,8 +171,17 @@ class FrontierManager:
             seed_domains = {extract_domain(u) for u in urls if extract_domain(u)}
             await self._mark_domains_as_seeded_batch(list(seed_domains))
             
-            # Add all URLs to the frontier in one batch
-            added_count = await self.add_urls_batch(urls)
+            logger.info(f"Adding {len(urls)} URLs to the frontier")
+            async def add_urls_batch_worker(urls: list[str]):
+                added_count = await self.add_urls_batch(urls)
+                return added_count
+            seed_tasks = []
+            chunk_size = (len(urls) + self.config.max_workers - 1) // self.config.max_workers
+            for i in range(self.config.max_workers):
+                url_chunk = urls[i*chunk_size:(i+1)*chunk_size]
+                seed_tasks.append(add_urls_batch_worker(url_chunk))
+            added_counts = await asyncio.gather(*seed_tasks)
+            added_count = sum(added_counts)
             
             logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
         except IOError as e:
@@ -435,3 +514,420 @@ class FrontierManager:
             )
         except Exception as e:
             logger.error(f"Error unclaiming URL ID {url_id}: {e}")
+
+class HybridFrontierManager:
+    """Redis + File-based frontier manager for high-performance crawling.
+    
+    Uses Redis for coordination and metadata, with file-based storage for actual frontier URLs.
+    This gives us Redis performance for the hot path while keeping memory usage reasonable.
+    """
+    
+    def __init__(self, config: CrawlerConfig, politeness: PolitenessEnforcer, redis_client: redis.Redis):
+        self.config = config
+        self.politeness = politeness
+        self.redis = redis_client
+        self.frontier_dir = config.data_dir / "frontiers"
+        self.frontier_dir.mkdir(exist_ok=True)
+        self.write_locks: Dict[str, asyncio.Lock] = {}  # Per-domain write locks
+        
+    def _get_frontier_path(self, domain: str) -> Path:
+        """Get file path for domain's frontier."""
+        # Use first 2 chars of hash for subdirectory (256 subdirs)
+        domain_hash = hashlib.md5(domain.encode()).hexdigest()
+        subdir = domain_hash[:2]
+        path = self.frontier_dir / subdir / f"{domain}.frontier"
+        path.parent.mkdir(exist_ok=True)
+        return path
+    
+    async def initialize_frontier(self):
+        """Initialize the frontier, loading seeds or resuming from existing data."""
+        # Initialize bloom filter if it doesn't exist
+        try:
+            # Try to get bloom filter info - will fail if it doesn't exist
+            await self.redis.execute_command('BF.INFO', 'seen:bloom')
+            logger.info("Bloom filter already exists, using existing filter")
+        except:
+            # Create bloom filter for seen URLs
+            # Estimate: visited + frontier + some growth room (default to 10M for new crawls)
+            try:
+                await self.redis.execute_command(
+                    'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
+                )
+                logger.info("Created new bloom filter for 160M URLs with 0.1% FPR")
+            except:
+                logger.warning("Could not create bloom filter - it may already exist")
+        
+        # Load seen URLs into memory cache (for compatibility with existing interface)
+        await self._populate_seen_urls_from_redis()
+        
+        if self.config.resume:
+            count = await self.count_frontier()
+            logger.info(f"Resuming crawl. Frontier has approximately {count} URLs.")
+            if count == 0:
+                logger.warning("Resuming with an empty frontier. Attempting to load seeds.")
+                await self._load_seeds()
+        else:
+            logger.info("Starting new crawl. Clearing any existing frontier and loading seeds.")
+            await self._clear_frontier()
+            await self._load_seeds()
+    
+    async def _populate_seen_urls_from_redis(self):
+        """Populate in-memory seen_urls from Redis visited records."""
+        # For compatibility, we load a subset of visited URLs into memory
+        # In production, we'd rely entirely on the bloom filter
+        visited_count = 0
+        cursor = 0
+        
+        while True:
+            cursor, keys = await self.redis.scan(
+                cursor, match='visited:*', count=1000
+            )
+            
+            if keys:
+                pipe = self.redis.pipeline()
+                for key in keys:
+                    pipe.hget(key, 'url')
+                urls = await pipe.execute()
+                
+                for url in urls:
+                    if url:
+                        visited_count += 1
+            
+            # Exit when cursor returns to 0    
+            if cursor == 0:
+                break
+                
+        logger.info(f"Loaded {visited_count} URLs into in-memory seen_urls cache")
+    
+    async def _clear_frontier(self):
+        """Clear all frontier data."""
+        # Clear Redis structures
+        pipe = self.redis.pipeline()
+        
+        # Clear domain metadata and ready queue
+        cursor = 0
+        while True:
+            cursor, keys = await self.redis.scan(
+                cursor, match='domain:*', count=1000
+            )
+            if keys:
+                pipe.delete(*keys)
+            if cursor == 0:
+                break
+        
+        pipe.delete('domains:queue')
+        await pipe.execute()
+        
+        # Clear frontier files
+        if self.frontier_dir.exists():
+            shutil.rmtree(self.frontier_dir)
+            self.frontier_dir.mkdir(exist_ok=True)
+            
+        logger.info("Cleared all frontier data")
+    
+    async def _load_seeds(self):
+        """Load seed URLs from file."""
+        logger.info(f"Loading seeds from {self.config.seed_file}")
+        if not self.config.seed_file.exists():
+            logger.error(f"Seed file not found: {self.config.seed_file}")
+            return
+            
+        try:
+            with open(self.config.seed_file, 'r') as f:
+                urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                
+            if not urls:
+                logger.warning(f"Seed file {self.config.seed_file} is empty.")
+                return
+                
+            # Mark domains as seeded
+            seed_domains = {extract_domain(u) for u in urls if extract_domain(u)}
+            await self._mark_domains_as_seeded_batch(list(seed_domains))
+            
+            # Add URLs to frontier
+            logger.info(f"Adding {len(urls)} URLs to the frontier")
+            async def add_urls_batch_worker(worker_id: int, urls: list[str]) -> int:
+                subchunk_size = 100
+                added_count = 0
+                for i in range(0, len(urls), subchunk_size):
+                    added_count += await self.add_urls_batch(urls[i:i+subchunk_size])
+                    logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
+                return added_count
+            seed_tasks = []
+            chunk_size = (len(urls) + self.config.max_workers - 1) // self.config.max_workers
+            for i in range(self.config.max_workers):
+                url_chunk = urls[i*chunk_size:(i+1)*chunk_size]
+                seed_tasks.append(add_urls_batch_worker(i, url_chunk))
+            added_counts = await asyncio.gather(*seed_tasks)
+            added_count = sum(added_counts)
+            logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
+            
+        except IOError as e:
+            logger.error(f"Error reading seed file {self.config.seed_file}: {e}")
+    
+    async def _mark_domains_as_seeded_batch(self, domains: List[str]):
+        """Mark domains as seeded in domain metadata."""
+        if not domains:
+            return
+            
+        pipe = self.redis.pipeline()
+        for i, domain in enumerate(domains):
+            pipe.hset(f'domain:{domain}', 'is_seeded', '1')
+            if i % 10_000 == 0:
+                logger.info(f"Mark {i}/{len(domains)} domains as seeded")
+        await pipe.execute()
+        logger.debug(f"Marked {len(domains)} domains as seeded")
+    
+    async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
+        """Add URLs to frontier files."""
+        # 1. Normalize and pre-filter
+        candidates = set()
+        for u in urls:
+            try:
+                normalized = normalize_url(u)
+                if normalized:
+                    candidates.add(normalized)
+            except Exception as e:
+                logger.debug(f"Failed to normalize URL {u}: {e}")
+        
+        if not candidates:
+            return 0
+            
+        # 2. Check against bloom filter and visited URLs
+        new_urls = []
+        
+        for url in candidates:
+            # Check bloom filter
+            exists = await self.redis.execute_command('BF.EXISTS', 'seen:bloom', url)
+            if not exists:
+                # Double-check against visited URLs (for exact match)
+                url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+                visited = await self.redis.exists(f'visited:{url_hash}')
+                if not visited:
+                    new_urls.append(url)
+                    
+        if not new_urls:
+            return 0
+        
+        # 3. Politeness filtering
+        allowed_urls = []
+        for url in new_urls:
+            if await self.politeness.is_url_allowed(url):
+                allowed_urls.append(url)
+
+        if not allowed_urls:
+            return 0
+            
+        # 4. Group URLs by domain
+        urls_by_domain: Dict[str, List[Tuple[str, int]]] = {}
+        for url in allowed_urls:
+            domain = extract_domain(url)
+            if domain:
+                if domain not in urls_by_domain:
+                    urls_by_domain[domain] = []
+                urls_by_domain[domain].append((url, depth))
+                
+        # 5. Add URLs to domain frontier files
+        added_total = 0
+        for domain, domain_urls in urls_by_domain.items():
+            added = await self._add_urls_to_domain(domain, domain_urls)
+            added_total += added
+            
+        return added_total
+    
+    async def _add_urls_to_domain(self, domain: str, urls: List[Tuple[str, int]]) -> int:
+        """Add URLs to a specific domain's frontier file."""
+        # Get or create write lock for this domain
+        if domain not in self.write_locks:
+            self.write_locks[domain] = asyncio.Lock()
+            
+        async with self.write_locks[domain]:
+            frontier_path = self._get_frontier_path(domain)
+            domain_key = f"domain:{domain}"
+            
+            # Filter out URLs already in bloom filter
+            new_urls = []
+            for url, depth in urls:
+                # Add to bloom filter (idempotent operation)
+                await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
+                # Check if it was already there (BF.ADD returns 0 if already existed)
+                # For simplicity, we'll just add all URLs and rely on file deduplication
+                new_urls.append((url, depth))
+                
+            if not new_urls:
+                return 0
+                
+            # Append to frontier file
+            lines_to_write = []
+            for url, depth in new_urls:
+                # Format: url|depth
+                line = f"{url}|{depth}\n"
+                lines_to_write.append(line)
+                
+            async with aiofiles.open(frontier_path, 'a') as f:
+                await f.writelines(lines_to_write)
+                
+            # Update Redis metadata
+            pipe = self.redis.pipeline()
+            
+            # Get current size
+            current_size_result = self.redis.hget(domain_key, 'frontier_size')
+            if asyncio.iscoroutine(current_size_result):
+                current_size = await current_size_result
+            else:
+                current_size = current_size_result
+            new_size = int(current_size or 0) + len(new_urls)
+            
+            # Get is_seeded status
+            is_seeded_result = self.redis.hget(domain_key, 'is_seeded')
+            if asyncio.iscoroutine(is_seeded_result):
+                is_seeded = await is_seeded_result
+            else:
+                is_seeded = is_seeded_result
+            
+            # Update metadata
+            pipe.hset(domain_key, mapping={
+                'frontier_size': str(new_size),
+                'file_path': str(frontier_path.relative_to(self.frontier_dir)),
+                'is_seeded': '1' if is_seeded else '0'
+            })
+            
+            # Initialize offset if needed
+            pipe.hsetnx(domain_key, 'frontier_offset', '0')
+            
+            # Add domain to queue
+            # Note: This might add duplicates, but we handle that when popping
+            pipe.rpush('domains:queue', domain)
+            
+            await pipe.execute()
+            
+            return len(new_urls)
+    
+    async def is_empty(self) -> bool:
+        """Check if frontier is empty."""
+        # Check if there are any domains in the queue
+        count = await self.redis.llen('domains:queue')  # type: ignore[misc]
+        return count == 0
+    
+    async def count_frontier(self) -> int:
+        """Estimate the number of URLs in the frontier."""
+        total = 0
+        cursor = 0
+        
+        # Sum up frontier sizes from all domains
+        while True:
+            cursor, keys = await self.redis.scan(
+                cursor, match='domain:*', count=1000
+            )
+            
+            if keys:
+                pipe = self.redis.pipeline()
+                for key in keys:
+                    pipe.hget(key, 'frontier_size')
+                    pipe.hget(key, 'frontier_offset')
+                    
+                results = await pipe.execute()
+                
+                # Process results in pairs (size, offset)
+                for i in range(0, len(results), 2):
+                    size = int(results[i] or 0)
+                    offset = int(results[i + 1] or 0)
+                    # Remaining URLs = size - (offset / bytes_per_line)
+                    # We need to estimate bytes per line or track line count
+                    # For now, assume offset tracks line count
+                    remaining = max(0, size - offset)
+                    total += remaining
+            
+            # Exit when cursor returns to 0
+            if cursor == 0:
+                break
+                    
+        return total
+    
+    async def get_next_url(self, worker_id: int = 0, total_workers: int = 1) -> Optional[Tuple[str, str, int, int]]:
+        """Get next URL to crawl.
+        
+        Returns None if no URLs are available OR if politeness rules prevent fetching.
+        The caller is responsible for retrying.
+        """
+        # Atomically pop a domain from the front of the queue
+        domain = await self.redis.lpop('domains:queue')  # type: ignore[misc]
+        
+        if not domain:
+            return None  # Queue is empty
+        
+        try:
+            # Check if we can fetch from this domain now
+            # This is where PolitenessEnforcer decides based on its rules
+            if not await self.politeness.can_fetch_domain_now(domain):
+                # Domain not ready
+                return None
+                
+            # Get URL from this domain
+            url_data = await self._get_url_from_domain(domain)
+            
+            if url_data:
+                url, extracted_domain, depth = url_data
+                
+                # Double-check URL-level politeness rules
+                if not await self.politeness.is_url_allowed(url):
+                    logger.debug(f"URL {url} disallowed by politeness rules")
+                    # Put domain back, caller decides whether to retry
+                    return None
+                    
+                # Record the fetch attempt in PolitenessEnforcer
+                await self.politeness.record_domain_fetch_attempt(domain)
+                
+                # Return URL with a dummy ID (for interface compatibility)
+                return (url, domain, -1, depth)
+        finally:
+            # Domain always goes back to the end of the queue, regardless of success or failure
+            await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
+        
+        return None
+    
+    async def _get_url_from_domain(self, domain: str) -> Optional[Tuple[str, str, int]]:
+        """Read next URL from domain's frontier file."""
+        domain_key = f"domain:{domain}"
+        
+        # Get file info from Redis
+        file_info = await self.redis.hmget(  # type: ignore[misc]
+            domain_key, 
+            ['file_path', 'frontier_offset', 'frontier_size']
+        )
+        
+        if not file_info[0]:  # No file path
+            return None
+            
+        file_path = self.frontier_dir / file_info[0]
+        offset = int(file_info[1] or 0)
+        size = int(file_info[2] or 0)
+        
+        if offset >= size:  # All URLs consumed
+            return None
+            
+        # Read URL from file
+        try:
+            async with aiofiles.open(file_path, 'r') as f:
+                # Read all lines to find the next valid URL
+                lines = await f.readlines()
+                
+                # Find the line at the current offset
+                if offset < len(lines):
+                    line = lines[offset].strip()
+                    
+                    if line:
+                        # Update offset
+                        new_offset = offset + 1
+                        await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
+                        
+                        # Parse URL data
+                        parts = line.split('|')
+                        if len(parts) >= 2:
+                            url, depth_str = parts[:2]
+                            return url, domain, int(depth_str)
+                            
+        except Exception as e:
+            logger.error(f"Error reading frontier file {file_path}: {e}")
+            
+        return None
