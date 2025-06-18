@@ -14,7 +14,7 @@ import sys
 import redis.asyncio as redis
 from prometheus_client import Counter, Histogram, Gauge
 
-from .config import CrawlerConfig
+from .config import CrawlerConfig, parse_args
 from .parser import PageParser
 from .redis_storage import RedisStorageManager
 from .frontier import HybridFrontierManager
@@ -214,10 +214,7 @@ async def main():
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
-    # Load config (you might want to pass this differently)
-    from .config import CrawlerConfig
-    config = CrawlerConfig()
+    config: CrawlerConfig = parse_args()
     
     consumer = ParserConsumer(config)
     await consumer.run()
