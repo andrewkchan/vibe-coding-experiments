@@ -6,7 +6,7 @@ import asyncio
 import logging
 import json
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from pathlib import Path
 import signal
 import sys
@@ -30,12 +30,14 @@ parse_queue_size_gauge = Gauge('parse_queue_size', 'Number of items in parse que
 parse_duration_histogram = Histogram('parse_duration_seconds', 'Time to parse HTML')
 parse_processed_counter = Counter('parse_processed_total', 'Total parsed pages')
 parse_errors_counter = Counter('parse_errors_total', 'Total parsing errors', ['error_type'])
+active_parser_workers_gauge = Gauge('active_parser_workers', 'Number of active parser workers')
 
 class ParserConsumer:
     """Consumes raw HTML from Redis queue and processes it."""
     
-    def __init__(self, config: CrawlerConfig):
+    def __init__(self, config: CrawlerConfig, num_workers: int = 50):
         self.config = config
+        self.num_workers = num_workers
         self.redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
         self.parser = PageParser()
         
@@ -52,6 +54,7 @@ class ParserConsumer:
         
         self._shutdown_event = asyncio.Event()
         self._setup_signal_handlers()
+        self.worker_tasks: Set[asyncio.Task] = set()
         
     def _setup_signal_handlers(self):
         """Setup graceful shutdown on SIGINT/SIGTERM."""
@@ -137,24 +140,14 @@ class ParserConsumer:
             logger.error(f"Error processing item: {e}", exc_info=True)
             parse_errors_counter.labels(error_type=type(e).__name__).inc()
     
-    async def run(self):
-        """Main consumer loop."""
-        logger.info("Parser consumer starting...")
+    async def _worker(self, worker_id: int):
+        """Worker coroutine that processes items from the queue."""
+        logger.info(f"Parser worker {worker_id} starting...")
+        
+        consecutive_empty = 0
+        max_consecutive_empty = 10  # Exit after 10 consecutive empty reads
         
         try:
-            # Initialize components
-            await self.storage.init_db_schema()
-            if hasattr(self.politeness, '_load_manual_exclusions'):
-                await self.politeness._load_manual_exclusions()
-            await self.frontier.initialize_frontier()
-            
-            # Start metrics server on different port than main crawler
-            start_metrics_server(port=8002)
-            logger.info("Parser metrics server started on port 8002")
-            
-            consecutive_empty = 0
-            max_consecutive_empty = 10  # Exit after 10 consecutive empty reads
-            
             while not self._shutdown_event.is_set():
                 try:
                     # Use BLPOP for blocking pop with timeout
@@ -164,44 +157,90 @@ class ParserConsumer:
                     if result is None:
                         consecutive_empty += 1
                         if consecutive_empty >= max_consecutive_empty:
-                            logger.info(f"Queue empty for {max_consecutive_empty} consecutive reads, checking if crawl is done...")
-                            # Check if main crawler is still running by looking at active workers
-                            # This is a simple heuristic - you might want a more sophisticated check
-                            queue_size = await self.redis_client.llen('fetch:queue')
-                            if queue_size == 0:
-                                logger.info("Queue confirmed empty and no new items arriving, shutting down...")
-                                break
+                            logger.debug(f"Worker {worker_id}: Queue empty for {max_consecutive_empty} consecutive reads")
                         continue
                     
                     consecutive_empty = 0  # Reset counter on successful pop
                     _, item_json = result
                     
-                    # Update queue size metric
-                    queue_size = await self.redis_client.llen('fetch:queue')
-                    parse_queue_size_gauge.set(queue_size)
-                    
                     # Parse JSON data
                     try:
                         item_data = json.loads(item_json)
                     except json.JSONDecodeError as e:
-                        logger.error(f"Invalid JSON in queue: {e}")
+                        logger.error(f"Worker {worker_id}: Invalid JSON in queue: {e}")
                         parse_errors_counter.labels(error_type='json_decode').inc()
                         continue
                     
                     # Process the item
                     await self._process_item(item_data)
                     
+                    # Yield to other workers
+                    await asyncio.sleep(0)
+                    
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.error(f"Error in consumer loop: {e}", exc_info=True)
-                    parse_errors_counter.labels(error_type='consumer_loop').inc()
+                    logger.error(f"Worker {worker_id}: Error in worker loop: {e}", exc_info=True)
+                    parse_errors_counter.labels(error_type='worker_loop').inc()
                     await asyncio.sleep(1)  # Brief pause on error
                     
+        except asyncio.CancelledError:
+            logger.info(f"Parser worker {worker_id} cancelled")
+        finally:
+            logger.info(f"Parser worker {worker_id} shutting down")
+    
+    async def run(self):
+        """Main consumer loop."""
+        logger.info(f"Parser consumer starting with {self.num_workers} workers...")
+        
+        try:
+            # Don't re-initialize components - they're already initialized by the orchestrator
+            # Just start the metrics server on a different port
+            start_metrics_server(port=8002)
+            logger.info("Parser metrics server started on port 8002")
+            
+            # Start worker tasks
+            for i in range(self.num_workers):
+                task = asyncio.create_task(self._worker(i + 1))
+                self.worker_tasks.add(task)
+            
+            logger.info(f"Started {len(self.worker_tasks)} parser workers")
+            
+            # Monitor queue size periodically
+            while not self._shutdown_event.is_set():
+                # Update metrics
+                queue_size = await self.redis_client.llen('fetch:queue')
+                parse_queue_size_gauge.set(queue_size)
+                
+                active_workers = sum(1 for task in self.worker_tasks if not task.done())
+                active_parser_workers_gauge.set(active_workers)
+                
+                # Check if all workers have exited
+                if not any(not task.done() for task in self.worker_tasks):
+                    logger.info("All parser workers have completed")
+                    break
+                
+                # Wait a bit before next check
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass  # Continue monitoring
+                
         except Exception as e:
             logger.critical(f"Parser consumer critical error: {e}", exc_info=True)
+            self._shutdown_event.set()
         finally:
             logger.info("Parser consumer shutting down...")
+            
+            # Cancel all worker tasks
+            for task in self.worker_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for all tasks to complete
+            if self.worker_tasks:
+                await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+            
             await self.fetcher.close_session()
             await self.storage.close()
             await self.redis_client.aclose()
@@ -214,7 +253,10 @@ async def main():
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    config: CrawlerConfig = parse_args()
+    config = parse_args()
+    
+    # When run standalone, assume the developer has initialized Redis properly
+    logger.info("Starting standalone parser consumer (assuming Redis is initialized)")
     
     consumer = ParserConsumer(config)
     await consumer.run()
