@@ -31,11 +31,14 @@ parse_duration_histogram = Histogram('parse_duration_seconds', 'Time to parse HT
 parse_processed_counter = Counter('parse_processed_total', 'Total parsed pages')
 parse_errors_counter = Counter('parse_errors_total', 'Total parsing errors', ['error_type'])
 active_parser_workers_gauge = Gauge('active_parser_workers', 'Number of active parser workers')
+pages_per_second_gauge = Gauge('parser_pages_per_second', 'Pages parsed per second')
+
+METRICS_LOG_INTERVAL_SECONDS = 60
 
 class ParserConsumer:
     """Consumes raw HTML from Redis queue and processes it."""
     
-    def __init__(self, config: CrawlerConfig, num_workers: int = 50):
+    def __init__(self, config: CrawlerConfig, num_workers: int = 80):
         self.config = config
         self.num_workers = num_workers
         self.redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
@@ -56,6 +59,12 @@ class ParserConsumer:
         self._setup_signal_handlers()
         self.worker_tasks: Set[asyncio.Task] = set()
         
+        # Metrics tracking
+        self.pages_parsed_count: int = 0
+        self.pages_parsed_in_interval: int = 0
+        self.last_metrics_log_time: float = time.time()
+        self.start_time: float = 0.0
+        
     def _setup_signal_handlers(self):
         """Setup graceful shutdown on SIGINT/SIGTERM."""
         def signal_handler(signum, frame):
@@ -70,6 +79,34 @@ class ParserConsumer:
         except ValueError:
             # Can happen in some contexts, ignore
             pass
+    
+    async def _log_metrics(self):
+        """Log parsing metrics similar to orchestrator."""
+        current_time = time.time()
+        time_elapsed_seconds = current_time - self.last_metrics_log_time
+        if time_elapsed_seconds == 0: 
+            time_elapsed_seconds = 1  # Avoid division by zero
+
+        pages_per_second = self.pages_parsed_in_interval / time_elapsed_seconds
+        logger.info(f"[Parser Metrics] Pages Parsed/sec: {pages_per_second:.2f}")
+        
+        # Update Prometheus gauge
+        pages_per_second_gauge.set(pages_per_second)
+        
+        # Additional parser-specific metrics
+        queue_size = await self.redis_client.llen('fetch:queue')
+        active_workers = sum(1 for task in self.worker_tasks if not task.done())
+        
+        logger.info(f"[Parser Metrics] Queue size: {queue_size}, Active workers: {active_workers}/{self.num_workers}")
+        
+        # Log cumulative stats
+        total_runtime = current_time - self.start_time
+        overall_rate = self.pages_parsed_count / total_runtime if total_runtime > 0 else 0
+        logger.info(f"[Parser Metrics] Total parsed: {self.pages_parsed_count}, Overall rate: {overall_rate:.2f}/sec, Runtime: {total_runtime:.0f}s")
+        
+        # Reset interval counter
+        self.pages_parsed_in_interval = 0
+        self.last_metrics_log_time = current_time
     
     async def _process_item(self, item_data: Dict[str, Any]) -> None:
         """Process a single item from the queue."""
@@ -133,7 +170,11 @@ class ParserConsumer:
                 redirected_to_url=url if is_redirect and initial_url != url else None
             )
             
+            # Update metrics
+            self.pages_parsed_count += 1
+            self.pages_parsed_in_interval += 1
             parse_processed_counter.inc()
+            
             logger.info(f"Successfully processed {url}: saved={bool(content_storage_path_str)}, links_added={links_added}")
             
         except Exception as e:
@@ -192,6 +233,7 @@ class ParserConsumer:
     async def run(self):
         """Main consumer loop."""
         logger.info(f"Parser consumer starting with {self.num_workers} workers...")
+        self.start_time = time.time()
         
         try:
             # Don't re-initialize components - they're already initialized by the orchestrator
@@ -206,9 +248,13 @@ class ParserConsumer:
             
             logger.info(f"Started {len(self.worker_tasks)} parser workers")
             
-            # Monitor queue size periodically
+            # Monitor queue size and log metrics periodically
             while not self._shutdown_event.is_set():
-                # Update metrics
+                # Check if it's time to log metrics
+                if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
+                    await self._log_metrics()
+                
+                # Update real-time metrics
                 queue_size = await self.redis_client.llen('fetch:queue')
                 parse_queue_size_gauge.set(queue_size)
                 
@@ -230,6 +276,9 @@ class ParserConsumer:
             logger.critical(f"Parser consumer critical error: {e}", exc_info=True)
             self._shutdown_event.set()
         finally:
+            # Log final metrics
+            await self._log_metrics()
+            
             logger.info("Parser consumer shutting down...")
             
             # Cancel all worker tasks
@@ -244,7 +293,11 @@ class ParserConsumer:
             await self.fetcher.close_session()
             await self.storage.close()
             await self.redis_client.aclose()
-            logger.info("Parser consumer shutdown complete.")
+            
+            # Log final stats
+            total_runtime = time.time() - self.start_time
+            logger.info(f"Parser consumer shutdown complete. Total pages parsed: {self.pages_parsed_count}")
+            logger.info(f"Total runtime: {total_runtime:.2f} seconds.")
 
 
 async def main():
