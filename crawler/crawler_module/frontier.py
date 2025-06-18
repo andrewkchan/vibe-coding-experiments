@@ -14,6 +14,7 @@ from .config import CrawlerConfig
 from .storage import StorageManager
 from .utils import normalize_url, extract_domain
 from .politeness import PolitenessEnforcer
+from .redis_lock import LockManager
 
 logger = logging.getLogger(__name__)
 
@@ -528,7 +529,7 @@ class HybridFrontierManager:
         self.redis = redis_client
         self.frontier_dir = config.data_dir / "frontiers"
         self.frontier_dir.mkdir(exist_ok=True)
-        self.write_locks: Dict[str, asyncio.Lock] = {}  # Per-domain write locks
+        self.lock_manager = LockManager(redis_client)
         
     def _get_frontier_path(self, domain: str) -> Path:
         """Get file path for domain's frontier."""
@@ -737,71 +738,78 @@ class HybridFrontierManager:
     
     async def _add_urls_to_domain(self, domain: str, urls: List[Tuple[str, int]]) -> int:
         """Add URLs to a specific domain's frontier file."""
-        # Get or create write lock for this domain
-        if domain not in self.write_locks:
-            self.write_locks[domain] = asyncio.Lock()
-            
-        async with self.write_locks[domain]:
-            frontier_path = self._get_frontier_path(domain)
-            domain_key = f"domain:{domain}"
-            
-            # Filter out URLs already in bloom filter
-            new_urls = []
-            for url, depth in urls:
-                # Add to bloom filter (idempotent operation)
-                await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
-                # Check if it was already there (BF.ADD returns 0 if already existed)
-                # For simplicity, we'll just add all URLs and rely on file deduplication
-                new_urls.append((url, depth))
+        # Use Redis-based lock for cross-process safety
+        domain_lock = self.lock_manager.get_domain_lock(domain)
+        
+        try:
+            async with domain_lock:
+                frontier_path = self._get_frontier_path(domain)
+                domain_key = f"domain:{domain}"
                 
-            if not new_urls:
-                return 0
+                # Filter out URLs already in bloom filter
+                new_urls = []
+                for url, depth in urls:
+                    # Add to bloom filter (idempotent operation)
+                    await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
+                    # Check if it was already there (BF.ADD returns 0 if already existed)
+                    # For simplicity, we'll just add all URLs and rely on file deduplication
+                    new_urls.append((url, depth))
+                    
+                if not new_urls:
+                    return 0
+                    
+                # Append to frontier file
+                lines_to_write = []
+                for url, depth in new_urls:
+                    # Format: url|depth
+                    line = f"{url}|{depth}\n"
+                    lines_to_write.append(line)
+                    
+                async with aiofiles.open(frontier_path, 'a') as f:
+                    await f.writelines(lines_to_write)
+                    
+                # Update Redis metadata
+                pipe = self.redis.pipeline()
                 
-            # Append to frontier file
-            lines_to_write = []
-            for url, depth in new_urls:
-                # Format: url|depth
-                line = f"{url}|{depth}\n"
-                lines_to_write.append(line)
+                # Get current size
+                current_size_result = self.redis.hget(domain_key, 'frontier_size')
+                if asyncio.iscoroutine(current_size_result):
+                    current_size = await current_size_result
+                else:
+                    current_size = current_size_result
+                new_size = int(current_size or 0) + len(new_urls)
                 
-            async with aiofiles.open(frontier_path, 'a') as f:
-                await f.writelines(lines_to_write)
+                # Get is_seeded status
+                is_seeded_result = self.redis.hget(domain_key, 'is_seeded')
+                if asyncio.iscoroutine(is_seeded_result):
+                    is_seeded = await is_seeded_result
+                else:
+                    is_seeded = is_seeded_result
                 
-            # Update Redis metadata
-            pipe = self.redis.pipeline()
-            
-            # Get current size
-            current_size_result = self.redis.hget(domain_key, 'frontier_size')
-            if asyncio.iscoroutine(current_size_result):
-                current_size = await current_size_result
-            else:
-                current_size = current_size_result
-            new_size = int(current_size or 0) + len(new_urls)
-            
-            # Get is_seeded status
-            is_seeded_result = self.redis.hget(domain_key, 'is_seeded')
-            if asyncio.iscoroutine(is_seeded_result):
-                is_seeded = await is_seeded_result
-            else:
-                is_seeded = is_seeded_result
-            
-            # Update metadata
-            pipe.hset(domain_key, mapping={
-                'frontier_size': str(new_size),
-                'file_path': str(frontier_path.relative_to(self.frontier_dir)),
-                'is_seeded': '1' if is_seeded else '0'
-            })
-            
-            # Initialize offset if needed
-            pipe.hsetnx(domain_key, 'frontier_offset', '0')
-            
-            # Add domain to queue
-            # Note: This might add duplicates, but we handle that when popping
-            pipe.rpush('domains:queue', domain)
-            
-            await pipe.execute()
-            
-            return len(new_urls)
+                # Update metadata
+                pipe.hset(domain_key, mapping={
+                    'frontier_size': str(new_size),
+                    'file_path': str(frontier_path.relative_to(self.frontier_dir)),
+                    'is_seeded': '1' if is_seeded else '0'
+                })
+                
+                # Initialize offset if needed
+                pipe.hsetnx(domain_key, 'frontier_offset', '0')
+                
+                # Add domain to queue
+                # Note: This might add duplicates, but we handle that when popping
+                pipe.rpush('domains:queue', domain)
+                
+                await pipe.execute()
+                
+                return len(new_urls)
+                
+        except TimeoutError:
+            logger.error(f"Failed to acquire lock for domain {domain} - another process may be stuck")
+            return 0
+        except Exception as e:
+            logger.error(f"Error adding URLs to domain {domain}: {e}")
+            return 0
     
     async def is_empty(self) -> bool:
         """Check if frontier is empty."""
@@ -905,29 +913,48 @@ class HybridFrontierManager:
         
         if offset >= size:  # All URLs consumed
             return None
-            
-        # Read URL from file
+        
+        # Use Redis-based lock for reading and updating offset
+        domain_lock = self.lock_manager.get_domain_lock(domain)
+        
         try:
-            async with aiofiles.open(file_path, 'r') as f:
-                # Read all lines to find the next valid URL
-                lines = await f.readlines()
+            async with domain_lock:
+                # Re-read offset inside the lock to avoid race conditions
+                offset_str = await self.redis.hget(domain_key, 'frontier_offset')  # type: ignore[misc]
+                offset = int(offset_str or 0)
                 
-                # Find the line at the current offset
-                if offset < len(lines):
-                    line = lines[offset].strip()
-                    
-                    if line:
-                        # Update offset
-                        new_offset = offset + 1
-                        await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
+                if offset >= size:  # Check again after lock
+                    return None
+                
+                # Read URL from file
+                try:
+                    async with aiofiles.open(file_path, 'r') as f:
+                        # Read all lines to find the next valid URL
+                        lines = await f.readlines()
                         
-                        # Parse URL data
-                        parts = line.split('|')
-                        if len(parts) >= 2:
-                            url, depth_str = parts[:2]
-                            return url, domain, int(depth_str)
+                        # Find the line at the current offset
+                        if offset < len(lines):
+                            line = lines[offset].strip()
                             
+                            if line:
+                                # Update offset
+                                new_offset = offset + 1
+                                await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
+                                
+                                # Parse URL data
+                                parts = line.split('|')
+                                if len(parts) >= 2:
+                                    url, depth_str = parts[:2]
+                                    return url, domain, int(depth_str)
+                                    
+                except Exception as e:
+                    logger.error(f"Error reading frontier file {file_path}: {e}")
+                    
+        except TimeoutError:
+            logger.error(f"Failed to acquire lock for domain {domain} when reading URL")
+            return None
         except Exception as e:
-            logger.error(f"Error reading frontier file {file_path}: {e}")
+            logger.error(f"Error getting URL from domain {domain}: {e}")
+            return None
             
         return None

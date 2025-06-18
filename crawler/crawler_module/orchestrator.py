@@ -7,6 +7,9 @@ import os # For process ID
 import psutil
 import random
 from collections import defaultdict
+import json
+import multiprocessing
+from multiprocessing import Process
 import redis.asyncio as redis
 
 from .config import CrawlerConfig
@@ -15,7 +18,7 @@ from .redis_storage import RedisStorageManager
 from .fetcher import Fetcher, FetchResult
 from .politeness import PolitenessEnforcer, RedisPolitenessEnforcer
 from .frontier import FrontierManager, HybridFrontierManager
-from .parser import PageParser, ParseResult
+
 from .utils import extract_domain # For getting domain for storage
 from .db_backends import create_backend, PostgreSQLBackend
 from .metrics_utils import calculate_percentiles
@@ -61,9 +64,8 @@ class CrawlerOrchestrator:
             logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
             raise # Stop if we can't create data directory
 
-        # Initialize fetcher and parser (common to all backends)
+        # Initialize fetcher (common to all backends)
         self.fetcher: Fetcher = Fetcher(config)
-        self.parser: PageParser = PageParser()
         
         # Initialize backend-specific components
         if config.db_type == 'redis':
@@ -144,12 +146,126 @@ class CrawlerOrchestrator:
 
         self.pages_crawled_in_interval: int = 0
         self.last_metrics_log_time: float = time.time()
+        
+        # Parser process management
+        self.parser_process: Optional[Process] = None
+        self.parser_processes: List[Process] = []  # Support multiple parsers
+        self.num_parser_processes = 2
+
+    def _start_parser_process(self):
+        """Start the parser consumer as a child process."""
+        if self.config.db_type != 'redis':
+            logger.warning("Parser process only supported with Redis backend")
+            return
+            
+        def run_parser():
+            """Function to run in the parser process."""
+            # Import inside the function to avoid issues with multiprocessing
+            import asyncio
+            import logging
+            from .parser_consumer import ParserConsumer
+            
+            # Setup logging for the child process
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(name)s - %(levelname)s - [Parser] %(message)s'
+            )
+            
+            # Create and run the parser consumer
+            consumer = ParserConsumer(self.config)
+            asyncio.run(consumer.run())
+        
+        logger.info("Starting parser consumer process...")
+        self.parser_process = Process(target=run_parser, name="ParserConsumer")
+        self.parser_process.daemon = False  # Don't make it daemon so it can clean up properly
+        self.parser_process.start()
+        logger.info(f"Parser consumer process started with PID: {self.parser_process.pid}")
+    
+    def _start_parser_processes(self, num_processes: Optional[int] = None):
+        """Start multiple parser consumer processes."""
+        if self.config.db_type != 'redis':
+            logger.warning("Parser processes only supported with Redis backend")
+            return
+        
+        num_processes = num_processes or self.num_parser_processes
+        
+        def run_parser(parser_id: int):
+            """Function to run in the parser process."""
+            # Import inside the function to avoid issues with multiprocessing
+            import asyncio
+            import logging
+            from .parser_consumer import ParserConsumer
+            
+            # Setup logging for the child process
+            logging.basicConfig(
+                level=logging.INFO,
+                format=f'%(asctime)s - %(name)s - %(levelname)s - [Parser-{parser_id}] %(message)s'
+            )
+            
+            # Create and run the parser consumer
+            consumer = ParserConsumer(self.config)
+            asyncio.run(consumer.run())
+        
+        logger.info(f"Starting {num_processes} parser consumer processes...")
+        for i in range(num_processes):
+            process = Process(target=run_parser, args=(i+1,), name=f"ParserConsumer-{i+1}")
+            process.daemon = False  # Don't make it daemon so it can clean up properly
+            process.start()
+            self.parser_processes.append(process)
+            logger.info(f"Parser consumer process {i+1} started with PID: {process.pid}")
+    
+    def _stop_parser_process(self):
+        """Stop the parser consumer process gracefully."""
+        if self.parser_process and self.parser_process.is_alive():
+            logger.info("Stopping parser consumer process...")
+            self.parser_process.terminate()
+            self.parser_process.join(timeout=10)  # Wait up to 10 seconds
+            
+            if self.parser_process.is_alive():
+                logger.warning("Parser process didn't terminate gracefully, forcing...")
+                self.parser_process.kill()
+                self.parser_process.join()
+            
+            logger.info("Parser consumer process stopped.")
+    
+    def _stop_parser_processes(self):
+        """Stop all parser consumer processes gracefully."""
+        if not self.parser_processes:
+            # Fallback to single process stop
+            self._stop_parser_process()
+            return
+            
+        logger.info(f"Stopping {len(self.parser_processes)} parser consumer processes...")
+        
+        # First try to terminate gracefully
+        for process in self.parser_processes:
+            if process.is_alive():
+                process.terminate()
+        
+        # Wait for all to terminate
+        for process in self.parser_processes:
+            process.join(timeout=10)  # Wait up to 10 seconds
+            
+            if process.is_alive():
+                logger.warning(f"Parser process {process.name} didn't terminate gracefully, forcing...")
+                process.kill()
+                process.join()
+        
+        self.parser_processes.clear()
+        logger.info("All parser consumer processes stopped.")
 
     async def _initialize_components(self):
         """Initializes all crawler components that require async setup."""
         logger.info("Initializing crawler components...")
         
         if self.config.db_type == 'redis':
+            # Clear any zombie locks from previous runs
+            from .redis_lock import LockManager
+            lock_manager = LockManager(self.redis_client)
+            cleared_count = await lock_manager.clear_all_locks()
+            if cleared_count > 0:
+                logger.warning(f"Cleared {cleared_count} zombie locks from previous run")
+            
             # Redis-based initialization
             await self.storage.init_db_schema()  # Sets schema version
             # RedisPolitenesEnforcer loads exclusions differently
@@ -278,46 +394,37 @@ class CrawlerOrchestrator:
                         pages_crawled_counter.inc()  # Increment Prometheus counter
                         logger.info(f"Worker-{worker_id}: Successfully fetched {fetch_result.final_url} (Status: {fetch_result.status_code}). Total crawled: {self.pages_crawled_count}")
                         
-                        content_storage_path_str: str | None = None
-                        parse_data: Optional[ParseResult] = None
-
                         if fetch_result.text_content and fetch_result.content_type and "html" in fetch_result.content_type.lower():
-                            logger.debug(f"Worker-{worker_id}: Parsing HTML content for {fetch_result.final_url}")
-                            parse_data = self.parser.parse_html_content(fetch_result.text_content, fetch_result.final_url)
+                            # Push to parse queue instead of parsing inline
+                            queue_item = {
+                                'url': fetch_result.final_url,
+                                'domain': domain,
+                                'depth': depth,
+                                'html_content': fetch_result.text_content,
+                                'content_type': fetch_result.content_type,
+                                'crawled_timestamp': crawled_timestamp,
+                                'status_code': fetch_result.status_code,
+                                'is_redirect': fetch_result.is_redirect,
+                                'initial_url': fetch_result.initial_url
+                            }
                             
-                            if parse_data.text_content:
-                                url_hash = self.storage.get_url_sha256(fetch_result.final_url)
-                                saved_path = await self.storage.save_content_to_file(url_hash, parse_data.text_content)
-                                if saved_path:
-                                    # Store relative path from data_dir for portability
-                                    try:
-                                        content_storage_path_str = str(saved_path.relative_to(self.config.data_dir))
-                                    except ValueError: # Should not happen if content_dir is child of data_dir
-                                        content_storage_path_str = str(saved_path)
-                                    logger.debug(f"Worker-{worker_id}: Saved content for {fetch_result.final_url} to {content_storage_path_str}")
-                            
-                            if parse_data.extracted_links:
-                                logger.debug(f"Worker-{worker_id}: Found {len(parse_data.extracted_links)} links on {fetch_result.final_url}")
-                                # Batch add URLs to the frontier
-                                links_added_this_page = await self.frontier.add_urls_batch(list(parse_data.extracted_links), depth=depth + 1)
-                                if links_added_this_page > 0:
-                                    self.total_urls_added_to_frontier += links_added_this_page
-                                    urls_added_counter.inc(links_added_this_page)  # Increment Prometheus counter
-                                    logger.info(f"Worker-{worker_id}: Added {links_added_this_page} new URLs to frontier from {fetch_result.final_url}. Total added: {self.total_urls_added_to_frontier}")
+                            # Push to Redis queue for parsing
+                            await self.redis_client.rpush('fetch:queue', json.dumps(queue_item))
+                            logger.debug(f"Worker-{worker_id}: Pushed HTML content to parse queue for {fetch_result.final_url}")
                         else:
                             logger.debug(f"Worker-{worker_id}: Not HTML or no text content for {fetch_result.final_url} (Type: {fetch_result.content_type})")
-                        
-                        # Record success
-                        await self.storage.add_visited_page(
-                            url=fetch_result.final_url,
-                            domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
-                            status_code=fetch_result.status_code,
-                            crawled_timestamp=crawled_timestamp,
-                            content_type=fetch_result.content_type,
-                            content_text=parse_data.text_content if parse_data else None, # For hashing
-                            content_storage_path_str=content_storage_path_str,
-                            redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
-                        )
+                            
+                            # For non-HTML content, still record in visited pages
+                            await self.storage.add_visited_page(
+                                url=fetch_result.final_url,
+                                domain=extract_domain(fetch_result.final_url) or domain,
+                                status_code=fetch_result.status_code,
+                                crawled_timestamp=crawled_timestamp,
+                                content_type=fetch_result.content_type,
+                                content_text=None,
+                                content_storage_path_str=None,
+                                redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
+                            )
                     
                     # Check stopping conditions after processing a page
                     if self._check_stopping_conditions():
@@ -367,6 +474,12 @@ class CrawlerOrchestrator:
             # Start Prometheus metrics server
             start_metrics_server(port=8001)
             logger.info("Prometheus metrics server started on port 8001")
+            
+            # Start parser process if using Redis backend
+            if self.config.db_type == 'redis':
+                self._start_parser_processes()
+                # Give parser a moment to initialize
+                await asyncio.sleep(2)
 
             # Start worker tasks
             logger.info(f"Starting {self.config.max_workers} workers with staggered startup...")
@@ -393,11 +506,69 @@ class CrawlerOrchestrator:
                     self._shutdown_event.set()
                     break
                 
+                # Check parser process health
+                # Handle single parser process (backward compatibility)
+                if self.parser_process and not self.parser_processes and not self.parser_process.is_alive():
+                    logger.error("Parser process died unexpectedly!")
+                    if self.parser_process.exitcode != 0:
+                        logger.error(f"Parser process exit code: {self.parser_process.exitcode}")
+                    # Restart parser processes
+                    self._start_parser_processes(1)  # Start single parser
+                
+                # Check multiple parser processes health
+                if self.parser_processes:
+                    dead_processes = []
+                    for i, process in enumerate(self.parser_processes):
+                        if not process.is_alive():
+                            logger.error(f"Parser process {process.name} died unexpectedly!")
+                            if process.exitcode != 0:
+                                logger.error(f"Parser process {process.name} exit code: {process.exitcode}")
+                            dead_processes.append(i)
+                    
+                    # Remove dead processes
+                    for i in reversed(dead_processes):  # Reverse to avoid index issues
+                        self.parser_processes.pop(i)
+                    
+                    # Restart if any died
+                    if dead_processes:
+                        missing_count = self.num_parser_processes - len(self.parser_processes)
+                        logger.info(f"Restarting {missing_count} parser processes...")
+                        
+                        def run_parser(parser_id: int):
+                            """Function to run in the parser process."""
+                            import asyncio
+                            import logging
+                            from .parser_consumer import ParserConsumer
+                            
+                            logging.basicConfig(
+                                level=logging.INFO,
+                                format=f'%(asctime)s - %(name)s - %(levelname)s - [Parser-{parser_id}] %(message)s'
+                            )
+                            
+                            consumer = ParserConsumer(self.config)
+                            asyncio.run(consumer.run())
+                        
+                        for i in range(missing_count):
+                            process_id = max([int(p.name.split('-')[-1]) for p in self.parser_processes] + [0]) + 1
+                            process = Process(
+                                target=run_parser,
+                                args=(process_id,),
+                                name=f"ParserConsumer-{process_id}"
+                            )
+                            process.daemon = False
+                            process.start()
+                            self.parser_processes.append(process)
+                            logger.info(f"Restarted parser process {process_id} with PID: {process.pid}")
+                
                 if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                     await self._log_metrics()
 
                 # Use the fast, estimated count for logging
-                estimated_frontier_size = await self.frontier.count_frontier()
+                if self.config.db_type == 'redis':
+                    # TODO: frontier count is very slow with redis right now
+                    estimated_frontier_size = -1
+                else:
+                    estimated_frontier_size = await self.frontier.count_frontier()
                 active_workers = sum(1 for task in self.worker_tasks if not task.done())
                 
                 # Update Prometheus gauges
@@ -492,6 +663,10 @@ class CrawlerOrchestrator:
                  await asyncio.gather(*[task for task in self.worker_tasks if not task.done()], return_exceptions=True)
         finally:
             logger.info("Performing final cleanup...")
+            
+            # Stop parser process first to prevent it from trying to process more items
+            self._stop_parser_processes()
+            
             await self.fetcher.close_session()
             
             # Close storage and database connections
