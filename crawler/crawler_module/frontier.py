@@ -739,7 +739,7 @@ class HybridFrontierManager:
     async def _add_urls_to_domain(self, domain: str, urls: List[Tuple[str, int]]) -> int:
         """Add URLs to a specific domain's frontier file."""
         # Use Redis-based lock for cross-process safety
-        domain_lock = self.lock_manager.get_domain_lock(domain)
+        domain_lock = self.lock_manager.get_domain_write_lock(domain)
         
         try:
             async with domain_lock:
@@ -898,58 +898,44 @@ class HybridFrontierManager:
         """Read next URL from domain's frontier file."""
         domain_key = f"domain:{domain}"
         
-        # Get file info from Redis
-        file_info = await self.redis.hmget(  # type: ignore[misc]
-            domain_key, 
-            ['file_path', 'frontier_offset', 'frontier_size']
-        )
-        
-        if not file_info[0]:  # No file path
-            return None
-            
-        file_path = self.frontier_dir / file_info[0]
-        offset = int(file_info[1] or 0)
-        size = int(file_info[2] or 0)
-        
-        if offset >= size:  # All URLs consumed
-            return None
-        
-        # Use Redis-based lock for reading and updating offset
-        domain_lock = self.lock_manager.get_domain_lock(domain)
-        
         try:
+            domain_lock = self.lock_manager.get_domain_read_lock(domain)
             async with domain_lock:
-                # Re-read offset inside the lock to avoid race conditions
-                offset_str = await self.redis.hget(domain_key, 'frontier_offset')  # type: ignore[misc]
-                offset = int(offset_str or 0)
+                # Get file info from Redis
+                file_info = await self.redis.hmget(  # type: ignore[misc]
+                    domain_key, 
+                    ['file_path', 'frontier_offset', 'frontier_size']
+                )
                 
-                if offset >= size:  # Check again after lock
+                if not file_info[0]:  # No file path
+                    return None
+                    
+                file_path = self.frontier_dir / file_info[0]
+                offset = int(file_info[1] or 0)
+                size = int(file_info[2] or 0)
+                
+                if offset >= size:  # All URLs consumed
                     return None
                 
                 # Read URL from file
-                try:
-                    async with aiofiles.open(file_path, 'r') as f:
-                        # Read all lines to find the next valid URL
-                        lines = await f.readlines()
-                        
-                        # Find the line at the current offset
-                        if offset < len(lines):
-                            line = lines[offset].strip()
-                            
-                            if line:
-                                # Update offset
-                                new_offset = offset + 1
-                                await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
-                                
-                                # Parse URL data
-                                parts = line.split('|')
-                                if len(parts) >= 2:
-                                    url, depth_str = parts[:2]
-                                    return url, domain, int(depth_str)
-                                    
-                except Exception as e:
-                    logger.error(f"Error reading frontier file {file_path}: {e}")
+                async with aiofiles.open(file_path, 'r') as f:
+                    # Read all lines to find the next valid URL
+                    lines = await f.readlines()
                     
+                    # Find the line at the current offset
+                    if offset < len(lines):
+                        line = lines[offset].strip()
+                        
+                        if line:
+                            # Update offset
+                            new_offset = offset + 1
+                            await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
+                            
+                            # Parse URL data
+                            parts = line.split('|')
+                            if len(parts) >= 2:
+                                url, depth_str = parts[:2]
+                                return url, domain, int(depth_str) 
         except TimeoutError:
             logger.error(f"Failed to acquire lock for domain {domain} when reading URL")
             return None

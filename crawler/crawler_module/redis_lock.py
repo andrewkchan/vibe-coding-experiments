@@ -13,10 +13,16 @@ logger = logging.getLogger(__name__)
 class DomainLock:
     """Manages write locks for domain frontiers using Redis."""
     
-    def __init__(self, redis_client: redis.Redis, domain: str):
+    def __init__(self, redis_client: redis.Redis, domain: str, is_reader: bool = False):
         self.redis = redis_client
         self.domain = domain
-        self.lock_key = f"lock:domain:{domain}"
+        # Readers can have a separate lock from writers because at every stage
+        # of the domain write process, a consistent view is exposed to all
+        # readers
+        if is_reader:
+            self.lock_key = f"lock:domain:{domain}:reader"
+        else:
+            self.lock_key = f"lock:domain:{domain}:writer"
         self.lock_acquired = False
         
     async def acquire(self, max_wait_seconds: float = 30.0) -> bool:
@@ -136,6 +142,10 @@ class LockManager:
                 
         return locked_domains
     
-    def get_domain_lock(self, domain: str) -> DomainLock:
+    def get_domain_read_lock(self, domain: str) -> DomainLock:
         """Create a DomainLock instance for the given domain."""
-        return DomainLock(self.redis, domain) 
+        return DomainLock(self.redis, domain, is_reader=True) 
+    
+    def get_domain_write_lock(self, domain: str) -> DomainLock:
+        """Create a DomainLock instance for the given domain."""
+        return DomainLock(self.redis, domain, is_reader=False) 
