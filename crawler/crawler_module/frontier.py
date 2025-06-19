@@ -696,17 +696,34 @@ class HybridFrontierManager:
             
         # 2. Check against bloom filter and visited URLs
         new_urls = []
+        candidate_list = list(candidates)
         
-        for url in candidates:
-            # Check bloom filter
-            exists = await self.redis.execute_command('BF.EXISTS', 'seen:bloom', url)
+        pipe = self.redis.pipeline()
+        for url in candidate_list:
+            pipe.execute_command('BF.EXISTS', 'seen:bloom', url)
+        bloom_results = await pipe.execute()
+        
+        # For URLs not in bloom filter, batch check visited URLs
+        urls_to_check_visited = []
+        url_hashes = []
+        for i, (url, exists) in enumerate(zip(candidate_list, bloom_results)):
             if not exists:
-                # Double-check against visited URLs (for exact match)
                 url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-                visited = await self.redis.exists(f'visited:{url_hash}')
+                urls_to_check_visited.append(url)
+                url_hashes.append(url_hash)
+        
+        # Batch check visited URLs
+        if urls_to_check_visited:
+            pipe = self.redis.pipeline()
+            for url_hash in url_hashes:
+                pipe.exists(f'visited:{url_hash}')
+            visited_results = await pipe.execute()
+            
+            # Collect URLs that are neither in bloom filter nor visited
+            for url, visited in zip(urls_to_check_visited, visited_results):
                 if not visited:
                     new_urls.append(url)
-                    
+        
         if not new_urls:
             return 0
         
@@ -746,15 +763,18 @@ class HybridFrontierManager:
                 frontier_path = self._get_frontier_path(domain)
                 domain_key = f"domain:{domain}"
                 
-                # Filter out URLs already in bloom filter
-                new_urls = []
+                # Batch add all URLs to bloom filter
+                pipe = self.redis.pipeline()
                 for url, depth in urls:
-                    # Add to bloom filter (idempotent operation)
-                    await self.redis.execute_command('BF.ADD', 'seen:bloom', url)
-                    # Check if it was already there (BF.ADD returns 0 if already existed)
-                    # For simplicity, we'll just add all URLs and rely on file deduplication
-                    new_urls.append((url, depth))
-                    
+                    pipe.execute_command('BF.ADD', 'seen:bloom', url)
+                bloom_add_results = await pipe.execute()
+                
+                # Filter out URLs that were already in bloom filter
+                new_urls = []
+                for (url, depth), was_new in zip(urls, bloom_add_results):
+                    if was_new:  # BF.ADD returns 1 if new, 0 if already existed
+                        new_urls.append((url, depth))
+                
                 if not new_urls:
                     return 0
                     
