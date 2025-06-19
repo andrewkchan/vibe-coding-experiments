@@ -3,11 +3,9 @@ import time
 from pathlib import Path
 from typing import Set, Optional, Tuple, List, Dict
 import asyncio
-import os
 import redis.asyncio as redis
 import aiofiles  # type: ignore
 import hashlib
-import json
 import shutil
 
 from .config import CrawlerConfig
@@ -558,9 +556,6 @@ class HybridFrontierManager:
             except:
                 logger.warning("Could not create bloom filter - it may already exist")
         
-        # Load seen URLs into memory cache (for compatibility with existing interface)
-        await self._populate_seen_urls_from_redis()
-        
         if self.config.resume:
             count = await self.count_frontier()
             logger.info(f"Resuming crawl. Frontier has approximately {count} URLs.")
@@ -571,34 +566,6 @@ class HybridFrontierManager:
             logger.info("Starting new crawl. Clearing any existing frontier and loading seeds.")
             await self._clear_frontier()
             await self._load_seeds()
-    
-    async def _populate_seen_urls_from_redis(self):
-        """Populate in-memory seen_urls from Redis visited records."""
-        # For compatibility, we load a subset of visited URLs into memory
-        # In production, we'd rely entirely on the bloom filter
-        visited_count = 0
-        cursor = 0
-        
-        while True:
-            cursor, keys = await self.redis.scan(
-                cursor, match='visited:*', count=1000
-            )
-            
-            if keys:
-                pipe = self.redis.pipeline()
-                for key in keys:
-                    pipe.hget(key, 'url')
-                urls = await pipe.execute()
-                
-                for url in urls:
-                    if url:
-                        visited_count += 1
-            
-            # Exit when cursor returns to 0    
-            if cursor == 0:
-                break
-                
-        logger.info(f"Loaded {visited_count} URLs into in-memory seen_urls cache")
     
     async def _clear_frontier(self):
         """Clear all frontier data."""
@@ -694,7 +661,10 @@ class HybridFrontierManager:
         if not candidates:
             return 0
             
-        # 2. Check against bloom filter and visited URLs
+        # 2. Check against bloom filter
+        # Note we check the bloom filter twice; once here and once in _add_urls_to_domain (which adds to the filter).
+        # This redundant check is a performance optimization because checking politeness below can be expensive.
+        # TODO: Validate that this actually improves performance.
         new_urls = []
         candidate_list = list(candidates)
         
@@ -702,27 +672,9 @@ class HybridFrontierManager:
         for url in candidate_list:
             pipe.execute_command('BF.EXISTS', 'seen:bloom', url)
         bloom_results = await pipe.execute()
-        
-        # For URLs not in bloom filter, batch check visited URLs
-        urls_to_check_visited = []
-        url_hashes = []
-        for i, (url, exists) in enumerate(zip(candidate_list, bloom_results)):
+        for url, exists in zip(candidate_list, bloom_results):
             if not exists:
-                url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-                urls_to_check_visited.append(url)
-                url_hashes.append(url_hash)
-        
-        # Batch check visited URLs
-        if urls_to_check_visited:
-            pipe = self.redis.pipeline()
-            for url_hash in url_hashes:
-                pipe.exists(f'visited:{url_hash}')
-            visited_results = await pipe.execute()
-            
-            # Collect URLs that are neither in bloom filter nor visited
-            for url, visited in zip(urls_to_check_visited, visited_results):
-                if not visited:
-                    new_urls.append(url)
+                new_urls.append(url)
         
         if not new_urls:
             return 0
@@ -939,7 +891,10 @@ class HybridFrontierManager:
                 
                 # Read URL from file
                 async with aiofiles.open(file_path, 'r') as f:
-                    # Read all lines to find the next valid URL
+                    # TODO: This reads the entire file which is inefficient for large files.
+                    # Since frontier_offset tracks line numbers not byte offsets, we can't 
+                    # directly seek. Consider storing byte offsets or using a more efficient 
+                    # line-based reading approach.
                     lines = await f.readlines()
                     
                     # Find the line at the current offset
