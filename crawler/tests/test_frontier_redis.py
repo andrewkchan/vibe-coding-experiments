@@ -265,12 +265,35 @@ async def test_frontier_file_persistence(
     retrieved_domain = url_retrieved[1]
     domain_metadata = await redis_test_client.hgetall(f"domain:{retrieved_domain}")  # type: ignore[misc]
     assert "frontier_offset" in domain_metadata
-    assert int(domain_metadata["frontier_offset"]) == 1  # Should have read 1 URL
+    # frontier_offset is now in bytes, should be > 0 after reading first URL
+    offset_bytes = int(domain_metadata["frontier_offset"])
+    assert offset_bytes > 0  # Should have advanced past the first URL
     
     # Calculate total URLs from all seed URLs + test URLs
     total_urls = 2 + len(test_urls)  # 2 seed URLs + 3 test URLs
-    remaining_count = await frontier_run1.count_frontier()
-    assert remaining_count == total_urls - 1  # One URL was retrieved
+    
+    # Test that we can retrieve all URLs by iterating
+    all_retrieved_urls = [url_retrieved[0]]  # Start with the one we already got
+    
+    while True:
+        next_url = await frontier_run1.get_next_url()
+        if next_url is None:
+            break
+        all_retrieved_urls.append(next_url[0])
+    
+    # Verify we got all the URLs we added
+    expected_urls = {
+        "http://example.com/seed1",
+        "http://example.org/seed2", 
+        "http://persistent.com/page1",
+        "http://persistent.com/page2",
+        "http://example.net/page1"
+    }
+    assert len(all_retrieved_urls) == total_urls
+    assert set(all_retrieved_urls) == expected_urls
+    
+    # Frontier should now be empty
+    assert await frontier_run1.count_frontier() == 0
     
     logger.info("Frontier file persistence test passed.")
 

@@ -740,16 +740,11 @@ class HybridFrontierManager:
                 async with aiofiles.open(frontier_path, 'a') as f:
                     await f.writelines(lines_to_write)
                     
+                # Get file size after writing
+                new_size_bytes = frontier_path.stat().st_size
+                    
                 # Update Redis metadata
                 pipe = self.redis.pipeline()
-                
-                # Get current size
-                current_size_result = self.redis.hget(domain_key, 'frontier_size')
-                if asyncio.iscoroutine(current_size_result):
-                    current_size = await current_size_result
-                else:
-                    current_size = current_size_result
-                new_size = int(current_size or 0) + len(new_urls)
                 
                 # Get is_seeded status
                 is_seeded_result = self.redis.hget(domain_key, 'is_seeded')
@@ -760,12 +755,12 @@ class HybridFrontierManager:
                 
                 # Update metadata
                 pipe.hset(domain_key, mapping={
-                    'frontier_size': str(new_size),
+                    'frontier_size': str(new_size_bytes),
                     'file_path': str(frontier_path.relative_to(self.frontier_dir)),
                     'is_seeded': '1' if is_seeded else '0'
                 })
                 
-                # Initialize offset if needed
+                # Initialize offset if needed (0 bytes)
                 pipe.hsetnx(domain_key, 'frontier_offset', '0')
                 
                 # Add domain to queue
@@ -810,13 +805,16 @@ class HybridFrontierManager:
                 
                 # Process results in pairs (size, offset)
                 for i in range(0, len(results), 2):
-                    size = int(results[i] or 0)
-                    offset = int(results[i + 1] or 0)
-                    # Remaining URLs = size - (offset / bytes_per_line)
-                    # We need to estimate bytes per line or track line count
-                    # For now, assume offset tracks line count
-                    remaining = max(0, size - offset)
-                    total += remaining
+                    size_bytes = int(results[i] or 0)
+                    offset_bytes = int(results[i + 1] or 0)
+                    # If we haven't consumed all bytes, there are URLs remaining
+                    # We can't know exact count without reading the file, but we know if any remain
+                    if size_bytes > offset_bytes:
+                        # This is an approximation - assumes 100 bytes per URL on average
+                        # This method is noted as flawed and not used in production
+                        remaining_bytes = size_bytes - offset_bytes
+                        estimated_urls = remaining_bytes // 100
+                        total += max(1, estimated_urls)  # At least 1 if bytes remain
             
             # Exit when cursor returns to 0
             if cursor == 0:
@@ -883,28 +881,29 @@ class HybridFrontierManager:
                     return None
                     
                 file_path = self.frontier_dir / file_info[0]
-                offset = int(file_info[1] or 0)
-                size = int(file_info[2] or 0)
+                offset_bytes = int(file_info[1] or 0)
+                size_bytes = int(file_info[2] or 0)
                 
-                if offset >= size:  # All URLs consumed
+                if offset_bytes >= size_bytes:  # All URLs consumed
                     return None
                 
                 # Read URL from file
                 async with aiofiles.open(file_path, 'r') as f:
-                    # TODO: This reads the entire file which is inefficient for large files.
-                    # Since frontier_offset tracks line numbers not byte offsets, we can't 
-                    # directly seek. Consider storing byte offsets or using a more efficient 
-                    # line-based reading approach.
-                    lines = await f.readlines()
+                    # Seek to the byte offset
+                    await f.seek(offset_bytes)
                     
-                    # Find the line at the current offset
-                    if offset < len(lines):
-                        line = lines[offset].strip()
+                    # Read one line from current position
+                    line = await f.readline()
+                    
+                    if line:
+                        line = line.strip()
                         
                         if line:
-                            # Update offset
-                            new_offset = offset + 1
-                            await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
+                            # Get new byte position after reading the line
+                            new_offset_bytes = await f.tell()
+                            
+                            # Update offset to new position
+                            await self.redis.hset(domain_key, 'frontier_offset', str(new_offset_bytes))  # type: ignore[misc]
                             
                             # Parse URL data
                             parts = line.split('|')
