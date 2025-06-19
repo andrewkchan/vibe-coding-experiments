@@ -28,7 +28,12 @@ def dummy_config(tmp_path: Path) -> CrawlerConfig:
         user_agent="TestCrawler/1.0 (pytest)",
         seeded_urls_only=False,
         db_type="sqlite",  # Added - default to SQLite for tests
-        db_url=None  # Added - SQLite doesn't need a URL
+        db_url=None,  # Added - SQLite doesn't need a URL
+        # Redis configuration - use default values
+        redis_host="localhost",
+        redis_port=6379,
+        redis_db=15,  # Tests will override this via redis_test_client fixture
+        redis_password=None
     )
 
 @pytest.fixture

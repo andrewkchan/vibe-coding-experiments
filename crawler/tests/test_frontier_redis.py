@@ -37,7 +37,7 @@ class FrontierTestConfig:
     # Redis settings
     redis_host: str = "localhost"
     redis_port: int = 6379
-    redis_db: int = 15  # Tests will override this via redis_test_client fixture
+    redis_db: int = 15
     redis_password: str | None = None
 
 # Note: The redis_client fixture is now imported from conftest.py as redis_test_client

@@ -34,6 +34,11 @@ class FrontierTestConfig:
     seeded_urls_only: bool = False
     db_type: str = "sqlite"  # Use SQLite for tests
     db_url: str | None = None
+    # Redis settings
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 15
+    redis_password: str | None = None
 
 @pytest_asyncio.fixture
 async def temp_test_frontier_dir(tmp_path: Path) -> Path:
@@ -214,7 +219,7 @@ async def test_frontier_resume_with_politeness(
     assert await frontier_run1.count_frontier() == 3
     
     url_to_retrieve = await frontier_run1.get_next_url()
-    assert url_to_retrieve is not None
+    assert url_to_retrieve[0] == "http://example.com/seed1"
     assert await frontier_run1.count_frontier() == 2 
     await backend_run1.close()
 
