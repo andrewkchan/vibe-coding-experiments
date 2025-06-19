@@ -2,11 +2,15 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 DEFAULT_DATA_DIR = "./crawler_data"
 DEFAULT_MAX_WORKERS = 20
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_DB_TYPE = "sqlite"
+DEFAULT_REDIS_HOST = "localhost"
+DEFAULT_REDIS_PORT = 6379
+DEFAULT_REDIS_DB = 0
 
 @dataclass
 class CrawlerConfig:
@@ -23,6 +27,29 @@ class CrawlerConfig:
     seeded_urls_only: bool
     db_type: str # sqlite, postgresql, or redis
     db_url: str | None # PostgreSQL connection URL
+    # Redis-specific configuration
+    redis_host: str
+    redis_port: int
+    redis_db: int
+    redis_password: Optional[str]
+
+    def get_redis_connection_kwargs(self) -> dict:
+        """Get Redis connection parameters as kwargs dict."""
+        kwargs = {
+            'host': self.redis_host,
+            'port': self.redis_port,
+            'db': self.redis_db,
+            'decode_responses': True
+        }
+        
+        if self.redis_password:
+            kwargs['password'] = self.redis_password
+            
+        # Log configuration (without password)
+        safe_kwargs = {k: v for k, v in kwargs.items() if k != 'password'}
+        logging.info(f"Redis configuration: {safe_kwargs}")
+        
+        return kwargs
 
 def parse_args() -> CrawlerConfig:
     parser = argparse.ArgumentParser(description="An experimental web crawler.")
@@ -105,6 +132,32 @@ def parse_args() -> CrawlerConfig:
         default=None,
         help="PostgreSQL connection pool size override. If not set, automatically calculated based on worker count."
     )
+    
+    # Redis-specific arguments
+    parser.add_argument(
+        "--redis-host",
+        type=str,
+        default=DEFAULT_REDIS_HOST,
+        help=f"Redis server hostname (default: {DEFAULT_REDIS_HOST})"
+    )
+    parser.add_argument(
+        "--redis-port",
+        type=int,
+        default=DEFAULT_REDIS_PORT,
+        help=f"Redis server port (default: {DEFAULT_REDIS_PORT})"
+    )
+    parser.add_argument(
+        "--redis-db",
+        type=int,
+        default=DEFAULT_REDIS_DB,
+        help=f"Redis database number (default: {DEFAULT_REDIS_DB})"
+    )
+    parser.add_argument(
+        "--redis-password",
+        type=str,
+        default=None,
+        help="Redis password (optional)"
+    )
 
     args = parser.parse_args()
     
@@ -117,9 +170,9 @@ def parse_args() -> CrawlerConfig:
         import os
         os.environ['CRAWLER_PG_POOL_SIZE'] = str(args.pg_pool_size)
     
-    # Redis doesn't require db_url as it uses default localhost:6379
+    # Redis doesn't require db_url as it uses the specific Redis arguments
     if args.db_type == "redis" and args.db_url:
-        parser.error("--db-url is not used with Redis backend (uses localhost:6379 by default)")
+        parser.error("--db-url is not used with Redis backend (use --redis-host, --redis-port, etc.)")
     
     # Construct User-Agent
     # Example: MyEducationalCrawler/1.0 (+http://example.com/crawler-info; mailto:user@example.com)
@@ -139,5 +192,9 @@ def parse_args() -> CrawlerConfig:
         user_agent=user_agent,
         seeded_urls_only=args.seeded_urls_only,
         db_type=args.db_type,
-        db_url=args.db_url
+        db_url=args.db_url,
+        redis_host=args.redis_host,
+        redis_port=args.redis_port,
+        redis_db=args.redis_db,
+        redis_password=args.redis_password
     ) 

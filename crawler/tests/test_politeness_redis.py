@@ -29,19 +29,8 @@ def dummy_config(tmp_path: Path) -> CrawlerConfig:
         db_url=None
     )
 
-@pytest_asyncio.fixture
-async def redis_client():
-    """Provides a Redis client for tests."""
-    client = redis.Redis(host='localhost', port=6379, decode_responses=True)
-    
-    # Clean up test data before and after
-    await client.flushdb()
-    
-    yield client
-    
-    # Cleanup after test
-    await client.flushdb()
-    await client.aclose()
+# Note: redis_test_client fixture is imported from conftest.py
+# This ensures we use db=15 for tests, not production db=0
 
 @pytest.fixture
 def mock_fetcher() -> MagicMock:
@@ -50,19 +39,19 @@ def mock_fetcher() -> MagicMock:
 @pytest_asyncio.fixture
 async def redis_politeness_enforcer(
     dummy_config: CrawlerConfig,
-    redis_client: redis.Redis,
+    redis_test_client: redis.Redis,
     mock_fetcher: MagicMock
 ) -> RedisPolitenessEnforcer:
     dummy_config.data_dir.mkdir(parents=True, exist_ok=True)
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_client=redis_client, fetcher=mock_fetcher)
+    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
     await pe.initialize()
     return pe
 
 # --- Tests for _load_manual_exclusions ---
 @pytest.mark.asyncio
-async def test_load_manual_exclusions_no_file(dummy_config: CrawlerConfig, redis_client: redis.Redis, mock_fetcher: MagicMock):
+async def test_load_manual_exclusions_no_file(dummy_config: CrawlerConfig, redis_test_client: redis.Redis, mock_fetcher: MagicMock):
     dummy_config.exclude_file = None
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_client=redis_client, fetcher=mock_fetcher)
+    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
     
     # Should initialize without error
     await pe.initialize()
@@ -71,7 +60,7 @@ async def test_load_manual_exclusions_no_file(dummy_config: CrawlerConfig, redis
 @pytest.mark.asyncio
 async def test_load_manual_exclusions_with_file(
     dummy_config: CrawlerConfig,
-    redis_client: redis.Redis,
+    redis_test_client: redis.Redis,
     mock_fetcher: MagicMock,
     tmp_path: Path
 ):
@@ -83,13 +72,13 @@ async def test_load_manual_exclusions_with_file(
     with open(exclude_file_path, 'w') as f:
         f.write(mock_file_content)
 
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_client=redis_client, fetcher=mock_fetcher)
+    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
     await pe.initialize()
     
     # Verify domains are marked as excluded in Redis
     expected_domains = ["excluded1.com", "excluded2.com", "excluded3.com"]
     for domain in expected_domains:
-        is_excluded = await redis_client.hget(f'domain:{domain}', 'is_excluded')  # type: ignore[misc]
+        is_excluded = await redis_test_client.hget(f'domain:{domain}', 'is_excluded')  # type: ignore[misc]
         assert is_excluded == '1', f"Domain {domain} should be marked as excluded"
     
     if exclude_file_path.exists():
@@ -290,17 +279,17 @@ async def test_is_url_allowed_by_robots(redis_politeness_enforcer: RedisPolitene
     redis_politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain)
 
 @pytest.mark.asyncio
-async def test_is_url_allowed_seeded_urls_only(redis_client: redis.Redis, mock_fetcher: MagicMock, dummy_config: CrawlerConfig):
+async def test_is_url_allowed_seeded_urls_only(redis_test_client: redis.Redis, mock_fetcher: MagicMock, dummy_config: CrawlerConfig):
     """Test that non-seeded domains are excluded when seeded_urls_only is True."""
     dummy_config.seeded_urls_only = True
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_client=redis_client, fetcher=mock_fetcher)
+    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
     await pe.initialize()
     
     seeded_domain = "seeded.com"
     non_seeded_domain = "notseeded.com"
     
     # Mark one domain as seeded
-    await redis_client.hset(f'domain:{seeded_domain}', 'is_seeded', '1')  # type: ignore[misc]
+    await redis_test_client.hset(f'domain:{seeded_domain}', 'is_seeded', '1')  # type: ignore[misc]
     
     # Seeded domain should be allowed
     assert await pe.is_url_allowed(f"http://{seeded_domain}/page") is True

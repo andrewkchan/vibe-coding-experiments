@@ -41,7 +41,7 @@ class ParserConsumer:
     def __init__(self, config: CrawlerConfig, num_workers: int = 80):
         self.config = config
         self.num_workers = num_workers
-        self.redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+        self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
         self.parser = PageParser()
         
         # Initialize storage and frontier for adding URLs

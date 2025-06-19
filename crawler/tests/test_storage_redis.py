@@ -17,39 +17,27 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-@pytest_asyncio.fixture
-async def redis_client() -> AsyncIterator[redis.Redis]:
-    """Fixture to create a Redis client for testing."""
-    # Connect to Redis (assumes Redis is running locally)
-    client = redis.Redis(host='localhost', port=6379, db=15, decode_responses=True)  # Use db 15 for tests
-    
-    # Clear the test database
-    await client.flushdb()
-    
-    yield client
-    
-    # Cleanup after tests
-    await client.flushdb()
-    await client.aclose()
+# Note: redis_test_client fixture is imported from conftest.py
+# This ensures we use db=15 for tests, not production db=0
 
 
 @pytest_asyncio.fixture
-async def redis_storage_manager(test_config: CrawlerConfig, redis_client: redis.Redis) -> RedisStorageManager:
+async def redis_storage_manager(test_config: CrawlerConfig, redis_test_client: redis.Redis) -> RedisStorageManager:
     """Fixture to create a RedisStorageManager instance."""
     logger.debug(f"Initializing RedisStorageManager with config data_dir: {test_config.data_dir}")
-    sm = RedisStorageManager(config=test_config, redis_client=redis_client)
+    sm = RedisStorageManager(config=test_config, redis_test_client=redis_test_client)
     await sm.init_db_schema()
     yield sm
 
 
 @pytest.mark.asyncio
-async def test_redis_storage_manager_initialization(redis_storage_manager: RedisStorageManager, test_config: CrawlerConfig, redis_client: redis.Redis):
+async def test_redis_storage_manager_initialization(redis_storage_manager: RedisStorageManager, test_config: CrawlerConfig, redis_test_client: redis.Redis):
     """Test if RedisStorageManager initializes directories and Redis correctly."""
     assert redis_storage_manager.data_dir.exists()
     assert redis_storage_manager.content_dir.exists()
     
     # Check that schema version is set in Redis
-    schema_version = await redis_client.get("schema_version")
+    schema_version = await redis_test_client.get("schema_version")
     assert schema_version is not None
     assert int(schema_version) == REDIS_SCHEMA_VERSION
     
@@ -57,11 +45,11 @@ async def test_redis_storage_manager_initialization(redis_storage_manager: Redis
 
 
 @pytest.mark.asyncio
-async def test_redis_schema_initialization(redis_storage_manager: RedisStorageManager, redis_client: redis.Redis):
+async def test_redis_schema_initialization(redis_storage_manager: RedisStorageManager, redis_test_client: redis.Redis):
     """Test if schema version is properly set in Redis."""
     # The redis_storage_manager fixture already initializes the schema
     
-    schema_version = await redis_client.get("schema_version")
+    schema_version = await redis_test_client.get("schema_version")
     assert schema_version == str(REDIS_SCHEMA_VERSION)
     
     logger.info("Redis schema initialization test passed.")
@@ -85,21 +73,21 @@ def test_get_url_sha256(redis_storage_manager: RedisStorageManager):
 
 
 @pytest.mark.asyncio
-async def test_redis_storage_manager_reinitialization(test_config: CrawlerConfig, redis_client: redis.Redis):
+async def test_redis_storage_manager_reinitialization(test_config: CrawlerConfig, redis_test_client: redis.Redis):
     """Test that re-initializing RedisStorageManager with the same Redis instance is safe."""
     
-    sm1 = RedisStorageManager(config=test_config, redis_client=redis_client)
+    sm1 = RedisStorageManager(config=test_config, redis_test_client=redis_test_client)
     await sm1.init_db_schema()
     
     # Verify schema version is set
-    schema_version = await redis_client.get("schema_version")
+    schema_version = await redis_test_client.get("schema_version")
     assert schema_version == str(REDIS_SCHEMA_VERSION)
     
-    sm2 = RedisStorageManager(config=test_config, redis_client=redis_client)
+    sm2 = RedisStorageManager(config=test_config, redis_test_client=redis_test_client)
     await sm2.init_db_schema()
     
     # Schema version should still be the same
-    schema_version = await redis_client.get("schema_version")
+    schema_version = await redis_test_client.get("schema_version")
     assert schema_version == str(REDIS_SCHEMA_VERSION)
     
     logger.info("RedisStorageManager re-initialization test passed.")
@@ -160,7 +148,7 @@ async def test_save_content_to_file_io_error(redis_storage_manager: RedisStorage
 
 
 @pytest.mark.asyncio
-async def test_add_visited_page(redis_storage_manager: RedisStorageManager, redis_client: redis.Redis): 
+async def test_add_visited_page(redis_storage_manager: RedisStorageManager, redis_test_client: redis.Redis): 
     """Test adding a visited page record to Redis."""
     url = "http://example.com/visited_page"
     domain = "example.com"
@@ -188,7 +176,7 @@ async def test_add_visited_page(redis_storage_manager: RedisStorageManager, redi
     expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
 
     # Get the visited page data from Redis
-    visited_data = await redis_client.hgetall(f'visited:{expected_url_hash}')
+    visited_data = await redis_test_client.hgetall(f'visited:{expected_url_hash}')
     
     assert visited_data is not None
     assert visited_data['url'] == url
@@ -206,7 +194,7 @@ async def test_add_visited_page(redis_storage_manager: RedisStorageManager, redi
 
 
 @pytest.mark.asyncio
-async def test_add_visited_page_no_content(redis_storage_manager: RedisStorageManager, redis_client: redis.Redis):
+async def test_add_visited_page_no_content(redis_storage_manager: RedisStorageManager, redis_test_client: redis.Redis):
     """Test adding a visited page with no text content (e.g., redirect or non-HTML)."""
     url = "http://example.com/redirect"
     domain = "example.com"
@@ -228,7 +216,7 @@ async def test_add_visited_page_no_content(redis_storage_manager: RedisStorageMa
     expected_url_sha256 = redis_storage_manager.get_url_sha256(url)
     expected_url_hash = expected_url_sha256[:16]
     
-    visited_data = await redis_client.hgetall(f'visited:{expected_url_hash}')
+    visited_data = await redis_test_client.hgetall(f'visited:{expected_url_hash}')
     
     assert visited_data is not None
     assert visited_data['content_path'] == ''
@@ -240,7 +228,7 @@ async def test_add_visited_page_no_content(redis_storage_manager: RedisStorageMa
 
 
 @pytest.mark.asyncio
-async def test_add_visited_page_update_existing(redis_storage_manager: RedisStorageManager, redis_client: redis.Redis):
+async def test_add_visited_page_update_existing(redis_storage_manager: RedisStorageManager, redis_test_client: redis.Redis):
     """Test updating an existing visited page in Redis."""
     url = "http://example.com/update_test"
     domain = "example.com"
@@ -279,7 +267,7 @@ async def test_add_visited_page_update_existing(redis_storage_manager: RedisStor
     expected_url_sha256 = redis_storage_manager.get_url_sha256(url)
     expected_url_hash = expected_url_sha256[:16]
     
-    visited_data = await redis_client.hgetall(f'visited:{expected_url_hash}')
+    visited_data = await redis_test_client.hgetall(f'visited:{expected_url_hash}')
     
     assert int(visited_data['status_code']) == 200
     assert int(visited_data['fetched_at']) == second_timestamp

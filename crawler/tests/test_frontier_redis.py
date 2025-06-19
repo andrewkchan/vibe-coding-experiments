@@ -35,19 +35,8 @@ class FrontierTestConfig:
     db_type: str = "sqlite"  # Still use SQLite for storage manager
     db_url: str | None = None
 
-@pytest_asyncio.fixture
-async def redis_client():
-    """Provides a Redis client for tests."""
-    client = redis.Redis(host='localhost', port=6379, decode_responses=True)
-    
-    # Clean up test data before and after
-    await client.flushdb()
-    
-    yield client
-    
-    # Cleanup after test
-    await client.flushdb()
-    await client.aclose()
+# Note: The redis_client fixture is now imported from conftest.py as redis_test_client
+# This ensures we use db=15 for tests and never touch production data (db=0)
 
 @pytest_asyncio.fixture
 async def temp_test_frontier_dir(tmp_path: Path) -> Path:
@@ -88,12 +77,12 @@ def mock_politeness_enforcer_for_frontier() -> MagicMock:
 async def hybrid_frontier_manager(
     actual_config_for_frontier: CrawlerConfig,
     mock_politeness_enforcer_for_frontier: MagicMock,
-    redis_client: redis.Redis
+    redis_test_client: redis.Redis
 ) -> HybridFrontierManager:
     fm = HybridFrontierManager(
         config=actual_config_for_frontier,
         politeness=mock_politeness_enforcer_for_frontier,
-        redis_client=redis_client
+        redis_client=redis_test_client
     )
     # Patch methods for inspection
     fm._mark_domains_as_seeded_batch = AsyncMock(side_effect=fm._mark_domains_as_seeded_batch)

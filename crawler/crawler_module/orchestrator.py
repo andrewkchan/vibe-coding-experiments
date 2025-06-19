@@ -69,8 +69,8 @@ class CrawlerOrchestrator:
         
         # Initialize backend-specific components
         if config.db_type == 'redis':
-            # Initialize Redis client
-            self.redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+            # Initialize Redis client with configurable connection
+            self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
             self.db_backend = None  # No SQL backend for Redis
             
             # Use Redis-based components

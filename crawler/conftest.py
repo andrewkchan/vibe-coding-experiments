@@ -16,6 +16,9 @@ from crawler_module.db_backends import create_backend, DatabaseBackend
 from crawler_module.config import CrawlerConfig # For a default config if needed
 from crawler_module.storage import StorageManager
 
+# Add Redis imports
+import redis.asyncio as redis
+
 @pytest.fixture(scope="function")
 def test_config(tmp_path: Path) -> CrawlerConfig:
     """
@@ -43,7 +46,12 @@ def test_config(tmp_path: Path) -> CrawlerConfig:
         email="test@example.com",
         exclude_file=None,
         db_type="sqlite",  # Added - default to SQLite for tests
-        db_url=None  # Added - SQLite doesn't need a URL
+        db_url=None,  # Added - SQLite doesn't need a URL
+        # Redis configuration - use default values
+        redis_host="localhost",
+        redis_port=6379,
+        redis_db=15,  # Tests will override this via redis_test_client fixture
+        redis_password=None
     )
 
 @pytest_asyncio.fixture(scope="function")
@@ -68,4 +76,45 @@ async def storage_manager(test_config: CrawlerConfig, db_backend: DatabaseBacken
     """
     sm = StorageManager(config=test_config, db_backend=db_backend)
     await sm.init_db_schema()
-    return sm 
+    return sm
+
+@pytest_asyncio.fixture(scope="function")
+async def redis_test_client() -> AsyncIterator[redis.Redis]:
+    """
+    Pytest fixture for a Redis client that uses a separate test database.
+    Uses db=15 to ensure tests never touch production data (db=0).
+    
+    IMPORTANT: This fixture clears the test database before and after each test!
+    """
+    # Use a different database number for tests (default is 0)
+    TEST_REDIS_DB = 15
+    
+    client = redis.Redis(
+        host='localhost', 
+        port=6379, 
+        db=TEST_REDIS_DB,  # Different database for tests!
+        decode_responses=True
+    )
+    
+    # Verify we're not on the production database
+    assert await client.config_get('databases')['databases'] != '1', \
+        "Redis must be configured with multiple databases for safe testing"
+    
+    # Clear test database before test
+    await client.flushdb()
+    
+    yield client
+    
+    # Clean up after test
+    await client.flushdb()
+    await client.aclose()
+
+@pytest.fixture(scope="function") 
+def redis_test_config(test_config: CrawlerConfig) -> CrawlerConfig:
+    """
+    Returns a test config specifically for Redis-based crawler testing.
+    """
+    test_config.db_type = "redis"
+    test_config.db_url = None  # Not used for Redis
+    test_config.redis_db = 15  # Use test database
+    return test_config 
