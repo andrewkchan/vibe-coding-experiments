@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 async def redis_storage_manager(test_config: CrawlerConfig, redis_test_client: redis.Redis) -> RedisStorageManager:
     """Fixture to create a RedisStorageManager instance."""
     logger.debug(f"Initializing RedisStorageManager with config data_dir: {test_config.data_dir}")
-    sm = RedisStorageManager(config=test_config, redis_test_client=redis_test_client)
+    sm = RedisStorageManager(config=test_config, redis_client=redis_test_client)
     await sm.init_db_schema()
     yield sm
 
@@ -76,14 +76,14 @@ def test_get_url_sha256(redis_storage_manager: RedisStorageManager):
 async def test_redis_storage_manager_reinitialization(test_config: CrawlerConfig, redis_test_client: redis.Redis):
     """Test that re-initializing RedisStorageManager with the same Redis instance is safe."""
     
-    sm1 = RedisStorageManager(config=test_config, redis_test_client=redis_test_client)
+    sm1 = RedisStorageManager(config=test_config, redis_client=redis_test_client)
     await sm1.init_db_schema()
     
     # Verify schema version is set
     schema_version = await redis_test_client.get("schema_version")
     assert schema_version == str(REDIS_SCHEMA_VERSION)
     
-    sm2 = RedisStorageManager(config=test_config, redis_test_client=redis_test_client)
+    sm2 = RedisStorageManager(config=test_config, redis_client=redis_test_client)
     await sm2.init_db_schema()
     
     # Schema version should still be the same

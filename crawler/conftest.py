@@ -97,7 +97,7 @@ async def redis_test_client() -> AsyncIterator[redis.Redis]:
     )
     
     # Verify we're not on the production database
-    assert await client.config_get('databases')['databases'] != '1', \
+    assert (await client.config_get('databases'))['databases'] != '1', \
         "Redis must be configured with multiple databases for safe testing"
     
     # Clear test database before test

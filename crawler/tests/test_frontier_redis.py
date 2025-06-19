@@ -34,6 +34,11 @@ class FrontierTestConfig:
     seeded_urls_only: bool = False
     db_type: str = "sqlite"  # Still use SQLite for storage manager
     db_url: str | None = None
+    # Redis settings
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 15  # Tests will override this via redis_test_client fixture
+    redis_password: str | None = None
 
 # Note: The redis_client fixture is now imported from conftest.py as redis_test_client
 # This ensures we use db=15 for tests and never touch production data (db=0)
@@ -182,7 +187,7 @@ async def test_frontier_file_persistence(
     temp_test_frontier_dir: Path,
     frontier_test_config_obj: FrontierTestConfig,
     mock_politeness_enforcer_for_frontier: MagicMock,
-    redis_client: redis.Redis
+    redis_test_client: redis.Redis
 ):
     logger.info("Testing Frontier file persistence")
     
@@ -196,7 +201,7 @@ async def test_frontier_file_persistence(
     frontier_run1 = HybridFrontierManager(
         config=cfg_run1,
         politeness=mock_politeness_enforcer_for_frontier,
-        redis_client=redis_client
+        redis_client=redis_test_client
     )
     
     await frontier_run1.initialize_frontier()
@@ -258,7 +263,7 @@ async def test_frontier_file_persistence(
     
     # Check Redis metadata for the domain we just fetched from
     retrieved_domain = url_retrieved[1]
-    domain_metadata = await redis_client.hgetall(f"domain:{retrieved_domain}")  # type: ignore[misc]
+    domain_metadata = await redis_test_client.hgetall(f"domain:{retrieved_domain}")  # type: ignore[misc]
     assert "frontier_offset" in domain_metadata
     assert int(domain_metadata["frontier_offset"]) == 1  # Should have read 1 URL
     
@@ -273,7 +278,7 @@ async def test_frontier_file_persistence(
 async def test_bloom_filter_deduplication(
     hybrid_frontier_manager: HybridFrontierManager,
     mock_politeness_enforcer_for_frontier: MagicMock,
-    redis_client: redis.Redis
+    redis_test_client: redis.Redis
 ):
     logger.info("Testing bloom filter deduplication")
     
@@ -290,7 +295,7 @@ async def test_bloom_filter_deduplication(
     assert second_add == 0  # Should be rejected by bloom filter
     
     # Verify bloom filter contains the URL
-    exists = await redis_client.execute_command('BF.EXISTS', 'seen:bloom', 'http://example.com/test')
+    exists = await redis_test_client.execute_command('BF.EXISTS', 'seen:bloom', 'http://example.com/test')
     assert exists == 1
     
     logger.info("Bloom filter deduplication test passed.")
@@ -299,7 +304,7 @@ async def test_bloom_filter_deduplication(
 async def test_domain_ready_queue(
     hybrid_frontier_manager: HybridFrontierManager,
     mock_politeness_enforcer_for_frontier: MagicMock,
-    redis_client: redis.Redis
+    redis_test_client: redis.Redis
 ):
     logger.info("Testing domain ready queue functionality")
     
@@ -317,7 +322,7 @@ async def test_domain_ready_queue(
     await hybrid_frontier_manager.add_urls_batch(urls)
     
     # Check domains in queue
-    queued_domains = await redis_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
+    queued_domains = await redis_test_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
     # Convert to set to ignore order and potential duplicates
     assert set(queued_domains) == {"domain1.com", "domain2.com"}
     
@@ -327,7 +332,7 @@ async def test_domain_ready_queue(
     url, domain, _, _ = result
     
     # After fetching, domain should still be in the queue (at the end)
-    updated_queue = await redis_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
+    updated_queue = await redis_test_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
     assert domain in updated_queue  # Domain should still be there
     
     logger.info("Domain ready queue test passed.")
@@ -357,7 +362,7 @@ async def test_atomic_domain_claiming_high_concurrency(
     temp_test_frontier_dir: Path,
     frontier_test_config_obj: FrontierTestConfig,
     mock_politeness_enforcer_for_frontier: MagicMock,
-    redis_client: redis.Redis
+    redis_test_client: redis.Redis
 ):
     """Test that URLs are claimed exactly once under high concurrency.
     
@@ -392,7 +397,7 @@ async def test_atomic_domain_claiming_high_concurrency(
     seed_frontier = HybridFrontierManager(
         config=config,
         politeness=mock_politeness_enforcer_for_frontier,
-        redis_client=redis_client
+        redis_client=redis_test_client
     )
     
     # Initialize but clear any existing data to start fresh
@@ -407,7 +412,7 @@ async def test_atomic_domain_claiming_high_concurrency(
         fm = HybridFrontierManager(
             config=config,
             politeness=mock_politeness_enforcer_for_frontier,
-            redis_client=redis_client
+            redis_client=redis_test_client
         )
         # Don't initialize frontier for workers - they share the same data
         workers.append((i, fm))
@@ -504,7 +509,7 @@ async def test_frontier_resume_with_politeness(
     temp_test_frontier_dir: Path,
     frontier_test_config_obj: FrontierTestConfig,
     mock_politeness_enforcer_for_frontier: MagicMock,
-    redis_client: redis.Redis
+    redis_test_client: redis.Redis
 ):
     """Test that frontier state persists correctly when resuming a crawl."""
     logger.info("Testing Frontier Resume Functionality with Politeness Mocks")
@@ -521,7 +526,7 @@ async def test_frontier_resume_with_politeness(
     frontier_run1 = HybridFrontierManager(
         config=cfg_run1,
         politeness=mock_politeness_enforcer_for_frontier,
-        redis_client=redis_client
+        redis_client=redis_test_client
     )
     
     await frontier_run1.initialize_frontier()
@@ -548,7 +553,7 @@ async def test_frontier_resume_with_politeness(
     frontier_run2 = HybridFrontierManager(
         config=cfg_run2,
         politeness=mock_politeness_enforcer_for_frontier,
-        redis_client=redis_client
+        redis_client=redis_test_client
     )
     
     # Initialize with resume=True - should preserve existing frontier

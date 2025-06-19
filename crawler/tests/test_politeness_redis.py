@@ -11,24 +11,6 @@ from crawler_module.politeness import RedisPolitenessEnforcer, DEFAULT_ROBOTS_TX
 from crawler_module.config import CrawlerConfig  # type: ignore
 from crawler_module.fetcher import Fetcher, FetchResult  # type: ignore
 
-@pytest.fixture
-def dummy_config(tmp_path: Path) -> CrawlerConfig:
-    return CrawlerConfig(
-        seed_file=tmp_path / "seeds.txt",
-        email="test@example.com",
-        data_dir=tmp_path / "test_data",
-        exclude_file=None,  # Will be set in specific tests
-        max_workers=1,
-        max_pages=None,
-        max_duration=None,
-        log_level="DEBUG",
-        resume=False,
-        user_agent="TestCrawler/1.0",
-        seeded_urls_only=False,
-        db_type="postgresql",  # Changed to indicate we're using Redis architecture
-        db_url=None
-    )
-
 # Note: redis_test_client fixture is imported from conftest.py
 # This ensures we use db=15 for tests, not production db=0
 
@@ -38,20 +20,20 @@ def mock_fetcher() -> MagicMock:
 
 @pytest_asyncio.fixture
 async def redis_politeness_enforcer(
-    dummy_config: CrawlerConfig,
+    redis_test_config: CrawlerConfig,
     redis_test_client: redis.Redis,
     mock_fetcher: MagicMock
 ) -> RedisPolitenessEnforcer:
-    dummy_config.data_dir.mkdir(parents=True, exist_ok=True)
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
+    redis_test_config.data_dir.mkdir(parents=True, exist_ok=True)
+    pe = RedisPolitenessEnforcer(config=redis_test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
     await pe.initialize()
     return pe
 
 # --- Tests for _load_manual_exclusions ---
 @pytest.mark.asyncio
-async def test_load_manual_exclusions_no_file(dummy_config: CrawlerConfig, redis_test_client: redis.Redis, mock_fetcher: MagicMock):
-    dummy_config.exclude_file = None
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
+async def test_load_manual_exclusions_no_file(redis_test_config: CrawlerConfig, redis_test_client: redis.Redis, mock_fetcher: MagicMock):
+    redis_test_config.exclude_file = None
+    pe = RedisPolitenessEnforcer(config=redis_test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
     
     # Should initialize without error
     await pe.initialize()
@@ -59,20 +41,20 @@ async def test_load_manual_exclusions_no_file(dummy_config: CrawlerConfig, redis
 
 @pytest.mark.asyncio
 async def test_load_manual_exclusions_with_file(
-    dummy_config: CrawlerConfig,
+    redis_test_config: CrawlerConfig,
     redis_test_client: redis.Redis,
     mock_fetcher: MagicMock,
     tmp_path: Path
 ):
     exclude_file_path = tmp_path / "custom_excludes.txt"
-    dummy_config.exclude_file = exclude_file_path
+    redis_test_config.exclude_file = exclude_file_path
     
     mock_file_content = "excluded1.com\n#comment\nexcluded2.com\n   excluded3.com  \n"
     
     with open(exclude_file_path, 'w') as f:
         f.write(mock_file_content)
 
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
+    pe = RedisPolitenessEnforcer(config=redis_test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
     await pe.initialize()
     
     # Verify domains are marked as excluded in Redis
@@ -101,7 +83,7 @@ async def test_get_robots_from_memory_cache(redis_politeness_enforcer: RedisPoli
     redis_politeness_enforcer.fetcher.fetch_url.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_get_robots_from_redis_cache_fresh(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_robots_from_redis_cache_fresh(redis_politeness_enforcer: RedisPolitenessEnforcer, redis_test_config: CrawlerConfig):
     """Tests getting a fresh robots.txt from the Redis cache when not in memory."""
     domain = "rediscached.com"
     robots_text = "User-agent: TestCrawler\nDisallow: /private"
@@ -124,7 +106,7 @@ async def test_get_robots_from_redis_cache_fresh(redis_politeness_enforcer: Redi
     redis_politeness_enforcer.fetcher.fetch_url.assert_not_called()
     # 2. Parser is correct
     assert rfp is not None
-    assert rfp.can_fetch(dummy_config.user_agent, f"http://{domain}/private") is False
+    assert rfp.can_fetch(redis_test_config.user_agent, f"http://{domain}/private") is False
     # 3. In-memory cache is now populated
     assert domain in redis_politeness_enforcer.robots_parsers
     assert redis_politeness_enforcer.robots_parsers[domain] == rfp
@@ -253,7 +235,7 @@ async def test_is_url_allowed_manually_excluded(redis_politeness_enforcer: Redis
     redis_politeness_enforcer._get_robots_for_domain.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_is_url_allowed_by_robots(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_is_url_allowed_by_robots(redis_politeness_enforcer: RedisPolitenessEnforcer, redis_test_config: CrawlerConfig):
     domain = "robotsallowed.com"
     allowed_url = f"http://{domain}/allowed"
     disallowed_url = f"http://{domain}/disallowed"
@@ -279,10 +261,10 @@ async def test_is_url_allowed_by_robots(redis_politeness_enforcer: RedisPolitene
     redis_politeness_enforcer._get_robots_for_domain.assert_called_once_with(domain)
 
 @pytest.mark.asyncio
-async def test_is_url_allowed_seeded_urls_only(redis_test_client: redis.Redis, mock_fetcher: MagicMock, dummy_config: CrawlerConfig):
+async def test_is_url_allowed_seeded_urls_only(redis_test_client: redis.Redis, mock_fetcher: MagicMock, redis_test_config: CrawlerConfig):
     """Test that non-seeded domains are excluded when seeded_urls_only is True."""
-    dummy_config.seeded_urls_only = True
-    pe = RedisPolitenessEnforcer(config=dummy_config, redis_test_client=redis_test_client, fetcher=mock_fetcher)
+    redis_test_config.seeded_urls_only = True
+    pe = RedisPolitenessEnforcer(config=redis_test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
     await pe.initialize()
     
     seeded_domain = "seeded.com"
@@ -299,7 +281,7 @@ async def test_is_url_allowed_seeded_urls_only(redis_test_client: redis.Redis, m
 
 # --- Tests for get_crawl_delay (async) ---
 @pytest.mark.asyncio
-async def test_get_crawl_delay_from_robots_agent_specific(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_crawl_delay_from_robots_agent_specific(redis_politeness_enforcer: RedisPolitenessEnforcer, redis_test_config: CrawlerConfig):
     domain = "delaytest.com"
     for agent_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
         # Use simplified user agent for robots.txt (without version/parens)
@@ -317,7 +299,7 @@ async def test_get_crawl_delay_from_robots_agent_specific(redis_politeness_enfor
         assert delay == max(float(agent_delay), float(MIN_CRAWL_DELAY_SECONDS))
 
 @pytest.mark.asyncio
-async def test_get_crawl_delay_from_robots_wildcard(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_crawl_delay_from_robots_wildcard(redis_politeness_enforcer: RedisPolitenessEnforcer, redis_test_config: CrawlerConfig):
     domain = "wildcarddelay.com"
     for wildcard_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
         robots_text = f"User-agent: AnotherBot\nCrawl-delay: 50\nUser-agent: *\nCrawl-delay: {wildcard_delay}"
@@ -334,7 +316,7 @@ async def test_get_crawl_delay_from_robots_wildcard(redis_politeness_enforcer: R
         assert delay == max(float(wildcard_delay), float(MIN_CRAWL_DELAY_SECONDS))
 
 @pytest.mark.asyncio
-async def test_get_crawl_delay_default_no_robots_rule(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_crawl_delay_default_no_robots_rule(redis_politeness_enforcer: RedisPolitenessEnforcer, redis_test_config: CrawlerConfig):
     domain = "nodelayrule.com"
     robots_text = "User-agent: *\nDisallow: /"
 
@@ -346,7 +328,7 @@ async def test_get_crawl_delay_default_no_robots_rule(redis_politeness_enforcer:
     assert delay == float(MIN_CRAWL_DELAY_SECONDS)
 
 @pytest.mark.asyncio
-async def test_get_crawl_delay_respects_min_crawl_delay(redis_politeness_enforcer: RedisPolitenessEnforcer, dummy_config: CrawlerConfig):
+async def test_get_crawl_delay_respects_min_crawl_delay(redis_politeness_enforcer: RedisPolitenessEnforcer, redis_test_config: CrawlerConfig):
     domain = "shortdelay.com"
     for robot_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
         robots_text = f"User-agent: *\nCrawl-delay: {robot_delay}"
