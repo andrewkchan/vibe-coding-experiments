@@ -36,6 +36,7 @@ class PostgreSQLToHybridMigrator:
         self.fm = frontier_manager
         
     async def migrate(self):
+        start_phase = 1
         """Migrate data from PostgreSQL to hybrid storage."""
         start_time = time.time()
         logger.info("Starting migration from PostgreSQL to Redis + files...")
@@ -47,138 +48,143 @@ class PostgreSQLToHybridMigrator:
         
         logger.info(f"Data to migrate: {domain_count} domains, {frontier_count} frontier URLs, {visited_count} visited URLs")
         
-        # 1. Create bloom filter for seen URLs
-        logger.info("Creating bloom filter for seen URLs...")
-        try:
-            await self.redis.execute_command('BF.INFO', 'seen:bloom')
-            logger.info("Bloom filter already exists, skipping creation")
-        except:
-            # Create bloom filter - size for visited + frontier + growth room
-            await self.redis.execute_command(
-                'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
-            )
-            logger.info("Created bloom filter for 160M URLs with 0.1% FPR")
+        if start_phase <= 1:
+            # 1. Create bloom filter for seen URLs
+            logger.info("Creating bloom filter for seen URLs...")
+            try:
+                await self.redis.execute_command('BF.INFO', 'seen:bloom')
+                logger.info("Bloom filter already exists, skipping creation")
+            except:
+                # Create bloom filter - size for visited + frontier + growth room
+                await self.redis.execute_command(
+                    'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
+                )
+                logger.info("Created bloom filter for 160M URLs with 0.1% FPR")
         
-        # 2. Migrate domain metadata FIRST (as requested)
-        logger.info(f"Migrating {domain_count} domain metadata records...")
-        domains = await self.pg.fetch("""
-            SELECT domain, robots_txt_content, robots_txt_expires_timestamp,
-                   is_manually_excluded, last_scheduled_fetch_timestamp, is_seeded
-            FROM domain_metadata
-            ORDER BY domain
-        """)
-        
-        batch_size = 1000
-        current_time = int(time.time())
-        
-        for i in range(0, len(domains), batch_size):
-            batch = domains[i:i + batch_size]
-            pipe = self.redis.pipeline()
+        if start_phase <= 2:
+            logger.info(f"Clearing existing frontier data...")
+            await self.fm._clear_frontier()
+
+            # 2. Migrate domain metadata
+            logger.info(f"Migrating {domain_count} domain metadata records...")
             
-            for row in batch:
-                domain_key = f"domain:{row['domain']}"
+            batch_size = 1000
+            current_time = int(time.time())
+            
+            for i in range(0, domain_count, batch_size):
+                batch = await self.pg.fetch("""
+                    SELECT domain, robots_txt_content, robots_txt_expires_timestamp,
+                        is_manually_excluded, last_scheduled_fetch_timestamp, is_seeded
+                    FROM domain_metadata
+                    ORDER BY domain LIMIT $1 OFFSET $2
+                """, batch_size, i)
                 
-                # Set next_fetch_time to now since it's been days
-                mapping = {
-                    'robots_txt': row['robots_txt_content'] or '',
-                    'robots_expires': str(row['robots_txt_expires_timestamp'] or 0),
-                    'is_excluded': str(row['is_manually_excluded'] or 0),
-                    'next_fetch_time': str(current_time),  # Set to now as requested
-                    'frontier_offset': '0',  # Start at 0 for all domains
-                    'frontier_size': '0',    # Will be updated when we add URLs
-                    'is_seeded': str(row['is_seeded'] or 0)
-                }
+                pipe = self.redis.pipeline()
                 
-                pipe.hset(domain_key, mapping=mapping)
-            
-            await pipe.execute()
-            logger.info(f"Migrated {min(i + batch_size, len(domains))}/{len(domains)} domains")
-        
-        # 3. Migrate frontier URLs to files
-        logger.info(f"Migrating {frontier_count} frontier URLs to files...")
-        
-        # Clear any existing frontier data
-        await self.fm._clear_frontier()
-        
-        # Process frontier in batches
-        batch_size = 10000
-        offset = 0
-        domains_with_urls = set()
-        
-        while offset < frontier_count:
-            rows = await self.pg.fetch("""
-                SELECT url, domain
-                FROM frontier 
-                ORDER BY domain, added_timestamp
-                LIMIT $1 OFFSET $2
-            """, batch_size, offset)
-            
-            if not rows:
-                break
-            
-            # Extract URLs and track domains
-            urls = []
-            for row in rows:
-                urls.append(row['url'])
-                domains_with_urls.add(row['domain'])
-            
-            # Add all URLs in this batch at once (depth defaults to 0)
-            added = await self.fm.add_urls_batch(urls)
-            
-            offset += len(rows)
-            logger.info(f"Migrated {min(offset, frontier_count)}/{frontier_count} frontier URLs (added {added} new)")
-        
-        # 4. Populate domains:queue with all domains that have URLs
-        logger.info(f"Populating domain queue with {len(domains_with_urls)} domains...")
-        if domains_with_urls:
-            # Add all domains to the queue
-            pipe = self.redis.pipeline()
-            for domain in sorted(domains_with_urls):  # Sort for consistent ordering
-                pipe.rpush('domains:queue', domain)
-            await pipe.execute()
-        
-        # 5. Migrate visited URLs
-        logger.info(f"Migrating {visited_count} visited URLs...")
-        batch_size = 10000
-        offset = 0
-        
-        while offset < visited_count:
-            rows = await self.pg.fetch("""
-                SELECT url, url_sha256, crawled_timestamp, http_status_code,
-                       content_storage_path, redirected_to_url
-                FROM visited_urls
-                ORDER BY crawled_timestamp
-                LIMIT $1 OFFSET $2
-            """, batch_size, offset)
-            
-            if not rows:
-                break
-            
-            pipe = self.redis.pipeline()
-            for row in rows:
-                url_hash = row['url_sha256'][:16]  # Use first 16 chars as in the code
+                for row in batch:
+                    domain_key = f"domain:{row['domain']}"
+                    logger.info(f"Migrating domain: {domain_key} with robots_txt size: {len(row['robots_txt_content'] or "")}")
+                    
+                    # Set next_fetch_time to now since it's been days
+                    mapping = {
+                        'robots_txt': row['robots_txt_content'] or '',
+                        'robots_expires': str(row['robots_txt_expires_timestamp'] or 0),
+                        'is_excluded': str(row['is_manually_excluded'] or 0),
+                        'next_fetch_time': str(current_time),  # Set to now as requested
+                        'frontier_offset': '0',  # Start at 0 for all domains
+                        'frontier_size': '0',    # Will be updated when we add URLs
+                        'is_seeded': str(row['is_seeded'] or 0)
+                    }
+                    
+                    pipe.hset(domain_key, mapping=mapping)
                 
-                # Convert timestamp to Unix timestamp if it's a datetime
-                if isinstance(row['crawled_timestamp'], datetime):
-                    fetched_at = int(row['crawled_timestamp'].timestamp())
-                else:
-                    fetched_at = row['crawled_timestamp'] or 0
-                
-                # Store visited metadata
-                pipe.hset(f'visited:{url_hash}', mapping={
-                    'url': row['url'],
-                    'status_code': str(row['http_status_code'] or 0),
-                    'fetched_at': str(fetched_at),
-                    'content_path': row['content_storage_path'] or '',
-                    'error': ''
-                })
-                
-                # Mark as seen in bloom filter
-                pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+                await pipe.execute()
+                logger.info(f"Migrated {min(i + batch_size, domain_count)}/{domain_count} domains")
+        
+        if start_phase <= 3:
+            # 3a. Migrate frontier URLs to files
+            logger.info(f"Migrating {frontier_count} frontier URLs to files...")
             
-            await pipe.execute()
-            offset += len(rows)
-            logger.info(f"Migrated {min(offset, visited_count)}/{visited_count} visited URLs")
+            # Process frontier in batches
+            batch_size = 5000
+            offset = 0
+            domains_with_urls = set()
+            
+            while offset < frontier_count:
+                rows = await self.pg.fetch("""
+                    SELECT url, domain
+                    FROM frontier 
+                    ORDER BY domain, added_timestamp
+                    LIMIT $1 OFFSET $2
+                """, batch_size, offset)
+                
+                if not rows:
+                    break
+                
+                # Extract URLs and track domains
+                urls = []
+                for row in rows:
+                    urls.append(row['url'])
+                    domains_with_urls.add(row['domain'])
+                
+                # Add all URLs in this batch at once (depth defaults to 0)
+                added = await self.fm.add_urls_batch(urls)
+                
+                offset += len(rows)
+                logger.info(f"Migrated {min(offset, frontier_count)}/{frontier_count} frontier URLs (added {added} new of {len(urls)})")
+        
+            # 3b. Populate domains:queue with all domains that have URLs
+            logger.info(f"Populating domain queue with {len(domains_with_urls)} domains...")
+            if domains_with_urls:
+                # Add all domains to the queue
+                pipe = self.redis.pipeline()
+                for domain in sorted(domains_with_urls):  # Sort for consistent ordering
+                    pipe.rpush('domains:queue', domain)
+                await pipe.execute()
+        
+        if start_phase <= 4:
+            # 4. Migrate visited URLs
+            logger.info(f"Migrating {visited_count} visited URLs...")
+            batch_size = 5000
+            offset = 0
+            
+            while offset < visited_count:
+                rows = await self.pg.fetch("""
+                    SELECT url, url_sha256, crawled_timestamp, http_status_code,
+                        content_storage_path, redirected_to_url
+                    FROM visited_urls
+                    ORDER BY crawled_timestamp
+                    LIMIT $1 OFFSET $2
+                """, batch_size, offset)
+                
+                if not rows:
+                    break
+                
+                pipe = self.redis.pipeline()
+                for row in rows:
+                    url_hash = row['url_sha256'][:16]  # Use first 16 chars as in the code
+                    
+                    # Convert timestamp to Unix timestamp if it's a datetime
+                    if isinstance(row['crawled_timestamp'], datetime):
+                        fetched_at = int(row['crawled_timestamp'].timestamp())
+                    else:
+                        fetched_at = row['crawled_timestamp'] or 0
+                    
+                    # Store visited metadata
+                    pipe.hset(f'visited:{url_hash}', mapping={
+                        'url': row['url'],
+                        'status_code': str(row['http_status_code'] or 0),
+                        'fetched_at': str(fetched_at),
+                        'content_path': row['content_storage_path'] or '',
+                        'error': ''
+                    })
+                    
+                    # Mark as seen in bloom filter
+                    pipe.execute_command('BF.ADD', 'seen:bloom', row['url'])
+                
+                await pipe.execute()
+                offset += len(rows)
+                logger.info(f"Migrated {min(offset, visited_count)}/{visited_count} visited URLs")
         
         # Summary
         total_time = time.time() - start_time
