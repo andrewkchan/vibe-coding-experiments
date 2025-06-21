@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import ssl
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -29,7 +30,7 @@ class Fetcher:
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
         # Standard timeout settings (can be made configurable)
-        self.timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45, sock_connect=15)
+        self.timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=30, sock_connect=10)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Returns the existing aiohttp session or creates a new one."""
@@ -39,12 +40,18 @@ class Fetcher:
             max_total_connections = min(1000, self.config.max_workers * 2)  # Scale with workers
             max_per_host = max(5, min(20, max_total_connections // 50))  # Conservative per-host limit
             
+            # Create SSL context that doesn't verify certificates (similar to curl -k)
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
             connector = aiohttp.TCPConnector(
                 limit=max_total_connections,  # Total connection pool limit
                 limit_per_host=max_per_host,  # Max connections per host
                 ttl_dns_cache=300,  # DNS cache timeout in seconds
                 enable_cleanup_closed=True,  # Clean up closed connections
                 force_close=True,  # Force close connections after each request to free up FDs
+                ssl=ssl_context,  # Use our SSL context that ignores certificate errors
             )
             
             self.session = aiohttp.ClientSession(
@@ -52,7 +59,7 @@ class Fetcher:
                 headers={"User-Agent": self.config.user_agent},
                 connector=connector,
             )
-            logger.debug(f"Created new aiohttp.ClientSession with limit={max_total_connections}, limit_per_host={max_per_host}")
+            logger.debug(f"Created new aiohttp.ClientSession with limit={max_total_connections}, limit_per_host={max_per_host}, SSL verification disabled")
         return self.session
 
     async def close_session(self):
@@ -144,6 +151,7 @@ class Fetcher:
 
 # Example Usage (for testing and illustration)
 if __name__ == "__main__":
+    from pathlib import Path
     from .config import parse_args # Assuming parse_args can be run without actual args for a default config
 
     # A simplified config for testing the fetcher directly
