@@ -154,31 +154,31 @@ class PolitenessEnforcer:
         logger.info(f"Attempting to fetch robots.txt for {domain} (HTTP first)")
         fetch_result_http: FetchResult = await self.fetcher.fetch_url(robots_url_http, is_robots_txt=True)
 
-        robots_content: str | None = None
+        fetched_robots_content: str | None = None
         if fetch_result_http.status_code == 200 and fetch_result_http.text_content is not None:
-            robots_content = fetch_result_http.text_content
+            fetched_robots_content = fetch_result_http.text_content
         else:
             logger.debug(f"robots.txt not found or error on HTTP for {domain}. Trying HTTPS.")
             fetch_result_https: FetchResult = await self.fetcher.fetch_url(robots_url_https, is_robots_txt=True)
             if fetch_result_https.status_code == 200 and fetch_result_https.text_content is not None:
-                robots_content = fetch_result_https.text_content
+                fetched_robots_content = fetch_result_https.text_content
             else:
                 logger.debug(f"Failed to fetch robots.txt for {domain} via HTTPS. Assuming allow all.")
-                robots_content = "" # Treat as empty, meaning allow all
-        if '\0' in robots_content:
+                fetched_robots_content = "" # Treat as empty, meaning allow all
+        if '\0' in fetched_robots_content:
             # The robots.txt is malformed, and Postgres will reject it.
             # Treat as empty, meaning allow all.
             # TODO: Handle this by storing byte field in DB instead.
             logger.debug(f"robots.txt for {domain} contains null byte. Assuming allow all.")
-            robots_content = ""
+            fetched_robots_content = ""
 
         # Cache the newly fetched content
-        await self._update_robots_cache(domain, robots_content, fetched_timestamp, expires_timestamp)
+        await self._update_robots_cache(domain, fetched_robots_content, fetched_timestamp, expires_timestamp)
 
         # Parse and cache in memory
         rerp = RobotExclusionRulesParser()
-        rerp.parse(robots_content)
-        rerp.source_content = robots_content
+        rerp.parse(fetched_robots_content)
+        rerp.source_content = fetched_robots_content
         self.robots_parsers[domain] = rerp
         return rerp
 

@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import aiohttp
+from aiohttp import TraceConfig
 import time
 import cchardet # For fast character encoding detection
 from aiohttp.client_reqrep import ClientResponse as AiohttpClientResponse # Correct import
 
 from .config import CrawlerConfig
+from .metrics import fetch_counter, fetch_error_counter, fetch_timing_histogram
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,50 @@ class Fetcher:
         self.session: Optional[aiohttp.ClientSession] = None
         # Standard timeout settings (can be made configurable)
         self.timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=30, sock_connect=10)
+        
+        # Create trace config for detailed timing
+        self.trace_config = TraceConfig()
+        self._setup_tracing()
+    
+    def _setup_tracing(self):
+        """Set up aiohttp tracing callbacks for detailed timing metrics."""
+        async def on_request_start(session, trace_config_ctx, params):
+            trace_config_ctx.start_time = time.time()
+            trace_config_ctx.timings = {}
+            trace_config_ctx.fetch_type = trace_config_ctx.trace_request_ctx.get('fetch_type', 'page')
+        
+        async def on_dns_resolvehost_start(session, trace_config_ctx, params):
+            trace_config_ctx.dns_start = time.time()
+        
+        async def on_dns_resolvehost_end(session, trace_config_ctx, params):
+            if hasattr(trace_config_ctx, 'dns_start'):
+                dns_time = time.time() - trace_config_ctx.dns_start
+                trace_config_ctx.timings['dns_lookup'] = dns_time
+        
+        async def on_connection_create_start(session, trace_config_ctx, params):
+            trace_config_ctx.connect_start = time.time()
+        
+        async def on_connection_create_end(session, trace_config_ctx, params):
+            if hasattr(trace_config_ctx, 'connect_start'):
+                connect_time = time.time() - trace_config_ctx.connect_start
+                trace_config_ctx.timings['connect'] = connect_time
+        
+        async def on_request_end(session, trace_config_ctx, params):
+            if hasattr(trace_config_ctx, 'start_time'):
+                total_time = time.time() - trace_config_ctx.start_time
+                trace_config_ctx.timings['total'] = total_time
+                
+                # Record metrics
+                fetch_type = trace_config_ctx.fetch_type
+                for phase, duration in trace_config_ctx.timings.items():
+                    fetch_timing_histogram.labels(phase=phase, fetch_type=fetch_type).observe(duration)
+        
+        self.trace_config.on_request_start.append(on_request_start)
+        self.trace_config.on_dns_resolvehost_start.append(on_dns_resolvehost_start)
+        self.trace_config.on_dns_resolvehost_end.append(on_dns_resolvehost_end)
+        self.trace_config.on_connection_create_start.append(on_connection_create_start)
+        self.trace_config.on_connection_create_end.append(on_connection_create_end)
+        self.trace_config.on_request_end.append(on_request_end)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Returns the existing aiohttp session or creates a new one."""
@@ -58,6 +104,7 @@ class Fetcher:
                 timeout=self.timeout,
                 headers={"User-Agent": self.config.user_agent},
                 connector=connector,
+                trace_configs=[self.trace_config],
             )
             logger.debug(f"Created new aiohttp.ClientSession with limit={max_total_connections}, limit_per_host={max_per_host}, SSL verification disabled")
         return self.session
@@ -77,9 +124,16 @@ class Fetcher:
     ) -> FetchResult:
         session = await self._get_session()
         actual_final_url = url # Will be updated upon redirects
+        
+        # Track fetch attempt
+        fetch_type = 'robots_txt' if is_robots_txt else 'page'
+        fetch_counter.labels(fetch_type=fetch_type).inc()
+        
+        # Create trace context with fetch type
+        trace_request_ctx = {'fetch_type': fetch_type}
 
         try:
-            async with session.get(url, allow_redirects=True, max_redirects=max_redirects) as response:
+            async with session.get(url, allow_redirects=True, max_redirects=max_redirects, trace_request_ctx=trace_request_ctx) as response:
                 actual_final_url = str(response.url)
                 content_bytes = await response.read() # Read content first
                 status_code = response.status
@@ -115,6 +169,7 @@ class Fetcher:
 
                 if status_code >= 400:
                     logger.warning(f"HTTP error {status_code} for {actual_final_url} (from {url})")
+                    fetch_error_counter.labels(error_type=f'http_{status_code}', fetch_type=fetch_type).inc()
                     return FetchResult(
                         initial_url=url,
                         final_url=actual_final_url,
@@ -138,15 +193,19 @@ class Fetcher:
 
         except aiohttp.ClientResponseError as e:
             logger.error(f"ClientResponseError for {url}: {e.message} (status: {e.status})", exc_info=False)
+            fetch_error_counter.labels(error_type='client_response_error', fetch_type=fetch_type).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=e.status, error_message=str(e.message), redirect_history=e.history if hasattr(e, 'history') else tuple())
         except aiohttp.ClientConnectionError as e:
             logger.error(f"ClientConnectionError for {url}: {e}", exc_info=False)
+            fetch_error_counter.labels(error_type='connection_error', fetch_type=fetch_type).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=901, error_message=f"Connection error: {e}") # Custom status for connection error
         except asyncio.TimeoutError:
             logger.error(f"Timeout for {url}", exc_info=False)
+            fetch_error_counter.labels(error_type='timeout', fetch_type=fetch_type).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=902, error_message="Request timed out") # Custom status for timeout
         except Exception as e:
             logger.error(f"Generic error fetching {url}: {e}", exc_info=True)
+            fetch_error_counter.labels(error_type='generic_error', fetch_type=fetch_type).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=900, error_message=str(e)) # Custom status for other errors
 
 # Example Usage (for testing and illustration)

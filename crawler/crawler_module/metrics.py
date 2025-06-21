@@ -31,6 +31,21 @@ errors_counter = Counter(
     registry=REGISTRY
 )
 
+# Fetch-specific counters
+fetch_counter = Counter(
+    'crawler_fetches_total',
+    'Total number of fetch attempts',
+    ['fetch_type'],  # Labels: robots_txt, page
+    registry=REGISTRY
+)
+
+fetch_error_counter = Counter(
+    'crawler_fetch_errors_total',
+    'Total number of fetch errors by type',
+    ['error_type', 'fetch_type'],  # Labels: (timeout, connection_error, etc.), (robots_txt, page)
+    registry=REGISTRY
+)
+
 # Gauges (can go up or down)
 pages_per_second_gauge = Gauge(
     'crawler_pages_per_second',
@@ -72,7 +87,16 @@ db_pool_available_gauge = Gauge(
 fetch_duration_histogram = Histogram(
     'crawler_fetch_duration_seconds',
     'Time taken to fetch a URL',
+    ['fetch_type'],  # Label to distinguish robots.txt vs page fetches
     buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+    registry=REGISTRY
+)
+
+fetch_timing_histogram = Histogram(
+    'crawler_fetch_timing_seconds',
+    'Detailed fetch timing breakdown',
+    ['phase', 'fetch_type'],  # Labels: (dns_lookup, connect, ssl_handshake, transfer, total), (robots_txt, page)
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
     registry=REGISTRY
 )
 

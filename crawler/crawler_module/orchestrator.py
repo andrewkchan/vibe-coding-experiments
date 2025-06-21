@@ -367,7 +367,7 @@ class CrawlerOrchestrator:
                     fetch_start_time = time.time()
                     fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
                     fetch_duration = time.time() - fetch_start_time
-                    fetch_duration_histogram.observe(fetch_duration)
+                    fetch_duration_histogram.labels(fetch_type='page').observe(fetch_duration)
                     
                     crawled_timestamp = int(time.time())
 
