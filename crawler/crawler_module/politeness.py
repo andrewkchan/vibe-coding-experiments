@@ -379,7 +379,7 @@ class RedisPolitenessEnforcer:
             domain_key = f'domain:{domain}'
             result = await self.redis.hmget(domain_key, ['robots_txt', 'robots_expires'])
             
-            if result[0] and result[1]:
+            if result[0] is not None and result[1] is not None:
                 return (result[0], int(result[1]))
             return (None, None)
         except Exception as e:
