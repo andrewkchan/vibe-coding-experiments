@@ -326,7 +326,9 @@ class RedisPolitenessEnforcer:
         self.config = config
         self.redis = redis_client
         self.fetcher = fetcher
+        self.robots_parsers_max_size = 500_000
         self.robots_parsers: dict[str, RobotFileParser] = {}  # In-memory cache for parsed robots.txt
+        self.robots_parsers_order: TypingOrderedDict[str, None] = OrderedDict()
         
         # In-memory exclusion cache (LRU-style)
         self.exclusion_cache_max_size = 100_000
@@ -403,6 +405,7 @@ class RedisPolitenessEnforcer:
         """Fetches (async), parses, and caches robots.txt for a domain."""
         # 1. Check in-memory cache first
         if domain in self.robots_parsers:
+            self.robots_parsers_order.move_to_end(domain) # Mark as recently used
             return self.robots_parsers[domain]
         
         # 2. Check Redis cache
@@ -416,6 +419,7 @@ class RedisPolitenessEnforcer:
             # Store the content for reference
             rfp._content = robots_content  # type: ignore[attr-defined]
             self.robots_parsers[domain] = rfp
+            self.robots_parsers_order[domain] = None
             return rfp
         
         # 3. If not in caches or caches are stale, fetch from the web
@@ -452,6 +456,13 @@ class RedisPolitenessEnforcer:
         rfp.parse(fetched_robots_content.split('\n'))
         rfp._content = fetched_robots_content  # type: ignore[attr-defined]
         self.robots_parsers[domain] = rfp
+        self.robots_parsers_order[domain] = None
+
+        # 4. Enforce cache size limit
+        if len(self.robots_parsers) > self.robots_parsers_max_size:
+            oldest_domain, _ = self.robots_parsers_order.popitem(last=False)
+            del self.robots_parsers[oldest_domain]
+
         return rfp
     
     async def _check_manual_exclusion(self, domain: str) -> bool:
