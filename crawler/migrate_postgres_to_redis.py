@@ -133,15 +133,6 @@ class PostgreSQLToHybridMigrator:
                 offset += len(rows)
                 logger.info(f"Migrated {min(offset, frontier_count)}/{frontier_count} frontier URLs (added {added} new of {len(urls)})")
         
-            # 3b. Populate domains:queue with all domains that have URLs
-            logger.info(f"Populating domain queue with {len(domains_with_urls)} domains...")
-            if domains_with_urls:
-                # Add all domains to the queue
-                pipe = self.redis.pipeline()
-                for domain in sorted(domains_with_urls):  # Sort for consistent ordering
-                    pipe.rpush('domains:queue', domain)
-                await pipe.execute()
-        
         if start_phase <= 4:
             # 4. Migrate visited URLs
             logger.info(f"Migrating {visited_count} visited URLs...")
