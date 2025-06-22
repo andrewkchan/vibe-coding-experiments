@@ -49,6 +49,7 @@ EMPTY_FRONTIER_SLEEP_SECONDS = 10
 ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 
 METRICS_LOG_INTERVAL_SECONDS = 60
+LOG_MEM_DIAGNOSTICS = False
 MEM_DIAGNOSTICS_INTERVAL_SECONDS = 30
 
 # Number of domain shards - hardcoded to 500 to match the database index
@@ -508,12 +509,13 @@ class CrawlerOrchestrator:
             
             logger.info(f"Started all {len(self.worker_tasks)} worker tasks.")
 
-            with open(f'mem_diagnostics.txt', 'w+') as f:
-                logger.info(f"Logging memory diagnostics to mem_diagnostics.txt")
-                all_objects = muppy.get_objects()
-                sum1 = summary.summarize(all_objects)
-                f.write("\n".join(summary.format_(sum1)))
-                logger.info(f"Logged memory diagnostics to mem_diagnostics.txt")
+            if LOG_MEM_DIAGNOSTICS:
+                with open(f'mem_diagnostics.txt', 'w+') as f:
+                    logger.info(f"Logging memory diagnostics to mem_diagnostics.txt")
+                    all_objects = muppy.get_objects()
+                    sum1 = summary.summarize(all_objects)
+                    f.write("\n".join(summary.format_(sum1)))
+                    logger.info(f"Logged memory diagnostics to mem_diagnostics.txt")
 
             # Main monitoring loop
             while not self._shutdown_event.is_set():
@@ -579,7 +581,7 @@ class CrawlerOrchestrator:
                 if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                     await self._log_metrics()
 
-                if time.time() - self.last_mem_diagnostics_time >= MEM_DIAGNOSTICS_INTERVAL_SECONDS:
+                if LOG_MEM_DIAGNOSTICS and time.time() - self.last_mem_diagnostics_time >= MEM_DIAGNOSTICS_INTERVAL_SECONDS:
                     logger.info(f"Logging memory diagnostics to mem_diagnostics_{time.time()}.txt")
                     with open(f'mem_diagnostics_{time.time()}.txt', 'w+') as f:
                         import gc
