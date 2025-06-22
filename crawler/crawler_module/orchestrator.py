@@ -10,6 +10,7 @@ from collections import defaultdict
 import json
 import multiprocessing
 from pympler import tracker, muppy, summary
+import objgraph
 from multiprocessing import Process
 import redis.asyncio as redis
 
@@ -579,6 +580,7 @@ class CrawlerOrchestrator:
                     with open(f'mem_diagnostics_{time.time()}.txt', 'w+') as f:
                         import gc
                         gc.collect()
+                        t = time.time()
                         all_objects = muppy.get_objects()
                         sum1 = summary.summarize(all_objects)
                         f.write("\n".join(summary.format_(sum1)))
@@ -586,17 +588,18 @@ class CrawlerOrchestrator:
                         bytes_objects = [obj for obj in all_objects if isinstance(obj, bytes)]
                         # Sample the largest strings
                         strings_by_size = sorted(strings, key=len, reverse=True)
-                        f.write("\nTop 20 largest strings:")
-                        for i, s in enumerate(strings_by_size[:20]):
-                            preview = repr(s[:1000]) if len(s) > 1000 else repr(s)
+                        f.write("\nTop 5 largest strings:")
+                        for i, s in enumerate(strings_by_size[:5]):
+                            preview = repr(s[:100]) if len(s) > 100 else repr(s)
                             f.write(f"\n{i+1:2d}. Size: {len(s):,} chars - {preview}")
+                            objgraph.show_backrefs(s, max_depth=4, filename=f'mem_diagnostics_{t}_str_{i+1:2d}.png')
                         bytes_by_size = sorted(bytes_objects, key=len, reverse=True)
-                        f.write("\nTop 20 largest bytes objects:")
-                        for i, s in enumerate(bytes_by_size[:20]):
-                            preview = repr(s[:1000]) if len(s) > 1000 else repr(s)
+                        f.write("\nTop 5 largest bytes objects:")
+                        for i, s in enumerate(bytes_by_size[:5]):
+                            preview = repr(s[:100]) if len(s) > 100 else repr(s)
                             f.write(f"\n{i+1:2d}. Size: {len(s):,} bytes - {preview}")
-                    self.last_mem_diagnostics_time = time.time()
-                    logger.info(f"Logged memory diagnostics to mem_diagnostics_{time.time()}.txt")
+                    self.last_mem_diagnostics_time = t
+                    logger.info(f"Logged memory diagnostics to mem_diagnostics_{t}.txt")
 
                 # Use the fast, estimated count for logging
                 if self.config.db_type == 'redis':
