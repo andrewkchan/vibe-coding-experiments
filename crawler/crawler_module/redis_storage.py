@@ -72,7 +72,7 @@ class RedisStorageManager:
             logger.error(f"IOError saving content file {file_path}: {e}")
             return None
         except Exception as e:
-            logger.error(f"Unexpected error saving content file {file_path}: {e}", exc_info=True)
+            logger.error(f"Unexpected error saving content file {file_path}: {e}")
             return None
     
     async def add_visited_page(

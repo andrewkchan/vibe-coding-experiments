@@ -1,14 +1,13 @@
 import asyncio
 import logging
 import ssl
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 import aiohttp
 from aiohttp import TraceConfig
 import time
 import cchardet # For fast character encoding detection
-from aiohttp.client_reqrep import ClientResponse as AiohttpClientResponse # Correct import
 
 from .config import CrawlerConfig
 from .metrics import fetch_counter, fetch_error_counter, fetch_timing_histogram
@@ -25,7 +24,6 @@ class FetchResult:
     text_content: Optional[str] = None
     error_message: Optional[str] = None
     is_redirect: bool = False
-    redirect_history: Tuple[AiohttpClientResponse, ...] = field(default_factory=tuple) # Corrected type hint
 
 class Fetcher:
     def __init__(self, config: CrawlerConfig):
@@ -177,7 +175,6 @@ class Fetcher:
                         content_type=content_type,
                         error_message=f"HTTP {status_code}",
                         is_redirect=is_redirect,
-                        redirect_history=response.history
                     )
 
                 return FetchResult(
@@ -188,13 +185,12 @@ class Fetcher:
                     content_bytes=content_bytes,
                     text_content=text_content,
                     is_redirect=is_redirect,
-                    redirect_history=response.history
                 )
 
         except aiohttp.ClientResponseError as e:
             logger.error(f"ClientResponseError for {url}: {e.message} (status: {e.status})", exc_info=False)
             fetch_error_counter.labels(error_type='client_response_error', fetch_type=fetch_type).inc()
-            return FetchResult(initial_url=url, final_url=actual_final_url, status_code=e.status, error_message=str(e.message), redirect_history=e.history if hasattr(e, 'history') else tuple())
+            return FetchResult(initial_url=url, final_url=actual_final_url, status_code=e.status, error_message=str(e.message))
         except aiohttp.ClientConnectionError as e:
             logger.error(f"ClientConnectionError for {url}: {e}", exc_info=False)
             fetch_error_counter.labels(error_type='connection_error', fetch_type=fetch_type).inc()
@@ -204,67 +200,6 @@ class Fetcher:
             fetch_error_counter.labels(error_type='timeout', fetch_type=fetch_type).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=902, error_message="Request timed out") # Custom status for timeout
         except Exception as e:
-            logger.error(f"Generic error fetching {url}: {e}", exc_info=True)
+            logger.error(f"Generic error fetching {url}: {e}")
             fetch_error_counter.labels(error_type='generic_error', fetch_type=fetch_type).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=900, error_message=str(e)) # Custom status for other errors
-
-# Example Usage (for testing and illustration)
-if __name__ == "__main__":
-    from pathlib import Path
-    from .config import parse_args # Assuming parse_args can be run without actual args for a default config
-
-    # A simplified config for testing the fetcher directly
-    @dataclass
-    class DummyFetcherConfig:
-        user_agent: str = "FetcherTest/1.0 (mailto:test@example.com)"
-        # Add other fields if CrawlerConfig is more complex and fetcher needs them
-        seed_file: Path = Path("dummy_seeds.txt") 
-        email: str = "test@example.com"
-        data_dir: Path = Path("./test_fetcher_data")
-        exclude_file: Path | None = None
-        max_workers: int = 1
-        max_pages: int | None = None
-        max_duration: int | None = None
-        log_level: str = "DEBUG"
-        resume: bool = False
-
-    async def run_fetch_test():
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        
-        # test_config = parse_args() # This would require command line args or mocking
-        test_config = DummyFetcherConfig() # Use the simpler dummy for direct testing
-        
-        fetcher = Fetcher(config=test_config) # type: ignore
-
-        urls_to_test = [
-            "http://httpbin.org/html", 
-            "http://httpbin.org/encoding/utf8",
-            "http://httpbin.org/status/404",
-            "http://httpbin.org/status/500",
-            "http://httpbin.org/redirect/3", # Test redirects
-            "http://example.com/nonexistentpageforsure", # Should be a connection error or 404 depending on server
-            "https://jigsaw.w3.org/HTTP/ChunkedScript" # Chunked encoding test
-        ]
-
-        for test_url in urls_to_test:
-            print(f"\n--- Fetching: {test_url} ---")
-            result = await fetcher.fetch_url(test_url)
-            print(f"Initial URL: {result.initial_url}")
-            print(f"Final URL:   {result.final_url}")
-            print(f"Status Code: {result.status_code}")
-            print(f"Content-Type: {result.content_type}")
-            print(f"Is Redirect: {result.is_redirect}")
-            if result.redirect_history:
-                print(f"Redirect History: {[(h.method, str(h.url)) for h in result.redirect_history]}")
-            if result.error_message:
-                print(f"Error: {result.error_message}")
-            # print(f"Text Content Preview: {result.text_content[:200] if result.text_content else 'N/A'}...")
-            print("-" * 30)
-
-        await fetcher.close_session()
-
-    asyncio.run(run_fetch_test()) 

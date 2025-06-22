@@ -431,6 +431,10 @@ class CrawlerOrchestrator:
                                 redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
                             )
                     
+                    # Delete the fetched results here because otherwise they cannot be garbage 
+                    # collected until the worker issues a new fetch, increasing peak memory usage
+                    del fetch_result
+                    
                     # Check stopping conditions after processing a page
                     if self._check_stopping_conditions():
                         self._shutdown_event.set()
@@ -446,7 +450,7 @@ class CrawlerOrchestrator:
                     raise
                 except Exception as e:
                     # Log the error but continue processing
-                    logger.error(f"Worker-{worker_id}: Error processing URL: {e}", exc_info=True)
+                    logger.error(f"Worker-{worker_id}: Error processing URL: {e}")
                     errors_counter.labels(error_type='worker_error').inc()
                     # Small delay before continuing to avoid tight error loops
                     await asyncio.sleep(1)

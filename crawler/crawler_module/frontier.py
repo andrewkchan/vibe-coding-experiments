@@ -388,7 +388,7 @@ class FrontierManager:
             return selected_url_info
             
         except Exception as e:
-            logger.error(f"Error in get_next_url: {e}", exc_info=True)
+            logger.error(f"Error in get_next_url: {e}")
             return None
 
     async def _atomic_claim_urls(self, batch_size: int, claim_expiry_seconds: int, worker_id: int = 0, total_workers: int = 1) -> list[tuple[int, str, str, int]]:
