@@ -9,6 +9,7 @@ import random
 from collections import defaultdict
 import json
 import multiprocessing
+from pympler import tracker, muppy, summary
 from multiprocessing import Process
 import redis.asyncio as redis
 
@@ -47,6 +48,7 @@ EMPTY_FRONTIER_SLEEP_SECONDS = 10
 ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 
 METRICS_LOG_INTERVAL_SECONDS = 60
+MEM_DIAGNOSTICS_INTERVAL_SECONDS = 30
 
 # Number of domain shards - hardcoded to 500 to match the database index
 # This is not scalable but we're testing performance with a matching index
@@ -146,6 +148,8 @@ class CrawlerOrchestrator:
 
         self.pages_crawled_in_interval: int = 0
         self.last_metrics_log_time: float = time.time()
+        self.mem_tracker = tracker.SummaryTracker()
+        self.last_mem_diagnostics_time: float = time.time()
         
         # Parser process management
         self.parser_process: Optional[Process] = None
@@ -499,6 +503,13 @@ class CrawlerOrchestrator:
             
             logger.info(f"Started all {len(self.worker_tasks)} worker tasks.")
 
+            with open(f'mem_diagnostics.txt', 'w+') as f:
+                logger.info(f"Logging memory diagnostics to mem_diagnostics.txt")
+                all_objects = muppy.get_objects()
+                sum1 = summary.summarize(all_objects)
+                f.write("\n".join(summary.format_(sum1)))
+                logger.info(f"Logged memory diagnostics to mem_diagnostics.txt")
+
             # Main monitoring loop
             while not self._shutdown_event.is_set():
                 if not any(not task.done() for task in self.worker_tasks):
@@ -562,6 +573,30 @@ class CrawlerOrchestrator:
                 
                 if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                     await self._log_metrics()
+
+                if time.time() - self.last_mem_diagnostics_time >= MEM_DIAGNOSTICS_INTERVAL_SECONDS:
+                    logger.info(f"Logging memory diagnostics to mem_diagnostics_{time.time()}.txt")
+                    with open(f'mem_diagnostics_{time.time()}.txt', 'w+') as f:
+                        import gc
+                        gc.collect()
+                        all_objects = muppy.get_objects()
+                        sum1 = summary.summarize(all_objects)
+                        f.write("\n".join(summary.format_(sum1)))
+                        strings = [obj for obj in all_objects if isinstance(obj, str)]
+                        bytes_objects = [obj for obj in all_objects if isinstance(obj, bytes)]
+                        # Sample the largest strings
+                        strings_by_size = sorted(strings, key=len, reverse=True)
+                        f.write("\nTop 20 largest strings:")
+                        for i, s in enumerate(strings_by_size[:20]):
+                            preview = repr(s[:1000]) if len(s) > 1000 else repr(s)
+                            f.write(f"\n{i+1:2d}. Size: {len(s):,} chars - {preview}")
+                        bytes_by_size = sorted(bytes_objects, key=len, reverse=True)
+                        f.write("\nTop 20 largest bytes objects:")
+                        for i, s in enumerate(bytes_by_size[:20]):
+                            preview = repr(s[:1000]) if len(s) > 1000 else repr(s)
+                            f.write(f"\n{i+1:2d}. Size: {len(s):,} bytes - {preview}")
+                    self.last_mem_diagnostics_time = time.time()
+                    logger.info(f"Logged memory diagnostics to mem_diagnostics_{time.time()}.txt")
 
                 # Use the fast, estimated count for logging
                 if self.config.db_type == 'redis':
