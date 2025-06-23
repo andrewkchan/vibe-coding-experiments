@@ -16,6 +16,46 @@ from .redis_lock import LockManager
 
 logger = logging.getLogger(__name__)
 
+# Common non-text file extensions to skip
+NON_TEXT_EXTENSIONS = {
+    # Images
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico', '.tiff', '.tif',
+    # Videos
+    '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mkv', '.mpg', '.mpeg', '.m4v',
+    # Audio
+    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus',
+    # Documents (non-HTML)
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt',
+    # Archives
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz',
+    # Executables
+    '.exe', '.msi', '.dmg', '.pkg', '.deb', '.rpm', '.apk', '.app',
+    # Other binary formats
+    '.iso', '.bin', '.dat', '.db', '.sqlite', '.dll', '.so', '.dylib',
+    # Media/Design files
+    '.psd', '.ai', '.eps', '.indd', '.sketch', '.fig', '.xd',
+    # Data files
+    '.csv', '.json', '.xml', '.sql',
+}
+
+def is_likely_non_text_url(url: str) -> bool:
+    """Check if a URL likely points to a non-text file based on its extension."""
+    # Extract the path component, ignoring query string and fragment
+    try:
+        # Find the path part before any ? or #
+        path = url.split('?')[0].split('#')[0]
+        # Get the last part of the path
+        last_part = path.rstrip('/').split('/')[-1]
+        # Check if it has an extension
+        if '.' in last_part:
+            # Get the extension (everything after the last dot)
+            ext = '.' + last_part.split('.')[-1].lower()
+            return ext in NON_TEXT_EXTENSIONS
+    except Exception:
+        # If we can't parse the URL, assume it's okay to crawl
+        pass
+    return False
+
 class FrontierManager:
     def __init__(self, config: CrawlerConfig, storage: StorageManager, politeness: PolitenessEnforcer):
         self.config = config
@@ -664,6 +704,10 @@ class HybridFrontierManager:
             try:
                 normalized = normalize_url(u)
                 if normalized:
+                    # Skip non-text URLs early
+                    if is_likely_non_text_url(normalized):
+                        logger.debug(f"Skipping non-text URL during add: {normalized}")
+                        continue
                     candidates.add(normalized)
             except Exception as e:
                 logger.debug(f"Failed to normalize URL {u}: {e}")
@@ -898,29 +942,49 @@ class HybridFrontierManager:
                 if offset_bytes >= size_bytes:  # All URLs consumed
                     return None
                 
-                # Read URL from file
+                # Read URLs from file until we find a text URL
                 async with aiofiles.open(file_path, 'r') as f:
                     # Seek to the byte offset
                     await f.seek(offset_bytes)
                     
-                    # Read one line from current position
-                    line = await f.readline()
-                    
-                    if line:
-                        line = line.strip()
+                    # Keep reading lines until we find a text URL
+                    skipped_count = 0
+                    while True:
+                        # Read one line from current position
+                        line = await f.readline()
                         
-                        if line:
-                            # Get new byte position after reading the line
-                            new_offset_bytes = await f.tell()
+                        if not line:  # End of file
+                            # Update offset to end of file if we skipped any URLs
+                            if skipped_count > 0:
+                                new_offset = await f.tell()
+                                await self.redis.hset(domain_key, 'frontier_offset', str(new_offset))  # type: ignore[misc]
+                                logger.debug(f"Reached end of frontier file for {domain} after skipping {skipped_count} non-text URLs")
+                            return None
                             
-                            # Update offset to new position
+                        line = line.strip()
+                        if not line:  # Empty line
+                            continue
+                            
+                        # Parse URL data
+                        parts = line.split('|')
+                        if len(parts) >= 2:
+                            url, depth_str = parts[:2]
+                            
+                            # Check if this looks like a non-text URL
+                            if is_likely_non_text_url(url):
+                                skipped_count += 1
+                                if skipped_count % 100 == 0:  # Log every 100 skipped
+                                    logger.debug(f"Skipped {skipped_count} non-text URLs for domain {domain}")
+                                continue  # Skip this URL and try the next one
+                                
+                            # Found a text URL! Update offset and return it
+                            new_offset_bytes = await f.tell()
                             await self.redis.hset(domain_key, 'frontier_offset', str(new_offset_bytes))  # type: ignore[misc]
                             
-                            # Parse URL data
-                            parts = line.split('|')
-                            if len(parts) >= 2:
-                                url, depth_str = parts[:2]
-                                return url, domain, int(depth_str) 
+                            if skipped_count > 0:
+                                logger.debug(f"Skipped {skipped_count} non-text URLs before finding text URL: {url}")
+                            
+                            return url, domain, int(depth_str)
         except TimeoutError:
             logger.error(f"Failed to acquire lock for domain {domain} when reading URL")
             return None

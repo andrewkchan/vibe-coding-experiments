@@ -604,3 +604,128 @@ async def test_frontier_resume_with_politeness(
     assert await frontier_run2.count_frontier() == 0
     
     logger.info("Frontier resume test passed with politeness mocks.")
+
+@pytest.mark.asyncio
+async def test_url_filtering_in_add_urls_batch(
+    hybrid_frontier_manager: HybridFrontierManager,
+    mock_politeness_enforcer_for_frontier: MagicMock
+):
+    """Test that non-text URLs are filtered out when adding to frontier."""
+    logger.info("Testing URL filtering in add_urls_batch")
+    
+    # Setup
+    await hybrid_frontier_manager._clear_frontier()
+    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
+    
+    # Mix of text and non-text URLs
+    urls_to_add = [
+        "http://example.com/page.html",  # Should be added
+        "http://example.com/image.jpg",  # Should be filtered
+        "http://example.com/document.pdf",  # Should be filtered
+        "http://example.com/article",  # Should be added
+        "http://example.com/video.mp4",  # Should be filtered
+        "http://example.com/api/data",  # Should be added
+        "http://example.com/archive.zip",  # Should be filtered
+    ]
+    
+    # Add URLs
+    added_count = await hybrid_frontier_manager.add_urls_batch(urls_to_add)
+    
+    # Only text URLs should be added (3 out of 7)
+    assert added_count == 3, f"Expected 3 URLs to be added, got {added_count}"
+    
+    # Verify the correct URLs were added by retrieving them
+    retrieved_urls = []
+    while True:
+        result = await hybrid_frontier_manager.get_next_url()
+        if result is None:
+            break
+        retrieved_urls.append(result[0])
+    
+    expected_urls = {
+        "http://example.com/page.html",
+        "http://example.com/article",
+        "http://example.com/api/data"
+    }
+    assert set(retrieved_urls) == expected_urls, \
+        f"Expected URLs {expected_urls}, got {set(retrieved_urls)}"
+    
+    logger.info("URL filtering in add_urls_batch test passed.")
+
+@pytest.mark.asyncio
+async def test_url_filtering_in_get_next_url(
+    temp_test_frontier_dir: Path,
+    frontier_test_config_obj: FrontierTestConfig,
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    redis_test_client: redis.Redis
+):
+    """Test that non-text URLs are skipped when reading from frontier files."""
+    logger.info("Testing URL filtering in get_next_url")
+    
+    # Setup
+    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
+    mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
+    
+    config = CrawlerConfig(**vars(frontier_test_config_obj))
+    fm = HybridFrontierManager(
+        config=config,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_test_client
+    )
+    
+    # Clear and manually create a frontier file with mixed content
+    await fm._clear_frontier()
+    
+    # Manually write a frontier file with mixed URLs
+    domain = "mixed-content.com"
+    frontier_path = fm._get_frontier_path(domain)
+    frontier_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write URLs directly to file (bypassing filtering in add_urls_batch)
+    with open(frontier_path, 'w') as f:
+        f.write("http://mixed-content.com/page1.html|0\n")
+        f.write("http://mixed-content.com/image1.jpg|0\n")  # Should be skipped
+        f.write("http://mixed-content.com/document.pdf|0\n")  # Should be skipped
+        f.write("http://mixed-content.com/page2|0\n")
+        f.write("http://mixed-content.com/video.mp4|0\n")  # Should be skipped
+        f.write("http://mixed-content.com/api/endpoint|0\n")
+        f.write("http://mixed-content.com/data.zip|0\n")  # Should be skipped
+        f.write("http://mixed-content.com/final-page.html|0\n")
+    
+    # Set up Redis metadata for this domain
+    domain_key = f"domain:{domain}"
+    await redis_test_client.hset(domain_key, mapping={  # type: ignore[misc]
+        'frontier_size': str(frontier_path.stat().st_size),
+        'file_path': str(frontier_path.relative_to(fm.frontier_dir)),
+        'frontier_offset': '0'
+    })
+    
+    # Add domain to queue
+    await redis_test_client.rpush('domains:queue', domain)  # type: ignore[misc]
+    
+    # Get URLs and verify only text URLs are returned
+    retrieved_urls = []
+    while True:
+        result = await fm.get_next_url()
+        if result is None:
+            break
+        retrieved_urls.append(result[0])
+    
+    expected_urls = [
+        "http://mixed-content.com/page1.html",
+        "http://mixed-content.com/page2",
+        "http://mixed-content.com/api/endpoint",
+        "http://mixed-content.com/final-page.html"
+    ]
+    
+    assert retrieved_urls == expected_urls, \
+        f"Expected URLs {expected_urls}, got {retrieved_urls}"
+    
+    # Verify that the offset was updated correctly (should be at end of file)
+    final_metadata = await redis_test_client.hgetall(domain_key)  # type: ignore[misc]
+    final_offset = int(final_metadata['frontier_offset'])
+    file_size = frontier_path.stat().st_size
+    assert final_offset == file_size, \
+        f"Expected offset to be at end of file ({file_size}), got {final_offset}"
+    
+    logger.info("URL filtering in get_next_url test passed.")

@@ -36,7 +36,8 @@ from .metrics import (
     db_pool_available_gauge,
     fetch_duration_histogram,
     db_connection_acquire_histogram,
-    db_query_duration_histogram
+    db_query_duration_histogram,
+    content_size_histogram
 )
 
 logger = logging.getLogger(__name__)
@@ -351,6 +352,34 @@ class CrawlerOrchestrator:
                     for hold_time in hold_times:
                         db_query_duration_histogram.labels(query_name=query_name).observe(hold_time)
                 # else: logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): No samples") # Optional: log if no samples
+
+        # Content size metrics - extract data from Prometheus histogram
+        try:
+            # Get samples from content_size_histogram for HTML pages
+            html_sizes = []
+            non_html_sizes = []
+            
+            # Access the internal metrics structure (this is a bit hacky but works)
+            for metric in content_size_histogram._metrics.values():
+                labels = metric._labelnames
+                if 'page' in labels.get('fetch_type', '') or labels.get('fetch_type') == 'page':
+                    if labels.get('content_type') == 'html':
+                        # Get the sum and count from the histogram
+                        sum_value = metric._sum._value.get()
+                        count_value = metric._count._value.get()
+                        if count_value > 0:
+                            avg_size = sum_value / count_value
+                            logger.info(f"[Metrics] HTML Content Size: Avg={avg_size/1024:.1f}KB, Count={count_value}")
+                    elif labels.get('content_type') == 'non_html':
+                        sum_value = metric._sum._value.get()
+                        count_value = metric._count._value.get()
+                        if count_value > 0:
+                            avg_size = sum_value / count_value
+                            logger.info(f"[Metrics] Non-HTML Content Size: Avg={avg_size/1024:.1f}KB, Count={count_value}")
+        except Exception as e:
+            # If we can't extract from Prometheus, just log that metrics are available
+            logger.debug(f"Could not extract content size metrics: {e}")
+            logger.info("[Metrics] Content size metrics available at Prometheus endpoint /metrics")
 
         # Reset for next interval
         self.pages_crawled_in_interval = 0

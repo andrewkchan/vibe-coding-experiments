@@ -115,6 +115,16 @@ db_query_duration_histogram = Histogram(
     registry=REGISTRY
 )
 
+# Content size histogram for tracking page sizes
+content_size_histogram = Histogram(
+    'crawler_content_size_bytes',
+    'Size of fetched content in bytes',
+    ['content_type', 'fetch_type'],  # Labels: (html, non_html), (robots_txt, page)
+    # Buckets: 1KB, 10KB, 50KB, 100KB, 500KB, 1MB, 5MB, 10MB, 50MB, 100MB
+    buckets=(1024, 10240, 51200, 102400, 512000, 1048576, 5242880, 10485760, 52428800, 104857600),
+    registry=REGISTRY
+)
+
 class MetricsServer:
     """Manages the Prometheus metrics HTTP server."""
     

@@ -10,7 +10,7 @@ import time
 import cchardet # For fast character encoding detection
 
 from .config import CrawlerConfig
-from .metrics import fetch_counter, fetch_error_counter, fetch_timing_histogram
+from .metrics import fetch_counter, fetch_error_counter, fetch_timing_histogram, content_size_histogram
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,27 @@ class Fetcher:
                 content_bytes = await response.read() # Read content first
                 status_code = response.status
                 content_type = response.headers.get('Content-Type')
+                
+                # Record content size metrics for successful responses
+                if content_bytes and status_code < 400:
+                    content_size = len(content_bytes)
+                    # Determine content type category for metrics
+                    if content_type:
+                        if 'html' in content_type.lower():
+                            content_type_label = 'html'
+                        else:
+                            content_type_label = 'non_html'
+                    else:
+                        content_type_label = 'unknown'
+                    
+                    content_size_histogram.labels(
+                        content_type=content_type_label,
+                        fetch_type=fetch_type
+                    ).observe(content_size)
+                    
+                    # Log large pages for monitoring
+                    if content_size > 10 * 1024 * 1024:  # 10MB
+                        logger.warning(f"Large page fetched: {content_size:,} bytes ({content_size / 1024 / 1024:.1f} MB) from {actual_final_url}")
                 
                 text_content: Optional[str] = None
                 if content_bytes and content_type and content_type.startswith('text/'):
