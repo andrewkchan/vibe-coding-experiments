@@ -77,28 +77,9 @@ class PageParser:
             logger.error(f"Error during link extraction for {base_url}: {e}")
 
         # 2. Extract text content
-        text_content: Optional[str] = None
-        try:
-            cleaned_doc = self.cleaner.clean_html(doc)
-
-            body_element_cleaned = cleaned_doc.find('.//body')
-            if body_element_cleaned is not None:
-                text_content = body_element_cleaned.text_content()
-            else:
-                # If there's no body element even after cleaning (or initially),
-                # we define our page's "text_content" as None.
-                # The title is handled separately.
-                text_content = None
-            
-            if text_content: # Process only if text_content was derived (i.e., from a body)
-                text_content = ' \n'.join([line.strip() for line in text_content.splitlines() if line.strip()])
-                text_content = text_content.strip()
-                if not text_content: 
-                    text_content = None
-            # If text_content was initially set to None (no body), it remains None.
-
-        except Exception as e:
-            logger.error(f"Error during text extraction for {base_url}: {e}")
+        # Currently not using any text extraction logic, just returning the raw HTML string
+        # If we want to clean the HTML or extract specific elements we would do so here
+        text_content = html_string
 
         # 3. Extract title
         title: Optional[str] = None
