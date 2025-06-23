@@ -40,6 +40,13 @@ errors_counter = Counter(
     registry=registry
 )
 
+backpressure_events_counter = Counter(
+    'backpressure_events_total',
+    'Total number of backpressure events by type',
+    ['backpressure_type'],  # soft_limit, hard_limit
+    registry=registry
+)
+
 # For gauges in multiprocess mode, we need to specify the multiprocess_mode
 # 'livesum' means the gauge shows the sum of all process values
 # Other options: 'liveall' (show all values), 'min', 'max'
@@ -80,7 +87,7 @@ active_parser_workers_gauge = Gauge(
 
 parse_queue_size_gauge = Gauge(
     'parse_queue_size', 
-    'Number of items in parse queue',
+    'Number of items in parse queue (fetch:queue)',
     multiprocess_mode='livemax' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )

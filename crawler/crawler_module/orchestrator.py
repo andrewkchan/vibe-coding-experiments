@@ -12,6 +12,7 @@ from pympler import tracker, muppy, summary
 import objgraph
 from multiprocessing import Process
 import redis.asyncio as redis
+import random
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -28,6 +29,7 @@ from .metrics import (
     pages_crawled_counter,
     urls_added_counter,
     errors_counter,
+    backpressure_events_counter,
     pages_per_second_gauge,
     frontier_size_gauge,
     active_workers_gauge,
@@ -173,6 +175,10 @@ class CrawlerOrchestrator:
         self.parser_process: Optional[Process] = None
         self.parser_processes: List[Process] = []  # Support multiple parsers
         self.num_parser_processes = 2
+        
+        # Backpressure configuration
+        self.fetch_queue_soft_limit = 20000  # Start slowing down at this size
+        self.fetch_queue_hard_limit = 80000  # Maximum queue size
 
     def _start_parser_process(self):
         """Start the parser consumer as a child process."""
@@ -459,8 +465,34 @@ class CrawlerOrchestrator:
                             }
                             
                             # Push to Redis queue for parsing
-                            await self.redis_client_binary.rpush('fetch:queue', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
+                            queue_size = await self.redis_client_binary.rpush('fetch:queue', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
                             logger.debug(f"Worker-{worker_id}: Pushed HTML content to parse queue for {fetch_result.final_url}")
+                            
+                            # Backpressure
+                            if queue_size > self.fetch_queue_hard_limit:
+                                # Hard limit - wait until queue shrinks
+                                logger.warning(f"Worker-{worker_id}: Fetch queue at hard limit ({queue_size}/{self.fetch_queue_hard_limit}), waiting...")
+                                backpressure_events_counter.labels(backpressure_type='hard_limit').inc()
+                                while queue_size > self.fetch_queue_soft_limit:
+                                    await asyncio.sleep(5.0)
+                                    queue_size = await self.redis_client_binary.llen('fetch:queue')
+                                logger.info(f"Worker-{worker_id}: Fetch queue below soft limit ({queue_size}), resuming")
+                                
+                            elif queue_size > self.fetch_queue_soft_limit:
+                                # Soft limit - progressive backoff based on queue size
+                                # Sleep between 0 and 2 seconds based on how far above soft limit we are
+                                overflow_ratio = (queue_size - self.fetch_queue_soft_limit) / (self.fetch_queue_hard_limit - self.fetch_queue_soft_limit)
+                                overflow_ratio = min(overflow_ratio, 1.0)  # Cap at 1.0
+                                
+                                # Add randomization to prevent thundering herd
+                                base_sleep = overflow_ratio * 2.0
+                                jitter = random.random() * 0.5  # 0-0.5 seconds of jitter
+                                sleep_time = base_sleep + jitter
+                                
+                                if worker_id % 10 == 1:  # Log from only 10% of workers to reduce spam
+                                    logger.debug(f"Worker-{worker_id}: Fetch queue at {queue_size}, applying backpressure (sleep {sleep_time:.2f}s)")
+                                backpressure_events_counter.labels(backpressure_type='soft_limit').inc()
+                                await asyncio.sleep(sleep_time)
                         else:
                             logger.debug(f"Worker-{worker_id}: Not HTML or no text content for {fetch_result.final_url} (Type: {fetch_result.content_type})")
                             
