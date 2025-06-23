@@ -22,21 +22,36 @@ else:
 
 # Define metrics with explicit registry
 pages_crawled_counter = Counter(
-    'pages_crawled_total', 
+    'crawler_pages_crawled_total', 
     'Total number of pages successfully crawled',
     registry=registry
 )
 
 urls_added_counter = Counter(
-    'urls_added_total', 
+    'crawler_urls_added_total', 
     'Total number of URLs added to the frontier',
     registry=registry
 )
 
 errors_counter = Counter(
-    'errors_total', 
+    'crawler_errors_total', 
     'Total number of errors by type', 
     ['error_type'],
+    registry=registry
+)
+
+# Fetch-specific countersAdd commentMore actions
+fetch_counter = Counter(
+    'crawler_fetches_total',
+    'Total number of fetch attempts',
+    ['fetch_type'],  # Labels: robots_txt, page
+    registry=registry
+)
+
+fetch_error_counter = Counter(
+    'crawler_fetch_errors_total',
+    'Total number of fetch errors by type',
+    ['error_type', 'fetch_type'],  # Labels: (timeout, connection_error, etc.), (robots_txt, page)
     registry=registry
 )
 
@@ -51,7 +66,7 @@ backpressure_events_counter = Counter(
 # 'livesum' means the gauge shows the sum of all process values
 # Other options: 'liveall' (show all values), 'min', 'max'
 pages_per_second_gauge = Gauge(
-    'pages_per_second', 
+    'crawler_pages_per_second', 
     'Pages crawled per second (recent rate)',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
@@ -65,21 +80,21 @@ parser_pages_per_second_gauge = Gauge(
 )
 
 frontier_size_gauge = Gauge(
-    'frontier_size', 
+    'crawler_frontier_size', 
     'Current size of the URL frontier',
     multiprocess_mode='livemax' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
 
 active_workers_gauge = Gauge(
-    'active_workers', 
+    'crawler_active_workers', 
     'Number of active crawler workers',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
 
 active_parser_workers_gauge = Gauge(
-    'active_parser_workers', 
+    'crawler_active_parser_workers', 
     'Number of active parser workers',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
@@ -93,21 +108,21 @@ parse_queue_size_gauge = Gauge(
 )
 
 memory_usage_gauge = Gauge(
-    'memory_usage_bytes', 
+    'crawler_memory_usage_bytes', 
     'Current memory usage in bytes',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
 
 open_fds_gauge = Gauge(
-    'open_file_descriptors', 
+    'crawler_open_fds', 
     'Number of open file descriptors',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
 
 db_pool_available_gauge = Gauge(
-    'db_pool_available_connections', 
+    'crawler_db_pool_available_connections', 
     'Available database connections in the pool',
     multiprocess_mode='livemin' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
@@ -115,10 +130,18 @@ db_pool_available_gauge = Gauge(
 
 # Histograms work normally in multiprocess mode
 fetch_duration_histogram = Histogram(
-    'fetch_duration_seconds', 
+    'crawler_fetch_duration_seconds', 
     'Time taken to fetch a URL',
     ['fetch_type'],
     buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+    registry=registry
+)
+
+fetch_timing_histogram = Histogram(
+    'crawler_fetch_timing_seconds',
+    'Detailed fetch timing breakdown',
+    ['phase', 'fetch_type'],  # Labels: (dns_lookup, connect, ssl_handshake, transfer, total), (robots_txt, page)
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
     registry=registry
 )
 
@@ -130,14 +153,14 @@ parse_duration_histogram = Histogram(
 )
 
 db_connection_acquire_histogram = Histogram(
-    'db_connection_acquire_seconds',
+    'crawler_db_connection_acquire_seconds',
     'Time to acquire a database connection from the pool',
     buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0),
     registry=registry
 )
 
 db_query_duration_histogram = Histogram(
-    'db_query_duration_seconds',
+    'crawler_db_query_duration_seconds',
     'Time taken for database queries',
     ['query_name'],
     buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
@@ -145,7 +168,7 @@ db_query_duration_histogram = Histogram(
 )
 
 content_size_histogram = Histogram(
-    'content_size_bytes',
+    'crawler_content_size_bytes',
     'Size of fetched content in bytes',
     ['content_type', 'fetch_type'],
     buckets=(1024, 10240, 102400, 1048576, 10485760),  # 1KB, 10KB, 100KB, 1MB, 10MB
