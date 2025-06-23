@@ -1,13 +1,13 @@
 import asyncio
 import logging
 import time
+import pickle
 from pathlib import Path
 from typing import Set, Optional, Dict, List, Union
 import os # For process ID
 import psutil
 import random
 from collections import defaultdict
-import json
 import multiprocessing
 from pympler import tracker, muppy, summary
 import objgraph
@@ -75,6 +75,12 @@ class CrawlerOrchestrator:
         if config.db_type == 'redis':
             # Initialize Redis client with configurable connection
             self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
+            
+            # Create a separate Redis client for binary data (pickle)
+            binary_redis_kwargs = config.get_redis_connection_kwargs()
+            binary_redis_kwargs['decode_responses'] = False
+            self.redis_client_binary = redis.Redis(**binary_redis_kwargs)
+            
             self.db_backend = None  # No SQL backend for Redis
             
             # Use Redis-based components
@@ -415,7 +421,7 @@ class CrawlerOrchestrator:
                             }
                             
                             # Push to Redis queue for parsing
-                            await self.redis_client.rpush('fetch:queue', json.dumps(queue_item))
+                            await self.redis_client_binary.rpush('fetch:queue', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
                             logger.debug(f"Worker-{worker_id}: Pushed HTML content to parse queue for {fetch_result.final_url}")
                         else:
                             logger.debug(f"Worker-{worker_id}: Not HTML or no text content for {fetch_result.final_url} (Type: {fetch_result.content_type})")
@@ -719,6 +725,7 @@ class CrawlerOrchestrator:
             # Close Redis connection if using Redis backend
             if self.config.db_type == 'redis' and self.redis_client:
                 await self.redis_client.aclose()
+                await self.redis_client_binary.aclose()
             
             logger.info(f"Crawl finished. Total pages crawled: {self.pages_crawled_count}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

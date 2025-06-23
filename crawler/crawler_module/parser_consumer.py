@@ -4,7 +4,7 @@ Consumes raw HTML from Redis queue and performs parsing, content saving, and lin
 """
 import asyncio
 import logging
-import json
+import pickle
 import time
 from typing import Optional, Dict, Any, Set
 from pathlib import Path
@@ -42,6 +42,12 @@ class ParserConsumer:
         self.config = config
         self.num_workers = num_workers
         self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
+        
+        # Create a separate Redis client for binary data (pickle)
+        binary_redis_kwargs = config.get_redis_connection_kwargs()
+        binary_redis_kwargs['decode_responses'] = False
+        self.redis_client_binary = redis.Redis(**binary_redis_kwargs)
+        
         self.parser = PageParser()
         
         # Initialize storage and frontier for adding URLs
@@ -193,7 +199,7 @@ class ParserConsumer:
                 try:
                     # Use BLPOP for blocking pop with timeout
                     # Returns tuple of (queue_name, item) or None on timeout
-                    result = await self.redis_client.blpop('fetch:queue', timeout=5)
+                    result = await self.redis_client_binary.blpop('fetch:queue', timeout=5)
                     
                     if result is None:
                         consecutive_empty += 1
@@ -202,14 +208,14 @@ class ParserConsumer:
                         continue
                     
                     consecutive_empty = 0  # Reset counter on successful pop
-                    _, item_json = result
+                    _, item_pickle = result
                     
-                    # Parse JSON data
+                    # Parse pickle data
                     try:
-                        item_data = json.loads(item_json)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Worker {worker_id}: Invalid JSON in queue: {e}")
-                        parse_errors_counter.labels(error_type='json_decode').inc()
+                        item_data = pickle.loads(item_pickle)
+                    except pickle.UnpicklingError as e:
+                        logger.error(f"Worker {worker_id}: Invalid pickle in queue: {e}")
+                        parse_errors_counter.labels(error_type='pickle_decode').inc()
                         continue
                     
                     # Process the item
@@ -293,6 +299,7 @@ class ParserConsumer:
             await self.fetcher.close_session()
             await self.storage.close()
             await self.redis_client.aclose()
+            await self.redis_client_binary.aclose()
             
             # Log final stats
             total_runtime = time.time() - self.start_time
