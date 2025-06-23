@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Set, Optional, Dict, List, Union
 import os # For process ID
 import psutil
-import random
 from collections import defaultdict
-import multiprocessing
+import functools
 from pympler import tracker, muppy, summary
 import objgraph
 from multiprocessing import Process
@@ -75,11 +74,21 @@ class CrawlerOrchestrator:
         if config.db_type == 'redis':
             # Initialize Redis client with configurable connection
             self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
+            # Monkey-patch redis client method to remove a useless decorator which incurs extra overhead
+            self.redis_client.connection_pool.get_connection = functools.partial(
+                self.redis_client.connection_pool.get_connection.__wrapped__, 
+                self.redis_client.connection_pool
+            )
             
             # Create a separate Redis client for binary data (pickle)
             binary_redis_kwargs = config.get_redis_connection_kwargs()
             binary_redis_kwargs['decode_responses'] = False
             self.redis_client_binary = redis.Redis(**binary_redis_kwargs)
+            # Same monkey patching as above
+            self.redis_client_binary.connection_pool.get_connection = functools.partial(
+                self.redis_client_binary.connection_pool.get_connection.__wrapped__, 
+                self.redis_client_binary.connection_pool
+            )
             
             self.db_backend = None  # No SQL backend for Redis
             

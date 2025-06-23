@@ -1,5 +1,5 @@
 # Optimizing web crawler performance
-_Exported on 6/22/2025 at 19:53:53 PDT from Cursor (1.0.0)_
+_Exported on 6/22/2025 at 21:32:29 PDT from Cursor (1.0.0)_
 
 ---
 
@@ -651,4 +651,128 @@ Perfect! I've successfully implemented the pickle changes. Here's a summary of w
 - **No breaking changes** to other Redis operations that expect strings
 
 The solution elegantly handles the bytes vs strings issue by using dedicated client instances for different data types. This should eliminate the JSON serialization bottleneck you identified in your profiling!
+
+---
+
+**User**
+
+Thanks, can you help me make the process-local read lock changes in HybridFrontierManager as well?
+
+---
+
+**Cursor**
+
+I'll help you implement the process-local read lock changes in HybridFrontierManager. This will eliminate the Redis round-trips for read operations, which should give us another ~4% performance improvement.
+
+```python
+    def __init__(self, config: CrawlerConfig, politeness: PolitenessEnforcer, redis_client: redis.Redis):
+        self.config = config
+        self.politeness = politeness
+        self.redis = redis_client
+        self.frontier_dir = config.data_dir / "frontiers"
+        self.frontier_dir.mkdir(exist_ok=True)
+        self.lock_manager = LockManager(redis_client)
+        # Process-local locks for reading - no need for Redis round-trips
+        self._read_locks: Dict[str, asyncio.Lock] = {}
+```
+
+```python
+    def _get_frontier_path(self, domain: str) -> Path:
+        """Get file path for domain's frontier."""
+        # Use first 2 chars of hash for subdirectory (256 subdirs)
+        domain_hash = hashlib.md5(domain.encode()).hexdigest()
+        subdir = domain_hash[:2]
+        path = self.frontier_dir / subdir / f"{domain}.frontier"
+        path.parent.mkdir(exist_ok=True)
+        return path
+    
+    def _get_read_lock(self, domain: str) -> asyncio.Lock:
+        """Get process-local read lock for domain."""
+        if domain not in self._read_locks:
+            self._read_locks[domain] = asyncio.Lock()
+        return self._read_locks[domain]
+```
+
+```python
+    async def _get_url_from_domain(self, domain: str) -> Optional[Tuple[str, str, int]]:
+        """Read next URL from domain's frontier file."""
+        domain_key = f"domain:{domain}"
+        
+        try:
+            # Use process-local lock for reading instead of Redis lock
+            domain_lock = self._get_read_lock(domain)
+            async with domain_lock:
+```
+
+```python
+    def _get_read_lock(self, domain: str) -> asyncio.Lock:
+        """Get process-local read lock for domain."""
+        if domain not in self._read_locks:
+            self._read_locks[domain] = asyncio.Lock()
+        # Note: In a long-running crawler with millions of domains, this dict could grow large.
+        # Consider implementing an LRU cache or periodic cleanup if memory becomes an issue.
+        return self._read_locks[domain]
+```
+
+Perfect! I've successfully implemented the process-local read lock changes in `HybridFrontierManager`. Here's what was done:
+
+## Changes Made:
+
+1. **Added process-local locks dictionary** in `__init__`:
+   ```python
+   self._read_locks: Dict[str, asyncio.Lock] = {}
+   ```
+
+2. **Created helper method** `_get_read_lock()`:
+   ```python
+   def _get_read_lock(self, domain: str) -> asyncio.Lock:
+       """Get process-local read lock for domain."""
+       if domain not in self._read_locks:
+           self._read_locks[domain] = asyncio.Lock()
+       return self._read_locks[domain]
+   ```
+
+3. **Updated `_get_url_from_domain()`** to use local locks:
+   ```python
+   # Before:
+   domain_lock = self.lock_manager.get_domain_read_lock(domain)
+   
+   # After:
+   domain_lock = self._get_read_lock(domain)
+   ```
+
+## Benefits:
+
+- **Eliminates Redis round-trips** for read operations (~4% performance improvement)
+- **Reduces Redis load** by only using distributed locks for writes (which truly need them)
+- **Near-instant lock acquisition** - asyncio locks are in-memory operations
+- **No functional changes** - still provides the same thread-safety guarantees within a process
+
+## Memory Consideration:
+
+I added a note about potential memory usage if you have millions of domains. For most crawls this won't be an issue, but if needed, you could implement an LRU cache to limit the size of the `_read_locks` dictionary.
+
+The visual diagram shows the improvement - we've eliminated the Redis network round-trip for acquiring read locks, which was taking ~2ms each time, replacing it with a near-instant local operation.
+
+Combined with the pickle optimization and the Redis wrapper monkey-patch you already did, you should now see significant performance improvements!
+
+```python
+   self._read_locks: Dict[str, asyncio.Lock] = {}
+```
+
+```python
+   def _get_read_lock(self, domain: str) -> asyncio.Lock:
+       """Get process-local read lock for domain."""
+       if domain not in self._read_locks:
+           self._read_locks[domain] = asyncio.Lock()
+       return self._read_locks[domain]
+```
+
+```python
+   # Before:
+   domain_lock = self.lock_manager.get_domain_read_lock(domain)
+   
+   # After:
+   domain_lock = self._get_read_lock(domain)
+```
 

@@ -528,6 +528,8 @@ class HybridFrontierManager:
         self.frontier_dir = config.data_dir / "frontiers"
         self.frontier_dir.mkdir(exist_ok=True)
         self.lock_manager = LockManager(redis_client)
+        # Process-local locks for reading - no need for Redis round-trips
+        self._read_locks: Dict[str, asyncio.Lock] = {}
         
     def _get_frontier_path(self, domain: str) -> Path:
         """Get file path for domain's frontier."""
@@ -537,6 +539,14 @@ class HybridFrontierManager:
         path = self.frontier_dir / subdir / f"{domain}.frontier"
         path.parent.mkdir(exist_ok=True)
         return path
+    
+    def _get_read_lock(self, domain: str) -> asyncio.Lock:
+        """Get process-local read lock for domain."""
+        if domain not in self._read_locks:
+            self._read_locks[domain] = asyncio.Lock()
+        # Note: In a long-running crawler with millions of domains, this dict could grow large.
+        # Consider implementing an LRU cache or periodic cleanup if memory becomes an issue.
+        return self._read_locks[domain]
     
     async def initialize_frontier(self):
         """Initialize the frontier, loading seeds or resuming from existing data."""
@@ -869,7 +879,8 @@ class HybridFrontierManager:
         domain_key = f"domain:{domain}"
         
         try:
-            domain_lock = self.lock_manager.get_domain_read_lock(domain)
+            # Use process-local lock for reading instead of Redis lock
+            domain_lock = self._get_read_lock(domain)
             async with domain_lock:
                 # Get file info from Redis
                 file_info = await self.redis.hmget(  # type: ignore[misc]
