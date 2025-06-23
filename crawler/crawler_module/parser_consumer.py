@@ -12,7 +12,6 @@ import signal
 import sys
 
 import redis.asyncio as redis
-from prometheus_client import Counter, Histogram, Gauge
 
 from .config import CrawlerConfig, parse_args
 from .parser import PageParser
@@ -21,17 +20,17 @@ from .frontier import HybridFrontierManager
 from .politeness import RedisPolitenessEnforcer
 from .fetcher import Fetcher
 from .utils import extract_domain
-from .metrics import start_metrics_server
+from .metrics import (
+    start_metrics_server,
+    parse_queue_size_gauge,
+    parse_duration_histogram,
+    parse_processed_counter,
+    parse_errors_counter,
+    active_parser_workers_gauge,
+    parser_pages_per_second_gauge
+)
 
 logger = logging.getLogger(__name__)
-
-# Metrics
-parse_queue_size_gauge = Gauge('parse_queue_size', 'Number of items in parse queue')
-parse_duration_histogram = Histogram('parse_duration_seconds', 'Time to parse HTML')
-parse_processed_counter = Counter('parse_processed_total', 'Total parsed pages')
-parse_errors_counter = Counter('parse_errors_total', 'Total parsing errors', ['error_type'])
-active_parser_workers_gauge = Gauge('active_parser_workers', 'Number of active parser workers')
-pages_per_second_gauge = Gauge('parser_pages_per_second', 'Pages parsed per second')
 
 METRICS_LOG_INTERVAL_SECONDS = 60
 
@@ -97,7 +96,7 @@ class ParserConsumer:
         logger.info(f"[Parser Metrics] Pages Parsed/sec: {pages_per_second:.2f}")
         
         # Update Prometheus gauge
-        pages_per_second_gauge.set(pages_per_second)
+        parser_pages_per_second_gauge.set(pages_per_second)
         
         # Additional parser-specific metrics
         queue_size = await self.redis_client.llen('fetch:queue')

@@ -69,6 +69,13 @@ class CrawlerOrchestrator:
         except OSError as e:
             logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
             raise # Stop if we can't create data directory
+        
+        # Set parent process ID for multiprocess metrics if using Redis
+        if config.db_type == 'redis':
+            # The multiprocess directory should already be set up by main.py
+            # We just need to mark this as the parent process
+            os.environ['PROMETHEUS_PARENT_PROCESS'] = str(os.getpid())
+            logger.info(f"Set PROMETHEUS_PARENT_PROCESS to {os.getpid()}")
 
         # Initialize fetcher (common to all backends)
         self.fetcher: Fetcher = Fetcher(config)
@@ -552,22 +559,6 @@ class CrawlerOrchestrator:
         self.start_time = time.time()
         logger.info(f"Crawler starting with config: {self.config}")
         current_process = psutil.Process(os.getpid())
-        
-        # Setup multiprocess metrics if using Redis with parser processes
-        if self.config.db_type == 'redis':
-            # Create directory for multiprocess metrics
-            metrics_dir = Path('/tmp/prometheus_multiproc')
-            metrics_dir.mkdir(exist_ok=True)
-            
-            # Set environment variables for multiprocess mode
-            os.environ['prometheus_multiproc_dir'] = str(metrics_dir)
-            os.environ['PROMETHEUS_PARENT_PROCESS'] = 'true'
-            
-            # Clean up any leftover metric files
-            for f in metrics_dir.glob('*.db'):
-                f.unlink()
-            
-            logger.info(f"Enabled Prometheus multiprocess mode with directory: {metrics_dir}")
 
         try:
             # Initialize components that need async setup

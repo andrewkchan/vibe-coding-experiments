@@ -4,6 +4,33 @@ import asyncio
 import logging
 import signal
 import resource
+import os
+from pathlib import Path
+
+# Setup multiprocess metrics environment BEFORE importing any crawler modules
+# This is crucial for Prometheus multiprocess mode to work correctly
+def setup_multiprocess_metrics():
+    """Setup environment for multiprocess metrics if using Redis backend."""
+    # We need to check if we're using Redis backend
+    # Parse args minimally just to check db_type
+    import sys
+    if any('redis' in arg.lower() for arg in sys.argv):
+        # Create directory for multiprocess metrics
+        metrics_dir = Path('/tmp/prometheus_multiproc')
+        metrics_dir.mkdir(exist_ok=True)
+        
+        # Set environment variables for multiprocess mode
+        os.environ['prometheus_multiproc_dir'] = str(metrics_dir)
+        # We'll set the parent process ID later in the orchestrator
+        
+        # Clean up any leftover metric files
+        for f in metrics_dir.glob('*.db'):
+            f.unlink()
+        
+        logging.info(f"Pre-configured Prometheus multiprocess mode with directory: {metrics_dir}")
+
+# Setup multiprocess before any imports
+setup_multiprocess_metrics()
 
 from crawler_module.config import parse_args, CrawlerConfig
 from crawler_module.orchestrator import CrawlerOrchestrator

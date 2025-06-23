@@ -17,8 +17,8 @@ if PROMETHEUS_MULTIPROC_DIR:
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
 else:
-    # Single process mode - use default registry
-    registry = None
+    # Single process mode - use default registry (None means use the global default)
+    registry = None  # type: ignore[assignment]
 
 # Define metrics with explicit registry
 pages_crawled_counter = Counter(
@@ -40,7 +40,7 @@ errors_counter = Counter(
     registry=registry
 )
 
-# Fetch-specific countersAdd commentMore actions
+# Fetch-specific counters
 fetch_counter = Counter(
     'crawler_fetches_total',
     'Total number of fetch attempts',
@@ -62,6 +62,20 @@ backpressure_events_counter = Counter(
     registry=registry
 )
 
+# Parser-specific counters
+parse_processed_counter = Counter(
+    'crawler_parse_processed_total',
+    'Total pages parsed',
+    registry=registry
+)
+
+parse_errors_counter = Counter(
+    'crawler_parse_errors_total',
+    'Total parsing errors',
+    ['error_type'],
+    registry=registry
+)
+
 # For gauges in multiprocess mode, we need to specify the multiprocess_mode
 # 'livesum' means the gauge shows the sum of all process values
 # Other options: 'liveall' (show all values), 'min', 'max'
@@ -73,7 +87,7 @@ pages_per_second_gauge = Gauge(
 )
 
 parser_pages_per_second_gauge = Gauge(
-    'parser_pages_per_second', 
+    'crawler_parser_pages_per_second', 
     'Pages parsed per second',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
@@ -101,7 +115,7 @@ active_parser_workers_gauge = Gauge(
 )
 
 parse_queue_size_gauge = Gauge(
-    'parse_queue_size', 
+    'crawler_parse_queue_size', 
     'Number of items in parse queue (fetch:queue)',
     multiprocess_mode='livemax' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
@@ -146,7 +160,7 @@ fetch_timing_histogram = Histogram(
 )
 
 parse_duration_histogram = Histogram(
-    'parse_duration_seconds', 
+    'crawler_parse_duration_seconds', 
     'Time to parse HTML',
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
     registry=registry
@@ -184,7 +198,7 @@ def start_metrics_server(port=8001):
     if PROMETHEUS_MULTIPROC_DIR:
         # In multiprocess mode, check if we're the main process
         # The orchestrator sets this environment variable
-        if os.environ.get('PROMETHEUS_PARENT_PROCESS') == 'true':
+        if os.environ.get('PROMETHEUS_PARENT_PROCESS') == str(os.getpid()):
             # Start a custom HTTP server that aggregates metrics
             from wsgiref.simple_server import make_server
             
