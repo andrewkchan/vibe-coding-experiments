@@ -520,14 +520,31 @@ class CrawlerOrchestrator:
         self.start_time = time.time()
         logger.info(f"Crawler starting with config: {self.config}")
         current_process = psutil.Process(os.getpid())
+        
+        # Setup multiprocess metrics if using Redis with parser processes
+        if self.config.db_type == 'redis':
+            # Create directory for multiprocess metrics
+            metrics_dir = Path('/tmp/prometheus_multiproc')
+            metrics_dir.mkdir(exist_ok=True)
+            
+            # Set environment variables for multiprocess mode
+            os.environ['prometheus_multiproc_dir'] = str(metrics_dir)
+            os.environ['PROMETHEUS_PARENT_PROCESS'] = 'true'
+            
+            # Clean up any leftover metric files
+            for f in metrics_dir.glob('*.db'):
+                f.unlink()
+            
+            logger.info(f"Enabled Prometheus multiprocess mode with directory: {metrics_dir}")
 
         try:
             # Initialize components that need async setup
             await self._initialize_components()
             
             # Start Prometheus metrics server
-            start_metrics_server(port=8001)
-            logger.info("Prometheus metrics server started on port 8001")
+            # In multiprocess mode, this aggregates metrics from all processes
+            if start_metrics_server(port=8001):
+                logger.info("Prometheus metrics server started on port 8001")
             
             # Start parser process if using Redis backend
             if self.config.db_type == 'redis':

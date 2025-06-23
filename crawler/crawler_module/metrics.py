@@ -1,156 +1,185 @@
-"""Metrics collection for the web crawler using Prometheus."""
+"""
+Prometheus metrics definitions and server setup for the crawler.
+Supports both single-process and multi-process modes.
+"""
+import os
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from prometheus_client import multiprocess
+from prometheus_client import generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST
+from prometheus_client import values
 
-import asyncio
-import logging
-from typing import Optional
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
-from prometheus_client.core import CollectorRegistry
+# Check if we're in multiprocess mode
+PROMETHEUS_MULTIPROC_DIR = os.environ.get('prometheus_multiproc_dir')
 
-logger = logging.getLogger(__name__)
+# Create registry based on mode
+if PROMETHEUS_MULTIPROC_DIR:
+    # Multiprocess mode - metrics will be aggregated across processes
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+else:
+    # Single process mode - use default registry
+    registry = None
 
-# Create a custom registry to avoid conflicts
-REGISTRY = CollectorRegistry()
-
-# Counters (always increasing)
+# Define metrics with explicit registry
 pages_crawled_counter = Counter(
-    'crawler_pages_crawled_total',
+    'pages_crawled_total', 
     'Total number of pages successfully crawled',
-    registry=REGISTRY
+    registry=registry
 )
 
 urls_added_counter = Counter(
-    'crawler_urls_added_total',
-    'Total number of URLs added to frontier',
-    registry=REGISTRY
+    'urls_added_total', 
+    'Total number of URLs added to the frontier',
+    registry=registry
 )
 
 errors_counter = Counter(
-    'crawler_errors_total',
-    'Total number of errors by type',
-    ['error_type'],  # Labels: fetch_error, parse_error, db_error, etc.
-    registry=REGISTRY
+    'errors_total', 
+    'Total number of errors by type', 
+    ['error_type'],
+    registry=registry
 )
 
-# Fetch-specific counters
-fetch_counter = Counter(
-    'crawler_fetches_total',
-    'Total number of fetch attempts',
-    ['fetch_type'],  # Labels: robots_txt, page
-    registry=REGISTRY
-)
-
-fetch_error_counter = Counter(
-    'crawler_fetch_errors_total',
-    'Total number of fetch errors by type',
-    ['error_type', 'fetch_type'],  # Labels: (timeout, connection_error, etc.), (robots_txt, page)
-    registry=REGISTRY
-)
-
-# Gauges (can go up or down)
+# For gauges in multiprocess mode, we need to specify the multiprocess_mode
+# 'livesum' means the gauge shows the sum of all process values
+# Other options: 'liveall' (show all values), 'min', 'max'
 pages_per_second_gauge = Gauge(
-    'crawler_pages_per_second',
-    'Current crawl rate in pages per second',
-    registry=REGISTRY
+    'pages_per_second', 
+    'Pages crawled per second (recent rate)',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+parser_pages_per_second_gauge = Gauge(
+    'parser_pages_per_second', 
+    'Pages parsed per second',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
 )
 
 frontier_size_gauge = Gauge(
-    'crawler_frontier_size',
+    'frontier_size', 
     'Current size of the URL frontier',
-    registry=REGISTRY
+    multiprocess_mode='livemax' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
 )
 
 active_workers_gauge = Gauge(
-    'crawler_active_workers',
-    'Number of currently active worker tasks',
-    registry=REGISTRY
+    'active_workers', 
+    'Number of active crawler workers',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+active_parser_workers_gauge = Gauge(
+    'active_parser_workers', 
+    'Number of active parser workers',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+parse_queue_size_gauge = Gauge(
+    'parse_queue_size', 
+    'Number of items in parse queue',
+    multiprocess_mode='livemax' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
 )
 
 memory_usage_gauge = Gauge(
-    'crawler_memory_usage_bytes',
-    'Current RSS memory usage in bytes',
-    registry=REGISTRY
+    'memory_usage_bytes', 
+    'Current memory usage in bytes',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
 )
 
 open_fds_gauge = Gauge(
-    'crawler_open_fds',
+    'open_file_descriptors', 
     'Number of open file descriptors',
-    registry=REGISTRY
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
 )
 
 db_pool_available_gauge = Gauge(
-    'crawler_db_pool_available',
-    'Number of available database connections in pool',
-    registry=REGISTRY
+    'db_pool_available_connections', 
+    'Available database connections in the pool',
+    multiprocess_mode='livemin' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
 )
 
-# Histograms (measure distributions)
+# Histograms work normally in multiprocess mode
 fetch_duration_histogram = Histogram(
-    'crawler_fetch_duration_seconds',
+    'fetch_duration_seconds', 
     'Time taken to fetch a URL',
-    ['fetch_type'],  # Label to distinguish robots.txt vs page fetches
+    ['fetch_type'],
     buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
-    registry=REGISTRY
+    registry=registry
 )
 
-fetch_timing_histogram = Histogram(
-    'crawler_fetch_timing_seconds',
-    'Detailed fetch timing breakdown',
-    ['phase', 'fetch_type'],  # Labels: (dns_lookup, connect, ssl_handshake, transfer, total), (robots_txt, page)
-    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
-    registry=REGISTRY
+parse_duration_histogram = Histogram(
+    'parse_duration_seconds', 
+    'Time to parse HTML',
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+    registry=registry
 )
 
 db_connection_acquire_histogram = Histogram(
-    'crawler_db_connection_acquire_seconds',
-    'Time taken to acquire a database connection',
-    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
-    registry=REGISTRY
+    'db_connection_acquire_seconds',
+    'Time to acquire a database connection from the pool',
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0),
+    registry=registry
 )
 
 db_query_duration_histogram = Histogram(
-    'crawler_db_query_duration_seconds',
-    'Time taken to execute database queries',
-    ['query_name'],  # Label for different query types
+    'db_query_duration_seconds',
+    'Time taken for database queries',
+    ['query_name'],
     buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
-    registry=REGISTRY
+    registry=registry
 )
 
-# Content size histogram for tracking page sizes
 content_size_histogram = Histogram(
-    'crawler_content_size_bytes',
+    'content_size_bytes',
     'Size of fetched content in bytes',
-    ['content_type', 'fetch_type'],  # Labels: (html, non_html), (robots_txt, page)
-    # Buckets: 1KB, 10KB, 50KB, 100KB, 500KB, 1MB, 5MB, 10MB, 50MB, 100MB
-    buckets=(1024, 10240, 51200, 102400, 512000, 1048576, 5242880, 10485760, 52428800, 104857600),
-    registry=REGISTRY
+    ['content_type', 'fetch_type'],
+    buckets=(1024, 10240, 102400, 1048576, 10485760),  # 1KB, 10KB, 100KB, 1MB, 10MB
+    registry=registry
 )
 
-class MetricsServer:
-    """Manages the Prometheus metrics HTTP server."""
+def start_metrics_server(port=8001):
+    """Start the Prometheus metrics HTTP server.
     
-    def __init__(self, port: int = 8001):
-        self.port = port
-        self._server_started = False
-    
-    def start(self):
-        """Start the metrics HTTP server."""
-        if not self._server_started:
-            try:
-                start_http_server(self.port, registry=REGISTRY)
-                self._server_started = True
-                logger.info(f"Metrics server started on port {self.port}")
-            except Exception as e:
-                logger.error(f"Failed to start metrics server: {e}")
-                raise
-    
-    def is_running(self) -> bool:
-        """Check if the metrics server is running."""
-        return self._server_started
-
-# Global metrics server instance
-metrics_server = MetricsServer()
-
-def start_metrics_server(port: int = 8001):
-    """Start the Prometheus metrics HTTP server."""
-    metrics_server.port = port
-    metrics_server.start() 
+    In multiprocess mode, only the parent process should start the server.
+    Child processes just write metrics to the shared directory.
+    """
+    if PROMETHEUS_MULTIPROC_DIR:
+        # In multiprocess mode, check if we're the main process
+        # The orchestrator sets this environment variable
+        if os.environ.get('PROMETHEUS_PARENT_PROCESS') == 'true':
+            # Start a custom HTTP server that aggregates metrics
+            from wsgiref.simple_server import make_server
+            
+            def metrics_app(environ, start_response):
+                registry = CollectorRegistry()
+                multiprocess.MultiProcessCollector(registry)
+                data = generate_latest(registry)
+                status = '200 OK'
+                headers = [
+                    ('Content-Type', CONTENT_TYPE_LATEST),
+                    ('Content-Length', str(len(data)))
+                ]
+                start_response(status, headers)
+                return [data]
+            
+            httpd = make_server('', port, metrics_app)
+            import threading
+            t = threading.Thread(target=httpd.serve_forever)
+            t.daemon = True
+            t.start()
+            return True
+        else:
+            # Child process - don't start server
+            return False
+    else:
+        # Single process mode - start server normally
+        start_http_server(port, registry=registry)
+        return True 

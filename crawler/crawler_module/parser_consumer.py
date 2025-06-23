@@ -242,10 +242,13 @@ class ParserConsumer:
         self.start_time = time.time()
         
         try:
-            # Don't re-initialize components - they're already initialized by the orchestrator
-            # Just start the metrics server on a different port
-            start_metrics_server(port=8002)
-            logger.info("Parser metrics server started on port 8002")
+            # In multiprocess mode, child processes don't start their own server
+            # They just write metrics to the shared directory
+            metrics_started = start_metrics_server(port=8002)
+            if metrics_started:
+                logger.info("Parser metrics server started on port 8002")
+            else:
+                logger.info("Running in multiprocess mode - metrics aggregated by parent")
             
             # Start worker tasks
             for i in range(self.num_workers):

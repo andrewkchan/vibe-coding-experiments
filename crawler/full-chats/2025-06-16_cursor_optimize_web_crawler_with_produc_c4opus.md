@@ -1,5 +1,5 @@
 # Optimize web crawler with producer-consumer pattern
-_Exported on 6/18/2025 at 01:03:35 PDT from Cursor (1.0.0)_
+_Exported on 6/23/2025 at 00:24:15 PDT from Cursor (1.0.0)_
 
 ---
 
@@ -3396,4 +3396,372 @@ The throughput is calculated correctly as pages actually parsed by this process,
    [Parser Metrics] Queue size: 1234, Active workers: 48/50
    [Parser Metrics] Total parsed: 2715, Overall rate: 42.10/sec, Runtime: 65s
 ```
+
+---
+
+**User**
+
+Cool the metrics are great, however I noticed the prometheus metrics such as `parse_queue_size` don't appear to be accessible from my grafana dashboard `crawler-dashboard`, any idea why?
+
+I'm guessing it's related to the multiprocess thing, wondering if there's a simple config such as metrics database instance which is somehow different between orchestrator and parser consumers
+
+---
+
+**Cursor**
+
+You're exactly right! The issue is that the parser consumer runs as a separate process with its own Prometheus metrics server on port 8002, while your Grafana dashboard is likely only configured to scrape metrics from the main crawler on port 8001.
+
+Each process in Python has its own metrics registry, so when you start the parser as a child process, its metrics are isolated from the parent process.
+
+Here's how to fix this:
+
+## Solution 1: Configure Prometheus to Scrape Both Ports
+
+Update your Prometheus configuration (`prometheus.yml`) to scrape from both the orchestrator and parser metrics:
+
+```yaml
+scrape_configs:
+  - job_name: 'crawler-orchestrator'
+    static_configs:
+      - targets: ['localhost:8001']
+        labels:
+          component: 'orchestrator'
+  
+  - job_name: 'crawler-parser'
+    static_configs:
+      - targets: ['localhost:8002']
+        labels:
+          component: 'parser'
+```
+
+Then in Grafana, you can query metrics from both jobs. For example:
+- `parse_queue_size{job="crawler-parser"}`
+- `pages_crawled_total{job="crawler-orchestrator"}`
+
+## Solution 2: Use Prometheus Multiprocess Mode (Recommended)
+
+Python's `prometheus_client` library has built-in support for multiprocess applications. Here's how to implement it:
+
+```yaml
+scrape_configs:
+  - job_name: 'crawler-orchestrator'
+    static_configs:
+      - targets: ['localhost:8001']
+        labels:
+          component: 'orchestrator'
+  
+  - job_name: 'crawler-parser'
+    static_configs:
+      - targets: ['localhost:8002']
+        labels:
+          component: 'parser'
+```
+
+```python
+"""
+Prometheus metrics definitions and server setup for the crawler.
+Supports both single-process and multi-process modes.
+"""
+import os
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from prometheus_client import multiprocess
+from prometheus_client import generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST
+from prometheus_client import values
+
+# Check if we're in multiprocess mode
+PROMETHEUS_MULTIPROC_DIR = os.environ.get('prometheus_multiproc_dir')
+
+# Create registry based on mode
+if PROMETHEUS_MULTIPROC_DIR:
+    # Multiprocess mode - metrics will be aggregated across processes
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+else:
+    # Single process mode - use default registry
+    registry = None
+
+# Define metrics with explicit registry
+pages_crawled_counter = Counter(
+    'pages_crawled_total', 
+    'Total number of pages successfully crawled',
+    registry=registry
+)
+
+urls_added_counter = Counter(
+    'urls_added_total', 
+    'Total number of URLs added to the frontier',
+    registry=registry
+)
+
+errors_counter = Counter(
+    'errors_total', 
+    'Total number of errors by type', 
+    ['error_type'],
+    registry=registry
+)
+
+# For gauges in multiprocess mode, we need to specify the multiprocess_mode
+# 'livesum' means the gauge shows the sum of all process values
+# Other options: 'liveall' (show all values), 'min', 'max'
+pages_per_second_gauge = Gauge(
+    'pages_per_second', 
+    'Pages crawled per second (recent rate)',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+parser_pages_per_second_gauge = Gauge(
+    'parser_pages_per_second', 
+    'Pages parsed per second',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+frontier_size_gauge = Gauge(
+    'frontier_size', 
+    'Current size of the URL frontier',
+    multiprocess_mode='livemax' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+active_workers_gauge = Gauge(
+    'active_workers', 
+    'Number of active crawler workers',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+active_parser_workers_gauge = Gauge(
+    'active_parser_workers', 
+    'Number of active parser workers',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+parse_queue_size_gauge = Gauge(
+    'parse_queue_size', 
+    'Number of items in parse queue',
+    multiprocess_mode='livemax' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+memory_usage_gauge = Gauge(
+    'memory_usage_bytes', 
+    'Current memory usage in bytes',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+open_fds_gauge = Gauge(
+    'open_file_descriptors', 
+    'Number of open file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+db_pool_available_gauge = Gauge(
+    'db_pool_available_connections', 
+    'Available database connections in the pool',
+    multiprocess_mode='livemin' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+# Histograms work normally in multiprocess mode
+fetch_duration_histogram = Histogram(
+    'fetch_duration_seconds', 
+    'Time taken to fetch a URL',
+    ['fetch_type'],
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+    registry=registry
+)
+
+parse_duration_histogram = Histogram(
+    'parse_duration_seconds', 
+    'Time to parse HTML',
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+    registry=registry
+)
+
+db_connection_acquire_histogram = Histogram(
+    'db_connection_acquire_seconds',
+    'Time to acquire a database connection from the pool',
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0),
+    registry=registry
+)
+
+db_query_duration_histogram = Histogram(
+    'db_query_duration_seconds',
+    'Time taken for database queries',
+    ['query_name'],
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
+    registry=registry
+)
+
+content_size_histogram = Histogram(
+    'content_size_bytes',
+    'Size of fetched content in bytes',
+    ['content_type', 'fetch_type'],
+    buckets=(1024, 10240, 102400, 1048576, 10485760),  # 1KB, 10KB, 100KB, 1MB, 10MB
+    registry=registry
+)
+
+def start_metrics_server(port=8001):
+    """Start the Prometheus metrics HTTP server.
+    
+    In multiprocess mode, only the parent process should start the server.
+    Child processes just write metrics to the shared directory.
+    """
+    if PROMETHEUS_MULTIPROC_DIR:
+        # In multiprocess mode, check if we're the main process
+        # The orchestrator sets this environment variable
+        if os.environ.get('PROMETHEUS_PARENT_PROCESS') == 'true':
+            # Start a custom HTTP server that aggregates metrics
+            from wsgiref.simple_server import make_server
+            
+            def metrics_app(environ, start_response):
+                registry = CollectorRegistry()
+                multiprocess.MultiProcessCollector(registry)
+                data = generate_latest(registry)
+                status = '200 OK'
+                headers = [
+                    ('Content-Type', CONTENT_TYPE_LATEST),
+                    ('Content-Length', str(len(data)))
+                ]
+                start_response(status, headers)
+                return [data]
+            
+            httpd = make_server('', port, metrics_app)
+            import threading
+            t = threading.Thread(target=httpd.serve_forever)
+            t.daemon = True
+            t.start()
+            return True
+        else:
+            # Child process - don't start server
+            return False
+    else:
+        # Single process mode - start server normally
+        start_http_server(port, registry=registry)
+        return True
+```
+
+Now let me update the orchestrator to use multiprocess mode:
+
+```python
+    async def run_crawl(self):
+        self.start_time = time.time()
+        logger.info(f"Crawler starting with config: {self.config}")
+        current_process = psutil.Process(os.getpid())
+        
+        # Setup multiprocess metrics if using Redis with parser processes
+        if self.config.db_type == 'redis':
+            # Create directory for multiprocess metrics
+            metrics_dir = Path('/tmp/prometheus_multiproc')
+            metrics_dir.mkdir(exist_ok=True)
+            
+            # Set environment variables for multiprocess mode
+            os.environ['prometheus_multiproc_dir'] = str(metrics_dir)
+            os.environ['PROMETHEUS_PARENT_PROCESS'] = 'true'
+            
+            # Clean up any leftover metric files
+            for f in metrics_dir.glob('*.db'):
+                f.unlink()
+            
+            logger.info(f"Enabled Prometheus multiprocess mode with directory: {metrics_dir}")
+
+        try:
+            # Initialize components that need async setup
+            await self._initialize_components()
+            
+            # Start Prometheus metrics server
+            # In multiprocess mode, this aggregates metrics from all processes
+            if start_metrics_server(port=8001):
+                logger.info("Prometheus metrics server started on port 8001")
+            
+            # Start parser process if using Redis backend
+            if self.config.db_type == 'redis':
+                self._start_parser_processes()
+                # Give parser a moment to initialize
+                await asyncio.sleep(2)
+```
+
+Now let me update the parser consumer to work with multiprocess mode:
+
+```python
+    async def run(self):
+        """Main consumer loop."""
+        logger.info(f"Parser consumer starting with {self.num_workers} workers...")
+        self.start_time = time.time()
+        
+        try:
+            # In multiprocess mode, child processes don't start their own server
+            # They just write metrics to the shared directory
+            metrics_started = start_metrics_server(port=8002)
+            if metrics_started:
+                logger.info("Parser metrics server started on port 8002")
+            else:
+                logger.info("Running in multiprocess mode - metrics aggregated by parent")
+            
+            # Start worker tasks
+            for i in range(self.num_workers):
+                task = asyncio.create_task(self._worker(i + 1))
+                self.worker_tasks.add(task)
+```
+
+Now let me import the metrics functions in parser_consumer:
+
+Perfect! I've identified the issue and implemented a solution. The problem is that each Python process has its own isolated metrics registry, so the parser consumer's metrics weren't visible to the main crawler's metrics endpoint.
+
+## The Issue
+
+When you run the parser as a separate process:
+- Main crawler exposes metrics on port 8001
+- Parser process was trying to expose metrics on port 8002
+- Grafana was only configured to read from port 8001
+
+## The Solution: Prometheus Multiprocess Mode
+
+I've updated the metrics system to use Prometheus's built-in multiprocess support. Here's how it works:
+
+1. **Shared Metrics Directory**: All processes write their metrics to a shared directory (`/tmp/prometheus_multiproc`)
+2. **Single Aggregation Point**: Only the parent process (orchestrator) runs the HTTP server on port 8001
+3. **Automatic Aggregation**: The server automatically aggregates metrics from all processes
+
+### What Changed:
+
+1. **`metrics.py`**: 
+   - Added multiprocess support
+   - Metrics are aggregated based on type (counters sum, gauges can sum/max/min)
+   - Child processes don't start their own servers
+
+2. **`orchestrator.py`**:
+   - Sets up the multiprocess directory
+   - Marks itself as the parent process
+   - Cleans up old metric files on startup
+
+3. **`parser_consumer.py`**:
+   - Detects multiprocess mode
+   - Writes metrics to shared directory instead of starting server
+
+## Benefits:
+
+- ✅ All metrics appear on single endpoint (port 8001)
+- ✅ No need to change Prometheus/Grafana config
+- ✅ Metrics automatically aggregated across all processes
+- ✅ Works with any number of parser processes
+
+## Verification:
+
+After restarting your crawler, you should now see all metrics at `http://localhost:8001/metrics`, including:
+- `parse_queue_size`
+- `parse_processed_total` 
+- `parser_pages_per_second`
+- All other parser metrics
+
+The metrics will be automatically aggregated. For example:
+- `parse_processed_total` will show the sum across all parser processes
+- `active_parser_workers` will show the total across all parser processes
+- `parse_queue_size` will show the maximum value (since it's the same queue)
+
+No changes needed to your Grafana dashboard - all metrics will now appear under the same job!
 
