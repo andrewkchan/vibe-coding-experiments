@@ -88,6 +88,13 @@ class Fetcher:
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
+            # Optimize SSL settings for speed
+            ssl_context.options |= ssl.OP_NO_SSLv2
+            ssl_context.options |= ssl.OP_NO_SSLv3
+            ssl_context.options |= ssl.OP_NO_COMPRESSION
+            ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+            # Enable session caching (helps if hitting the same server)
+            ssl_context.session_stats()  # Enable session statistics
             
             connector = aiohttp.TCPConnector(
                 limit=max_total_connections,  # Total connection pool limit
