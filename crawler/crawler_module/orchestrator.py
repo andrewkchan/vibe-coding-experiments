@@ -475,6 +475,8 @@ class CrawlerOrchestrator:
                             queue_size = await self.redis_client_binary.rpush('fetch:queue', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
                             logger.debug(f"Worker-{worker_id}: Pushed HTML content to parse queue for {fetch_result.final_url}")
                             
+                            # Explicitly delete to keep peak memory down
+                            del queue_item
                             # Backpressure
                             if queue_size > self.fetch_queue_hard_limit:
                                 # Hard limit - wait until queue shrinks
