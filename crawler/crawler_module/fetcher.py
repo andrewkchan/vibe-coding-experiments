@@ -14,6 +14,9 @@ from .metrics import fetch_counter, fetch_error_counter, fetch_timing_histogram,
 
 logger = logging.getLogger(__name__)
 
+MAX_CONTENT_SIZE_BYTES = 100 * 1024 * 1024 # Content over 100MB is discarded to avoid memory issues
+MAX_PAGE_LENGTH = 100 * 1024 # Truncate page content over 100KB before parsing
+
 @dataclass
 class FetchResult:
     initial_url: str
@@ -140,6 +143,9 @@ class Fetcher:
         try:
             async with session.get(url, allow_redirects=True, max_redirects=max_redirects, trace_request_ctx=trace_request_ctx) as response:
                 actual_final_url = str(response.url)
+                content_length = response.headers.get('Content-Length')
+                if content_length and int(content_length) > MAX_CONTENT_SIZE_BYTES:
+                    raise Exception(f"Page discarded: content length {content_length} bytes exceeds {MAX_CONTENT_SIZE_BYTES=} bytes")
                 content_bytes = await response.read() # Read content first
                 status_code = response.status
                 content_type = response.headers.get('Content-Type')
@@ -204,14 +210,14 @@ class Fetcher:
                         error_message=f"HTTP {status_code}",
                         is_redirect=is_redirect,
                     )
-
+                
                 return FetchResult(
                     initial_url=url,
                     final_url=actual_final_url,
                     status_code=status_code,
                     content_type=content_type,
                     content_bytes=content_bytes,
-                    text_content=text_content,
+                    text_content=text_content[:MAX_PAGE_LENGTH] if text_content else None,
                     is_redirect=is_redirect,
                 )
 
