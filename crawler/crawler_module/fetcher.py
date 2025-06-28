@@ -44,6 +44,8 @@ class Fetcher:
             trace_config_ctx.start_time = time.time()
             trace_config_ctx.timings = {}
             trace_config_ctx.fetch_type = trace_config_ctx.trace_request_ctx.get('fetch_type', 'page')
+            # Clear any references from previous requests
+            trace_config_ctx.trace_request_ctx = None
         
         async def on_dns_resolvehost_start(session, trace_config_ctx, params):
             trace_config_ctx.dns_start = time.time()
@@ -194,7 +196,7 @@ class Fetcher:
                             text_content = await response.text(errors='replace') 
                         except Exception as ex_inner:
                              logger.error(f"Final fallback decoding error for {actual_final_url}: {ex_inner}")
-                             text_content = "DECODING_ERROR"
+                             text_content = None
                 
                 is_redirect = len(response.history) > 0
 
