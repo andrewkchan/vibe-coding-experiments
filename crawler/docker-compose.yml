@@ -40,6 +40,8 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
+      # Docker will auto-create this directory if it doesn't exist
+      - ./logs/redis:/var/log/redis
     command: >
       redis-server
       --maxmemory 24gb
@@ -48,6 +50,8 @@ services:
       --save 300 10
       --save 60 10000
       --appendonly yes
+      --logfile /var/log/redis/redis.log
+      --loglevel notice
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
