@@ -23,7 +23,6 @@ class FetchResult:
     final_url: str
     status_code: int
     content_type: Optional[str] = None
-    content_bytes: Optional[bytes] = None
     text_content: Optional[str] = None
     error_message: Optional[str] = None
     is_redirect: bool = False
@@ -216,7 +215,6 @@ class Fetcher:
                     final_url=actual_final_url,
                     status_code=status_code,
                     content_type=content_type,
-                    content_bytes=content_bytes,
                     text_content=text_content[:MAX_PAGE_LENGTH] if text_content else None,
                     is_redirect=is_redirect,
                 )
