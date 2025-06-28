@@ -200,7 +200,11 @@ def start_metrics_server(port=8001):
         # The orchestrator sets this environment variable
         if os.environ.get('PROMETHEUS_PARENT_PROCESS') == str(os.getpid()):
             # Start a custom HTTP server that aggregates metrics
-            from wsgiref.simple_server import make_server
+            from wsgiref.simple_server import make_server, WSGIRequestHandler
+            # Suppress logging from wsgiref
+            class NoLoggingWSGIRequestHandler(WSGIRequestHandler):
+                def log_message(self, format, *args):
+                    pass
             
             def metrics_app(environ, start_response):
                 registry = CollectorRegistry()
@@ -214,7 +218,7 @@ def start_metrics_server(port=8001):
                 start_response(status, headers)
                 return [data]
             
-            httpd = make_server('', port, metrics_app)
+            httpd = make_server('', port, metrics_app, handler_class=NoLoggingWSGIRequestHandler)
             import threading
             t = threading.Thread(target=httpd.serve_forever)
             t.daemon = True
