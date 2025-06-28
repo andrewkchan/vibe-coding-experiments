@@ -176,19 +176,8 @@ class Fetcher:
                 if content_bytes and content_type and content_type.startswith('text/'):
                     # Try to decode using cchardet for speed and accuracy
                     try:
-                        start_time = time.time()
-                        detected_encoding = cchardet.detect(content_bytes)['encoding']
-                        end_time = time.time()
-                        if end_time - start_time > 0.5:
-                            logger.warning(f"ENCODER: Encoding detection time: {end_time - start_time} seconds for content of size {len(content_bytes)} bytes")
-                            logger.warning(f"ENCODER: Detected encoding: {detected_encoding}")
-                            logger.warning(f"ENCODER: Content type: {content_type}")
-                            logger.warning(f"ENCODER: URL: {actual_final_url}")
-                        if detected_encoding:
-                            text_content = content_bytes.decode(detected_encoding, errors='replace')
-                        else:
-                            # Fallback to aiohttp's guessed encoding or utf-8
-                            text_content = await response.text(errors='replace') # response.text() re-reads if not careful
+                        # Fallback to aiohttp's guessed encoding or utf-8
+                        text_content = await response.text(errors='replace') # response.text() re-reads if not careful
                     except (UnicodeDecodeError, LookupError, TypeError) as e:
                         logger.warning(f"Encoding detection/decoding error for {actual_final_url}: {e}. Falling back.")
                         try:
