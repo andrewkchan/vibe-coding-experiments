@@ -151,6 +151,56 @@ The crawler exposes real-time metrics via Prometheus, which can be visualized wi
 *   **Resource Usage**: `memory_usage_bytes`
 *   **Error Tracking**: `errors_total`
 
+#### System Metrics
+
+The crawler also collects comprehensive system metrics to help debug performance issues during long runs:
+
+**CPU & Memory**
+*   `system_cpu_percent` - System-wide CPU usage percentage (non-blocking measurement)
+*   `system_memory_free_bytes` - Free system memory
+*   `system_memory_available_bytes` - Available system memory (includes cache/buffers that can be freed)
+*   `crawler_memory_usage_bytes` - Crawler process RSS memory usage
+
+**Disk**
+*   `system_disk_free_bytes` - Free space in the crawler's data directory
+*   `system_disk_usage_percent` - Disk usage percentage for the data directory
+*   Note: These metrics specifically monitor your `--data-dir` path, not the root filesystem
+
+**Network**
+*   `system_network_bytes_sent` - Total network bytes sent (use `rate()` in queries)
+*   `system_network_bytes_received` - Total network bytes received
+*   `system_network_packets_sent` - Total network packets sent
+*   `system_network_packets_recv` - Total network packets received
+
+**Disk I/O**
+*   `system_io_read_count` - Total read operations (use `rate()` for IOPS)
+*   `system_io_write_count` - Total write operations
+*   `system_io_read_bytes` - Total bytes read
+*   `system_io_write_bytes` - Total bytes written
+
+**Redis Metrics**
+*   `redis_ops_per_second` - Redis operations per second
+*   `redis_memory_usage_bytes` - Redis memory consumption
+*   `redis_connected_clients` - Number of connected clients
+*   `redis_hit_rate_percent` - Cache hit rate percentage
+*   `redis_command_latency_seconds` - Command latency histogram (not yet implemented)
+
+#### Grafana Dashboard Features
+
+The pre-configured dashboard includes panels for all these metrics:
+*   System resource usage (CPU, memory, disk, network)
+*   Disk I/O performance with dual-axis charts (IOPS and throughput)
+*   Redis performance monitoring with hit rate gauge
+*   Correlation between crawler activity and system resources
+
+This comprehensive monitoring helps identify:
+*   Memory leaks (steady RSS increase)
+*   File descriptor leaks
+*   Network saturation
+*   Disk space issues in the data directory
+*   Redis performance bottlenecks
+*   Correlation between system issues and crawler behavior
+
 ### Stopping the Monitoring Stack
 
 ```bash
