@@ -278,10 +278,11 @@ class CrawlerOrchestrator:
         
         # Collect system metrics
         try:
-            # CPU usage
-            cpu_percent = psutil.cpu_percent(interval=1)
-            cpu_usage_gauge.set(cpu_percent)
-            logger.info(f"[Metrics] CPU Usage: {cpu_percent:.1f}%")
+            # CPU usage (non-blocking - returns usage since last call)
+            cpu_percent = psutil.cpu_percent(interval=None)
+            if cpu_percent is not None:  # First call returns None
+                cpu_usage_gauge.set(cpu_percent)
+                logger.info(f"[Metrics] CPU Usage: {cpu_percent:.1f}%")
             
             # Memory metrics
             mem = psutil.virtual_memory()
@@ -662,6 +663,9 @@ class CrawlerOrchestrator:
         self.start_time = time.time()
         logger.info(f"Crawler starting with config: {self.config}")
         current_process = psutil.Process(os.getpid())
+        
+        # Initialize CPU monitoring for non-blocking measurements
+        psutil.cpu_percent(interval=None)  # First call to establish baseline
         
         # Optional: Enable tracemalloc for memory tracking
         ENABLE_TRACEMALLOC = os.environ.get('ENABLE_TRACEMALLOC', '').lower() == 'true'
