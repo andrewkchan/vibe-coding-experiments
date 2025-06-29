@@ -56,7 +56,16 @@ from .metrics import (
     redis_memory_usage_gauge,
     redis_connected_clients_gauge,
     redis_hit_rate_gauge,
-    redis_latency_histogram
+    redis_latency_histogram,
+    # FD type metrics
+    fd_redis_gauge,
+    fd_http_gauge,
+    fd_https_gauge,
+    fd_frontier_files_gauge,
+    fd_prometheus_gauge,
+    fd_other_sockets_gauge,
+    fd_pipes_gauge,
+    fd_other_gauge
 )
 
 logger = logging.getLogger(__name__)
@@ -264,6 +273,115 @@ class CrawlerOrchestrator:
         await self.frontier.initialize_frontier()
             
         logger.info("Crawler components initialized.")
+
+    async def _analyze_fd_types(self):
+        """Analyze FD types and update Prometheus metrics."""
+        try:
+            pid = os.getpid()
+            
+            # First, read socket inode -> connection mapping
+            socket_map = {}
+            
+            # Parse /proc/net/tcp and /proc/net/tcp6
+            for proto_file in ['/proc/net/tcp', '/proc/net/tcp6']:
+                try:
+                    with open(proto_file, 'r') as f:
+                        lines = f.readlines()[1:]  # Skip header
+                        for line in lines:
+                            parts = line.strip().split()
+                            if len(parts) >= 10:
+                                local_addr = parts[1]  # hex IP:port
+                                remote_addr = parts[2]  # hex IP:port
+                                inode = parts[9]
+                                
+                                # Parse hex addresses
+                                local_ip, local_port = local_addr.split(':')
+                                remote_ip, remote_port = remote_addr.split(':')
+                                local_port = int(local_port, 16)
+                                remote_port = int(remote_port, 16)
+                                
+                                socket_map[inode] = {
+                                    'local_port': local_port,
+                                    'remote_port': remote_port,
+                                    'proto': proto_file.split('/')[-1]
+                                }
+                except:
+                    pass
+            
+            # Now check FDs
+            fd_stats = {
+                'redis': 0,
+                'http': 0,
+                'https': 0,
+                'frontier_files': 0,
+                'prometheus': 0,
+                'other_sockets': 0,
+                'pipes': 0,
+                'other': 0
+            }
+            
+            fd_dir = f'/proc/{pid}/fd'
+            for fd in os.listdir(fd_dir):
+                try:
+                    link = os.readlink(f'{fd_dir}/{fd}')
+                    
+                    if 'socket:' in link:
+                        # Extract inode from socket:[12345]
+                        inode = link.split('[')[1].split(']')[0]
+                        
+                        if inode in socket_map:
+                            info = socket_map[inode]
+                            # Redis typically on port 6379
+                            if info['remote_port'] == 6379 or info['local_port'] == 6379:
+                                fd_stats['redis'] += 1
+                            # HTTP/HTTPS
+                            elif info['remote_port'] == 443:
+                                fd_stats['https'] += 1
+                            elif info['remote_port'] == 80:
+                                fd_stats['http'] += 1
+                            else:
+                                fd_stats['other_sockets'] += 1
+                        else:
+                            fd_stats['other_sockets'] += 1
+                            
+                    elif 'pipe:' in link:
+                        fd_stats['pipes'] += 1
+                    elif '/frontier' in link:
+                        fd_stats['frontier_files'] += 1
+                    elif '/prometheus' in link:
+                        fd_stats['prometheus'] += 1
+                    else:
+                        fd_stats['other'] += 1
+                        
+                except:
+                    pass  # FD might have closed
+            
+            # Update Prometheus metrics
+            fd_redis_gauge.set(fd_stats['redis'])
+            fd_http_gauge.set(fd_stats['http'])
+            fd_https_gauge.set(fd_stats['https'])
+            fd_frontier_files_gauge.set(fd_stats['frontier_files'])
+            fd_prometheus_gauge.set(fd_stats['prometheus'])
+            fd_other_sockets_gauge.set(fd_stats['other_sockets'])
+            fd_pipes_gauge.set(fd_stats['pipes'])
+            fd_other_gauge.set(fd_stats['other'])
+            
+            logger.info(f"[Metrics] FD breakdown: {fd_stats}")
+            
+            # Also log connection pool stats
+            if hasattr(self, 'redis_client') and hasattr(self.redis_client.connection_pool, '_created_connections'):
+                logger.info(f"[Metrics] Redis pool connections: {self.redis_client.connection_pool._created_connections}")
+            
+            if hasattr(self, 'fetcher') and hasattr(self.fetcher, 'session') and self.fetcher.session:
+                connector = self.fetcher.session.connector
+                if hasattr(connector, '_acquired'):
+                    logger.info(f"[Metrics] aiohttp acquired connections: {len(connector._acquired)}")
+                if hasattr(connector, '_conns'):
+                    total_conns = sum(len(conns) for conns in connector._conns.values())
+                    logger.info(f"[Metrics] aiohttp total cached connections: {total_conns}")
+                    
+        except Exception as e:
+            logger.error(f"Error in FD analysis: {e}")
 
     async def _log_metrics(self):
         current_time = time.time()
@@ -781,6 +899,9 @@ class CrawlerOrchestrator:
                 
                 if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                     await self._log_metrics()
+                    
+                    # Analyze FD types
+                    await self._analyze_fd_types()
                     
                     # Log lightweight memory tracker summary
                     try:

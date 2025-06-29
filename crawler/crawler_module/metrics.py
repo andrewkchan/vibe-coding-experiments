@@ -135,6 +135,63 @@ open_fds_gauge = Gauge(
     registry=registry
 )
 
+# FD type breakdown metrics
+fd_redis_gauge = Gauge(
+    'crawler_fd_redis_connections',
+    'Number of Redis connection file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+fd_http_gauge = Gauge(
+    'crawler_fd_http_connections',
+    'Number of HTTP connection file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+fd_https_gauge = Gauge(
+    'crawler_fd_https_connections',
+    'Number of HTTPS connection file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+fd_frontier_files_gauge = Gauge(
+    'crawler_fd_frontier_files',
+    'Number of frontier file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+fd_prometheus_gauge = Gauge(
+    'crawler_fd_prometheus_files',
+    'Number of Prometheus metric file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+fd_other_sockets_gauge = Gauge(
+    'crawler_fd_other_sockets',
+    'Number of other socket file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+fd_pipes_gauge = Gauge(
+    'crawler_fd_pipes',
+    'Number of pipe file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+fd_other_gauge = Gauge(
+    'crawler_fd_other',
+    'Number of other file descriptors',
+    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
 db_pool_available_gauge = Gauge(
     'crawler_db_pool_available_connections', 
     'Available database connections in the pool',
