@@ -67,12 +67,11 @@ class CrawlerOrchestrator:
             logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
             raise # Stop if we can't create data directory
         
-        # Set parent process ID for multiprocess metrics if using Redis
-        if config.db_type == 'redis':
-            # The multiprocess directory should already be set up by main.py
-            # We just need to mark this as the parent process
-            os.environ['PROMETHEUS_PARENT_PROCESS'] = str(os.getpid())
-            logger.info(f"Set PROMETHEUS_PARENT_PROCESS to {os.getpid()}")
+        # Set parent process ID for multiprocess metrics
+        # The multiprocess directory should already be set up by main.py
+        # We just need to mark this as the parent process
+        os.environ['PROMETHEUS_PARENT_PROCESS'] = str(os.getpid())
+        logger.info(f"Set PROMETHEUS_PARENT_PROCESS to {os.getpid()}")
 
         # Initialize fetcher (common to all backends)
         self.fetcher: Fetcher = Fetcher(config)
@@ -127,9 +126,6 @@ class CrawlerOrchestrator:
 
     def _start_parser_process(self):
         """Start the parser consumer as a child process."""
-        if self.config.db_type != 'redis':
-            logger.warning("Parser process only supported with Redis backend")
-            return
             
         def run_parser():
             """Function to run in the parser process."""
@@ -156,10 +152,6 @@ class CrawlerOrchestrator:
     
     def _start_parser_processes(self, num_processes: Optional[int] = None):
         """Start multiple parser consumer processes."""
-        if self.config.db_type != 'redis':
-            logger.warning("Parser processes only supported with Redis backend")
-            return
-        
         num_processes = num_processes or self.num_parser_processes
         
         def run_parser(parser_id: int):
@@ -577,11 +569,10 @@ class CrawlerOrchestrator:
             if start_metrics_server(port=8001):
                 logger.info("Prometheus metrics server started on port 8001")
             
-            # Start parser process if using Redis backend
-            if self.config.db_type == 'redis':
-                self._start_parser_processes()
-                # Give parser a moment to initialize
-                await asyncio.sleep(2)
+            # Start parser process
+            self._start_parser_processes()
+            # Give parser a moment to initialize
+            await asyncio.sleep(2)
 
             # Start worker tasks
             logger.info(f"Starting {self.config.max_workers} workers with staggered startup...")
@@ -692,12 +683,8 @@ class CrawlerOrchestrator:
                 if LOG_MEM_DIAGNOSTICS and time.time() - self.last_mem_diagnostics_time >= MEM_DIAGNOSTICS_INTERVAL_SECONDS:
                     self.log_mem_diagnostics()
 
-                # Use the fast, estimated count for logging
-                if self.config.db_type == 'redis':
-                    # TODO: frontier count is very slow with redis right now
-                    estimated_frontier_size = -1
-                else:
-                    estimated_frontier_size = await self.frontier.count_frontier()
+                # TODO: frontier count is very slow with redis right now
+                estimated_frontier_size = -1
                 active_workers = sum(1 for task in self.worker_tasks if not task.done())
                 
                 # Update Prometheus gauges

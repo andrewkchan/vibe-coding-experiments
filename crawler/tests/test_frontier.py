@@ -32,7 +32,6 @@ class FrontierTestConfig:
     resume: bool = False
     user_agent: str = "FrontierTestCrawler/1.0"
     seeded_urls_only: bool = False
-    db_type: str = "redis"
     # Redis settings
     redis_host: str = "localhost"
     redis_port: int = 6379
