@@ -189,6 +189,137 @@ content_size_histogram = Histogram(
     registry=registry
 )
 
+# System metrics
+cpu_usage_gauge = Gauge(
+    'system_cpu_percent',
+    'CPU usage percentage',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+memory_free_gauge = Gauge(
+    'system_memory_free_bytes',
+    'Free system memory in bytes',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+memory_available_gauge = Gauge(
+    'system_memory_available_bytes',
+    'Available system memory in bytes',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+disk_free_gauge = Gauge(
+    'system_disk_free_bytes',
+    'Free disk space in bytes',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+disk_usage_percent_gauge = Gauge(
+    'system_disk_usage_percent',
+    'Disk usage percentage',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+# IO metrics
+io_read_count_gauge = Gauge(
+    'system_io_read_count',
+    'Number of read operations',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+io_write_count_gauge = Gauge(
+    'system_io_write_count',
+    'Number of write operations',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+io_read_bytes_gauge = Gauge(
+    'system_io_read_bytes',
+    'Bytes read',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+io_write_bytes_gauge = Gauge(
+    'system_io_write_bytes',
+    'Bytes written',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+# Network metrics
+network_bytes_sent_gauge = Gauge(
+    'system_network_bytes_sent',
+    'Network bytes sent',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+network_bytes_recv_gauge = Gauge(
+    'system_network_bytes_received',
+    'Network bytes received',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+network_packets_sent_gauge = Gauge(
+    'system_network_packets_sent',
+    'Network packets sent',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+network_packets_recv_gauge = Gauge(
+    'system_network_packets_received',
+    'Network packets received',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+# Redis metrics
+redis_ops_per_sec_gauge = Gauge(
+    'redis_ops_per_second',
+    'Redis operations per second',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+redis_memory_usage_gauge = Gauge(
+    'redis_memory_usage_bytes',
+    'Redis memory usage in bytes',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+redis_connected_clients_gauge = Gauge(
+    'redis_connected_clients',
+    'Number of Redis connected clients',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+redis_hit_rate_gauge = Gauge(
+    'redis_hit_rate_percent',
+    'Redis cache hit rate percentage',
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+redis_latency_histogram = Histogram(
+    'redis_command_latency_seconds',
+    'Redis command latency',
+    ['command_type'],
+    buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1),
+    registry=registry
+)
+
 def start_metrics_server(port=8001):
     """Start the Prometheus metrics HTTP server.
     

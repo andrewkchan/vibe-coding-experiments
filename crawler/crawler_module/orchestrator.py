@@ -36,7 +36,27 @@ from .metrics import (
     fetch_duration_histogram,
     db_connection_acquire_histogram,
     db_query_duration_histogram,
-    content_size_histogram
+    content_size_histogram,
+    # System metrics
+    cpu_usage_gauge,
+    memory_free_gauge,
+    memory_available_gauge,
+    disk_free_gauge,
+    disk_usage_percent_gauge,
+    io_read_count_gauge,
+    io_write_count_gauge,
+    io_read_bytes_gauge,
+    io_write_bytes_gauge,
+    network_bytes_sent_gauge,
+    network_bytes_recv_gauge,
+    network_packets_sent_gauge,
+    network_packets_recv_gauge,
+    # Redis metrics
+    redis_ops_per_sec_gauge,
+    redis_memory_usage_gauge,
+    redis_connected_clients_gauge,
+    redis_hit_rate_gauge,
+    redis_latency_histogram
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +134,12 @@ class CrawlerOrchestrator:
         self.mem_tracker = tracker.SummaryTracker()
         self.last_mem_diagnostics_time: float = time.time()
         self.last_mem_diagnostics_rss: int = 0
+        
+        # System metrics tracking for rate calculations
+        self.last_io_stats = None
+        self.last_network_stats = None
+        self.last_redis_stats = None
+        self.last_redis_stats_time = None
         
         # Parser process management
         self.parser_process: Optional[Process] = None
@@ -249,6 +275,94 @@ class CrawlerOrchestrator:
         
         # Update Prometheus gauge
         pages_per_second_gauge.set(pages_per_second)
+        
+        # Collect system metrics
+        try:
+            # CPU usage
+            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_usage_gauge.set(cpu_percent)
+            logger.info(f"[Metrics] CPU Usage: {cpu_percent:.1f}%")
+            
+            # Memory metrics
+            mem = psutil.virtual_memory()
+            memory_free_gauge.set(mem.free)
+            memory_available_gauge.set(mem.available)
+            logger.info(f"[Metrics] Memory: Free={mem.free/1024/1024/1024:.1f}GB, Available={mem.available/1024/1024/1024:.1f}GB, Used={mem.percent:.1f}%")
+            
+            # Disk metrics (for the crawler's data directory)
+            disk = psutil.disk_usage(self.config.data_dir)
+            disk_free_gauge.set(disk.free)
+            disk_usage_percent_gauge.set(disk.percent)
+            logger.info(f"[Metrics] Disk ({self.config.data_dir}): Free={disk.free/1024/1024/1024:.1f}GB, Used={disk.percent:.1f}%")
+            
+            # IO metrics
+            io_counters = psutil.disk_io_counters()
+            if io_counters:
+                io_read_count_gauge.set(io_counters.read_count)
+                io_write_count_gauge.set(io_counters.write_count)
+                io_read_bytes_gauge.set(io_counters.read_bytes)
+                io_write_bytes_gauge.set(io_counters.write_bytes)
+                
+                # Calculate IOPS and throughput rates
+                if self.last_io_stats:
+                    read_iops = (io_counters.read_count - self.last_io_stats.read_count) / time_elapsed_seconds
+                    write_iops = (io_counters.write_count - self.last_io_stats.write_count) / time_elapsed_seconds
+                    read_throughput_mb = (io_counters.read_bytes - self.last_io_stats.read_bytes) / time_elapsed_seconds / 1024 / 1024
+                    write_throughput_mb = (io_counters.write_bytes - self.last_io_stats.write_bytes) / time_elapsed_seconds / 1024 / 1024
+                    logger.info(f"[Metrics] IO: Read={read_iops:.0f} IOPS/{read_throughput_mb:.1f} MB/s, Write={write_iops:.0f} IOPS/{write_throughput_mb:.1f} MB/s")
+                
+                self.last_io_stats = io_counters
+            
+            # Network metrics
+            net_counters = psutil.net_io_counters()
+            if net_counters:
+                network_bytes_sent_gauge.set(net_counters.bytes_sent)
+                network_bytes_recv_gauge.set(net_counters.bytes_recv)
+                network_packets_sent_gauge.set(net_counters.packets_sent)
+                network_packets_recv_gauge.set(net_counters.packets_recv)
+                
+                # Calculate network rates
+                if self.last_network_stats:
+                    sent_mb_per_sec = (net_counters.bytes_sent - self.last_network_stats.bytes_sent) / time_elapsed_seconds / 1024 / 1024
+                    recv_mb_per_sec = (net_counters.bytes_recv - self.last_network_stats.bytes_recv) / time_elapsed_seconds / 1024 / 1024
+                    logger.info(f"[Metrics] Network: Sent={sent_mb_per_sec:.1f} MB/s, Recv={recv_mb_per_sec:.1f} MB/s")
+                
+                self.last_network_stats = net_counters
+            
+            # Redis metrics
+            redis_info = await self.redis_client.info()
+            redis_memory = await self.redis_client.info('memory')
+            redis_stats = await self.redis_client.info('stats')
+            
+            # Basic Redis metrics
+            redis_memory_usage_gauge.set(redis_memory.get('used_memory', 0))
+            redis_connected_clients_gauge.set(redis_info.get('connected_clients', 0))
+            
+            # Redis ops/sec
+            instantaneous_ops = redis_stats.get('instantaneous_ops_per_sec', 0)
+            redis_ops_per_sec_gauge.set(instantaneous_ops)
+            
+            # Calculate hit rate
+            if self.last_redis_stats:
+                time_diff = current_time - self.last_redis_stats_time
+                if time_diff > 0:
+                    hits_diff = redis_stats.get('keyspace_hits', 0) - self.last_redis_stats.get('keyspace_hits', 0)
+                    misses_diff = redis_stats.get('keyspace_misses', 0) - self.last_redis_stats.get('keyspace_misses', 0)
+                    total_diff = hits_diff + misses_diff
+                    if total_diff > 0:
+                        hit_rate = (hits_diff / total_diff) * 100
+                        redis_hit_rate_gauge.set(hit_rate)
+                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_memory.get('used_memory_human', 'N/A')}, Hit Rate={hit_rate:.1f}%")
+                    else:
+                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_memory.get('used_memory_human', 'N/A')}")
+            else:
+                logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_memory.get('used_memory_human', 'N/A')}")
+            
+            self.last_redis_stats = redis_stats
+            self.last_redis_stats_time = current_time
+            
+        except Exception as e:
+            logger.error(f"Error collecting system metrics: {e}")
 
         # Content size metrics - extract data from Prometheus histogram
         try:
