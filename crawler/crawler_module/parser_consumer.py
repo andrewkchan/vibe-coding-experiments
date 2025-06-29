@@ -15,9 +15,9 @@ import redis.asyncio as redis
 
 from .config import CrawlerConfig, parse_args
 from .parser import PageParser
-from .redis_storage import RedisStorageManager
-from .frontier import HybridFrontierManager
-from .politeness import RedisPolitenessEnforcer
+from .storage import StorageManager
+from .frontier import FrontierManager
+from .politeness import PolitenessEnforcer
 from .fetcher import Fetcher
 from .utils import extract_domain
 from .metrics import (
@@ -50,11 +50,11 @@ class ParserConsumer:
         self.parser = PageParser()
         
         # Initialize storage and frontier for adding URLs
-        self.storage = RedisStorageManager(config, self.redis_client)
+        self.storage = StorageManager(config, self.redis_client)
         # Need fetcher for politeness enforcer
         self.fetcher = Fetcher(config)
-        self.politeness = RedisPolitenessEnforcer(config, self.redis_client, self.fetcher)
-        self.frontier = HybridFrontierManager(
+        self.politeness = PolitenessEnforcer(config, self.redis_client, self.fetcher)
+        self.frontier = FrontierManager(
             config, 
             self.politeness,  # type: ignore[arg-type]
             self.redis_client

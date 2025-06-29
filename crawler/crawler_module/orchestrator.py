@@ -16,14 +16,11 @@ import random
 
 from .config import CrawlerConfig
 from .storage import StorageManager
-from .redis_storage import RedisStorageManager
 from .fetcher import Fetcher, FetchResult
-from .politeness import PolitenessEnforcer, RedisPolitenessEnforcer
-from .frontier import FrontierManager, HybridFrontierManager
+from .politeness import PolitenessEnforcer
+from .frontier import FrontierManager
 
 from .utils import extract_domain # For getting domain for storage
-from .db_backends import create_backend, PostgreSQLBackend
-from .metrics_utils import calculate_percentiles
 from .metrics import (
     start_metrics_server,
     pages_crawled_counter,
@@ -80,92 +77,32 @@ class CrawlerOrchestrator:
         # Initialize fetcher (common to all backends)
         self.fetcher: Fetcher = Fetcher(config)
         
-        # Initialize backend-specific components
-        if config.db_type == 'redis':
-            # Initialize Redis client with configurable connection
-            self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
-            # Monkey-patch redis client method to remove a useless decorator which incurs extra overhead
-            self.redis_client.connection_pool.get_connection = functools.partial(
-                self.redis_client.connection_pool.get_connection.__wrapped__, 
-                self.redis_client.connection_pool
-            )
-            
-            # Create a separate Redis client for binary data (pickle)
-            binary_redis_kwargs = config.get_redis_connection_kwargs()
-            binary_redis_kwargs['decode_responses'] = False
-            self.redis_client_binary = redis.Redis(**binary_redis_kwargs)
-            # Same monkey patching as above
-            self.redis_client_binary.connection_pool.get_connection = functools.partial(
-                self.redis_client_binary.connection_pool.get_connection.__wrapped__, 
-                self.redis_client_binary.connection_pool
-            )
-            
-            self.db_backend = None  # No SQL backend for Redis
-            
-            # Use Redis-based components
-            self.storage: Union[StorageManager, RedisStorageManager] = RedisStorageManager(config, self.redis_client)
-            self.politeness: Union[PolitenessEnforcer, RedisPolitenessEnforcer] = RedisPolitenessEnforcer(config, self.redis_client, self.fetcher)
-            # HybridFrontierManager expects a PolitenessEnforcer-compatible object
-            self.frontier: Union[FrontierManager, HybridFrontierManager] = HybridFrontierManager(
-                config, 
-                self.politeness,  # type: ignore[arg-type]  # RedisPolitenessEnforcer implements same interface
-                self.redis_client
-            )
-            
-        else:
-            # SQL-based backends (SQLite or PostgreSQL)
-            self.redis_client = None
-            
-            if config.db_type == 'sqlite':
-                self.db_backend = create_backend(
-                    'sqlite',
-                    db_path=data_dir_path / "crawler_state.db",
-                    pool_size=config.max_workers,
-                    timeout=60
-                )
-            else:  # PostgreSQL
-                # For PostgreSQL, we need to be careful about connection limits
-                # PostgreSQL default max_connections is often 100
-                # We need to leave some connections for monitoring and other processes
-                
-                # Check for manual pool size override
-                pool_size_override = os.environ.get('CRAWLER_PG_POOL_SIZE')
-                if pool_size_override:
-                    try:
-                        max_pool = int(pool_size_override)
-                        min_pool = min(10, max_pool)
-                        logger.info(f"Using manual PostgreSQL pool size: min={min_pool}, max={max_pool}")
-                    except ValueError:
-                        logger.warning(f"Invalid CRAWLER_PG_POOL_SIZE value: {pool_size_override}, using automatic sizing")
-                        pool_size_override = None
-                
-                if not pool_size_override:
-                    # Estimate reasonable pool size based on workers
-                    # Not all workers need a connection simultaneously
-                    # Workers spend time fetching URLs, parsing, etc.
-                    concurrent_db_fraction = 0.7  # Assume ~70% of workers need DB at once
-                    
-                    min_pool = min(10, config.max_workers)
-                    # Calculate max based on expected concurrent needs
-                    estimated_concurrent = int(config.max_workers * concurrent_db_fraction)
-                    # Leave 20 connections for psql, monitoring, etc.
-                    safe_max = 80  # Assuming max_connections=100
-                    max_pool = min(max(estimated_concurrent, 20), safe_max)
-                    
-                    logger.info(f"PostgreSQL pool configuration: min={min_pool}, max={max_pool} "
-                               f"(for {config.max_workers} workers)")
-                
-                self.db_backend = create_backend(
-                    'postgresql',
-                    db_url=config.db_url,
-                    min_size=min_pool,
-                    max_size=max_pool
-                )
-            
-            # Initialize SQL-based components
-            self.storage = StorageManager(config, self.db_backend)
-            self.politeness = PolitenessEnforcer(config, self.storage, self.fetcher)
-            self.frontier = FrontierManager(config, self.storage, self.politeness)
+        # Initialize Redis client with configurable connection
+        self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
+        # Monkey-patch redis client method to remove a useless decorator which incurs extra overhead
+        self.redis_client.connection_pool.get_connection = functools.partial(
+            self.redis_client.connection_pool.get_connection.__wrapped__, 
+            self.redis_client.connection_pool
+        )
+        
+        # Create a separate Redis client for binary data (pickle)
+        binary_redis_kwargs = config.get_redis_connection_kwargs()
+        binary_redis_kwargs['decode_responses'] = False
+        self.redis_client_binary = redis.Redis(**binary_redis_kwargs)
+        # Same monkey patching as above
+        self.redis_client_binary.connection_pool.get_connection = functools.partial(
+            self.redis_client_binary.connection_pool.get_connection.__wrapped__, 
+            self.redis_client_binary.connection_pool
+        )
+        
+        # Use Redis-based components
+        self.storage: StorageManager = StorageManager(config, self.redis_client)
+        self.politeness: PolitenessEnforcer = PolitenessEnforcer(config, self.redis_client, self.fetcher)
+        self.frontier: FrontierManager = FrontierManager(
+            config, 
+            self.politeness,
+            self.redis_client
+        )
 
         self.pages_crawled_count: int = 0
         self.start_time: float = 0.0
@@ -294,27 +231,19 @@ class CrawlerOrchestrator:
         """Initializes all crawler components that require async setup."""
         logger.info("Initializing crawler components...")
         
-        if self.config.db_type == 'redis':
-            # Clear any zombie locks from previous runs
-            from .redis_lock import LockManager
-            lock_manager = LockManager(self.redis_client)
-            cleared_count = await lock_manager.clear_all_locks()
-            if cleared_count > 0:
-                logger.warning(f"Cleared {cleared_count} zombie locks from previous run")
-            
-            # Redis-based initialization
-            await self.storage.init_db_schema()  # Sets schema version
-            # RedisPolitenesEnforcer loads exclusions differently
-            if hasattr(self.politeness, '_load_manual_exclusions'):
-                await self.politeness._load_manual_exclusions()
-            await self.frontier.initialize_frontier()
-        else:
-            # SQL-based initialization
-            await self.db_backend.initialize()
-            await self.storage.init_db_schema()
-            # Load politeness-related data that needs to be available before crawl starts
+        # Clear any zombie locks from previous runs
+        from .redis_lock import LockManager
+        lock_manager = LockManager(self.redis_client)
+        cleared_count = await lock_manager.clear_all_locks()
+        if cleared_count > 0:
+            logger.warning(f"Cleared {cleared_count} zombie locks from previous run")
+        
+        # Redis-based initialization
+        await self.storage.init_db_schema()  # Sets schema version
+        # PolitenessEnforcer loads exclusions differently
+        if hasattr(self.politeness, '_load_manual_exclusions'):
             await self.politeness._load_manual_exclusions()
-            await self.frontier.initialize_frontier()
+        await self.frontier.initialize_frontier()
             
         logger.info("Crawler components initialized.")
 
@@ -328,44 +257,6 @@ class CrawlerOrchestrator:
         
         # Update Prometheus gauge
         pages_per_second_gauge.set(pages_per_second)
-
-        # DB-specific metrics
-        if self.config.db_type == 'redis':
-            # Redis doesn't have connection pool metrics in the same way
-            # Could add Redis-specific metrics here if needed
-            pass
-        elif isinstance(self.db_backend, PostgreSQLBackend): # type: ignore
-            # Connection Acquire Times
-            acquire_times = list(self.db_backend.connection_acquire_times) # Copy for processing
-            self.db_backend.connection_acquire_times.clear()
-            if acquire_times:
-                p50_acquire = calculate_percentiles(acquire_times, [50])[0]
-                p95_acquire = calculate_percentiles(acquire_times, [95])[0]
-                logger.info(f"[Metrics] DB Conn Acquire Time (ms): P50={p50_acquire*1000:.2f}, P95={p95_acquire*1000:.2f} (from {len(acquire_times)} samples)")
-                
-                # Update Prometheus histogram with acquire times
-                for acquire_time in acquire_times:
-                    db_connection_acquire_histogram.observe(acquire_time)
-            else:
-                logger.info("[Metrics] DB Conn Acquire Time (ms): No samples")
-
-            # Query Hold Times (for specific queries)
-            query_hold_times_copy: Dict[str, List[float]] = defaultdict(list)
-            for name, times in self.db_backend.query_hold_times.items():
-                query_hold_times_copy[name] = list(times)
-                times.clear() # Clear original list
-            
-            for query_name, hold_times in query_hold_times_copy.items():
-                if hold_times:
-                    p50_hold = calculate_percentiles(hold_times, [50])[0]
-                    p95_hold = calculate_percentiles(hold_times, [95])[0]
-                    max_hold = max(hold_times)
-                    logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): P50={p50_hold*1000:.2f}, P95={p95_hold*1000:.2f}, MAX={max_hold*1000:.2f} (from {len(hold_times)} samples)")
-                    
-                    # Update Prometheus histogram with query times
-                    for hold_time in hold_times:
-                        db_query_duration_histogram.labels(query_name=query_name).observe(hold_time)
-                # else: logger.info(f"[Metrics] Query Hold Time '{query_name}' (ms): No samples") # Optional: log if no samples
 
         # Content size metrics - extract data from Prometheus histogram
         try:
@@ -832,26 +723,11 @@ class CrawlerOrchestrator:
                         logger.warning(f"psutil error during resource monitoring: {e}")
                         # Fallback or disable further psutil calls for this iteration if needed
                 
-                # Connection pool info - different for each backend
-                pool_info = "N/A"
-                if self.config.db_type == 'redis':
-                    # Redis connection info
-                    pool_info = "Redis"
-                    # Could add Redis connection pool stats if needed
-                elif self.config.db_type == 'sqlite' and hasattr(self.db_backend, '_pool'):
-                    pool_info = f"available={self.db_backend._pool.qsize()}"
-                    db_pool_available_gauge.set(self.db_backend._pool.qsize())
-                elif self.config.db_type == 'postgresql':
-                    pool_info = f"min={self.db_backend.min_size},max={self.db_backend.max_size}"
-                    # For PostgreSQL, we'd need to expose pool stats from the backend
-                    # This is a simplified version - actual implementation would query the pool
-
                 status_parts = [
                     f"Crawled={self.pages_crawled_count}",
                     f"Frontier={estimated_frontier_size}",
                     f"AddedToFrontier={self.total_urls_added_to_frontier}",
                     f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
-                    f"DBPool({self.config.db_type})={pool_info}",
                     f"MemRSS={rss_mem_mb}",
                     f"OpenFDs={fds_count}",
                     f"Runtime={(time.time() - self.start_time):.0f}s"
@@ -910,10 +786,9 @@ class CrawlerOrchestrator:
             # Close storage and database connections
             await self.storage.close()
             
-            # Close Redis connection if using Redis backend
-            if self.config.db_type == 'redis' and self.redis_client:
-                await self.redis_client.aclose()
-                await self.redis_client_binary.aclose()
+            # Close Redis connection
+            await self.redis_client.aclose()
+            await self.redis_client_binary.aclose()
             
             logger.info(f"Crawl finished. Total pages crawled: {self.pages_crawled_count}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

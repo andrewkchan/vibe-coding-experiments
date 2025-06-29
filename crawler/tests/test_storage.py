@@ -1,69 +1,60 @@
 import pytest
 import pytest_asyncio
 from pathlib import Path
-import sqlite3
-import shutil
 import logging
-from dataclasses import dataclass
-import aiofiles # For testing async file save
 import time
 import hashlib
+import aiofiles
+import redis.asyncio as redis
+from typing import AsyncIterator
+import asyncio
 
-# Import db_backend from conftest
-# pytest will automatically discover fixtures in conftest.py in the same directory or parent directories.
-
-from crawler_module.storage import StorageManager, DB_SCHEMA_VERSION
-from crawler_module.config import CrawlerConfig # Will use test_config from conftest
-from crawler_module.db_backends import create_backend, DatabaseBackend
+from crawler_module.storage import StorageManager, REDIS_SCHEMA_VERSION
+from crawler_module.config import CrawlerConfig
 
 # Configure basic logging for tests to see output
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
+# Note: redis_test_client fixture is imported from conftest.py
+# This ensures we use db=15 for tests, not production db=0
 @pytest_asyncio.fixture
-async def storage_manager(test_config: CrawlerConfig, db_backend: DatabaseBackend) -> StorageManager:
-    """Fixture to create a StorageManager instance using a db_backend."""
-    logger.debug(f"Initializing StorageManager with config data_dir: {test_config.data_dir} and db_backend")
-    sm = StorageManager(config=test_config, db_backend=db_backend)
+async def storage_manager(test_config: CrawlerConfig, redis_test_client: redis.Redis) -> StorageManager:
+    """Fixture to create a StorageManager instance."""
+    logger.debug(f"Initializing StorageManager with config data_dir: {test_config.data_dir}")
+    sm = StorageManager(config=test_config, redis_client=redis_test_client)
     await sm.init_db_schema()
     yield sm
 
+
 @pytest.mark.asyncio
-async def test_storage_manager_initialization(storage_manager: StorageManager, test_config: CrawlerConfig, db_backend: DatabaseBackend):
-    """Test if StorageManager initializes directories and DB correctly."""
+async def test_storage_manager_initialization(storage_manager: StorageManager, test_config: CrawlerConfig, redis_test_client: redis.Redis):
+    """Test if StorageManager initializes directories and Redis correctly."""
     assert storage_manager.data_dir.exists()
     assert storage_manager.content_dir.exists()
     
-    # For SQLite, check that the database file exists
-    if test_config.db_type == "sqlite":
-        assert storage_manager.db_path.exists(), f"Database file {storage_manager.db_path} should exist."
-    
-    # Check that schema version table exists
-    result = await db_backend.fetch_one("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';")
-    assert result is not None, "schema_version table should exist."
-    
-    logger.info("StorageManager initialization test passed.")
+    # Check that schema version is set in Redis
+    schema_version = await redis_test_client.get('schema_version')
+    assert schema_version is not None, "Schema version should be set in Redis"
+    assert int(schema_version) == REDIS_SCHEMA_VERSION, "Schema version in Redis should match"
+    logger.info("Storage manager initialization test passed.")
+
 
 @pytest.mark.asyncio
-async def test_database_schema_creation(storage_manager: StorageManager, db_backend: DatabaseBackend):
-    """Test if all tables and indexes are created as expected using the database backend."""
-    # The storage_manager fixture already initializes the schema via StorageManager.init_db_schema
+async def test_schema_initialization(storage_manager: StorageManager, redis_test_client: redis.Redis):
+    """Test if schema version is properly set in Redis."""
+    # The storage_manager fixture already initializes the schema
+    schema_version = await redis_test_client.get('schema_version')
+    assert schema_version is not None
+    assert int(schema_version) == REDIS_SCHEMA_VERSION
     
-    tables_to_check = ["frontier", "visited_urls", "domain_metadata", "schema_version"]
-    for table in tables_to_check:
-        result = await db_backend.fetch_one(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}';")
-        assert result is not None, f"Table {table} should exist."
+    # Test that re-initializing is safe
+    await storage_manager.init_db_schema()
+    schema_version_after = await redis_test_client.get('schema_version')
+    assert int(schema_version_after) == REDIS_SCHEMA_VERSION
+    logger.info("Schema initialization test passed.")
 
-    result = await db_backend.fetch_one("SELECT version FROM schema_version")
-    assert result[0] == DB_SCHEMA_VERSION, f"Schema version should be {DB_SCHEMA_VERSION}"
-
-    result = await db_backend.fetch_one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_frontier_domain';")
-    assert result is not None, "Index idx_frontier_domain on frontier table should exist."
-    result = await db_backend.fetch_one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_visited_domain';")
-    assert result is not None, "Index idx_visited_domain on visited_urls table should exist."
-    
-    logger.info("Database schema creation test passed.")
 
 def test_get_url_sha256(storage_manager: StorageManager):
     """Test the URL hashing function."""
@@ -76,37 +67,32 @@ def test_get_url_sha256(storage_manager: StorageManager):
     hash1_again = storage_manager.get_url_sha256(url1_again)
 
     assert isinstance(hash1, str)
-    assert len(hash1) == 64 # SHA256 hex digest length
+    assert len(hash1) == 64  # SHA256 hex digest length
     assert hash1 != hash2
     assert hash1 == hash1_again
     logger.info("URL SHA256 hashing test passed.")
 
+
 @pytest.mark.asyncio
-async def test_storage_manager_reinitialization(test_config: CrawlerConfig, tmp_path: Path):
-    """Test that re-initializing StorageManager with the same path is safe."""
+async def test_reinitialization_safety(test_config: CrawlerConfig, redis_test_client: redis.Redis):
+    """Test that re-initializing StorageManager with the same Redis instance is safe."""
     
-    # The standard DB path that StorageManager will use based on test_config
-    target_db_path = Path(test_config.data_dir) / "crawler_state.db"
-
-    backend1 = create_backend('sqlite', db_path=target_db_path, pool_size=1)
-    await backend1.initialize()
-    sm1 = StorageManager(config=test_config, db_backend=backend1)
+    sm1 = StorageManager(config=test_config, redis_client=redis_test_client)
     await sm1.init_db_schema()
-    # Verify StorageManager calculates its db_path correctly based on the config
-    assert sm1.db_path == target_db_path, \
-        f"SM1 path {sm1.db_path} should match target DB path {target_db_path}"
-    await backend1.close()
-
-    backend2 = create_backend('sqlite', db_path=target_db_path, pool_size=1)
-    await backend2.initialize()
-    sm2 = StorageManager(config=test_config, db_backend=backend2)
+    
+    # Verify schema version is set
+    schema_version = await redis_test_client.get("schema_version")
+    assert schema_version == str(REDIS_SCHEMA_VERSION)
+    
+    sm2 = StorageManager(config=test_config, redis_client=redis_test_client)
     await sm2.init_db_schema()
-    assert sm2.db_path == target_db_path, \
-        f"SM2 path {sm2.db_path} should match target DB path {target_db_path}"
-    await backend2.close()
-
-    assert target_db_path.exists(), "Database file should exist after StorageManager initializations."
+    
+    # Schema version should still be the same
+    schema_version = await redis_test_client.get("schema_version")
+    assert schema_version == str(REDIS_SCHEMA_VERSION)
+    
     logger.info("StorageManager re-initialization test passed.")
+
 
 @pytest.mark.asyncio
 async def test_save_content_to_file(storage_manager: StorageManager): 
@@ -126,6 +112,7 @@ async def test_save_content_to_file(storage_manager: StorageManager):
     assert saved_content == text_content
     logger.info("Save content to file test passed.")
 
+
 @pytest.mark.asyncio
 async def test_save_content_to_file_empty_content(storage_manager: StorageManager):
     """Test that saving empty content returns None and creates no file."""
@@ -140,15 +127,15 @@ async def test_save_content_to_file_empty_content(storage_manager: StorageManage
     assert not expected_file.exists()
     logger.info("Save empty content to file test passed.")
 
+
 @pytest.mark.asyncio
 async def test_save_content_to_file_io_error(storage_manager: StorageManager, monkeypatch):
     """Test handling of IOError during file save."""
     url_hash = "io_error_hash"
-    text_content = "Some content that will fail to save."
+    text_content = "This content should not be saved."
 
-    # Mock aiofiles.open to raise IOError
     async def mock_aio_open_raiser(*args, **kwargs):
-        raise IOError("Simulated disk full error")
+        raise IOError("Disk is full")
 
     monkeypatch.setattr(aiofiles, "open", mock_aio_open_raiser)
     
@@ -159,9 +146,10 @@ async def test_save_content_to_file_io_error(storage_manager: StorageManager, mo
     assert not expected_file.exists()
     logger.info("Save content to file with IOError test passed.")
 
+
 @pytest.mark.asyncio
-async def test_add_visited_page(storage_manager: StorageManager, db_backend: DatabaseBackend): 
-    """Test adding a visited page record to the database."""
+async def test_add_visited_page(storage_manager: StorageManager, redis_test_client: redis.Redis): 
+    """Test adding a visited page record to Redis."""
     url = "http://example.com/visited_page"
     domain = "example.com"
     status_code = 200
@@ -177,38 +165,41 @@ async def test_add_visited_page(storage_manager: StorageManager, db_backend: Dat
         status_code=status_code,
         crawled_timestamp=crawled_timestamp,
         content_type=content_type,
-        content_text=text_content, 
-        content_storage_path_str=content_storage_path_str,
-        redirected_to_url=None
+        content_text=text_content,
+        content_storage_path_str=content_storage_path_str
     )
 
+    # Check data in Redis
     expected_url_sha256 = storage_manager.get_url_sha256(url)
+    expected_url_hash = expected_url_sha256[:16]
     expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
 
-    row = await db_backend.fetch_one("SELECT * FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
+    # Get the visited page data from Redis
+    visited_data = await redis_test_client.hgetall(f'visited:{expected_url_hash}')
     
-    assert row is not None
-    (db_url_sha256, db_url, db_domain, db_crawled_ts, db_status, 
-     db_content_type, db_content_hash, db_storage_path, db_redirected_to) = row
+    assert visited_data is not None
+    assert visited_data['url'] == url
+    assert visited_data['url_sha256'] == expected_url_sha256
+    assert visited_data['domain'] == domain
+    assert int(visited_data['fetched_at']) == crawled_timestamp
+    assert int(visited_data['status_code']) == status_code
+    assert visited_data['content_type'] == content_type
+    assert visited_data['content_hash'] == expected_content_hash
+    assert visited_data['content_path'] == content_storage_path_str
+    assert visited_data['error'] == ''
+    assert 'redirected_to_url' not in visited_data  # Not set when None
     
-    assert db_url_sha256 == expected_url_sha256
-    assert db_url == url
-    assert db_domain == domain
-    assert db_crawled_ts == crawled_timestamp
-    assert db_status == status_code
-    assert db_content_type == content_type
-    assert db_content_hash == expected_content_hash
-    assert db_storage_path == content_storage_path_str
-    assert db_redirected_to is None
     logger.info("Add visited page test passed.")
 
+
 @pytest.mark.asyncio
-async def test_add_visited_page_no_content(storage_manager: StorageManager, db_backend: DatabaseBackend):
+async def test_add_visited_page_no_content(storage_manager: StorageManager, redis_test_client: redis.Redis):
     """Test adding a visited page with no text content (e.g., redirect or non-HTML)."""
     url = "http://example.com/redirect"
     domain = "example.com"
     status_code = 301
     crawled_timestamp = int(time.time())
+    content_type = "text/html"
     redirected_to_url = "http://example.com/final_destination"
 
     await storage_manager.add_visited_page(
@@ -216,18 +207,69 @@ async def test_add_visited_page_no_content(storage_manager: StorageManager, db_b
         domain=domain,
         status_code=status_code,
         crawled_timestamp=crawled_timestamp,
-        content_type=None,
+        content_type=content_type,
         content_text=None,
         content_storage_path_str=None,
         redirected_to_url=redirected_to_url
     )
 
     expected_url_sha256 = storage_manager.get_url_sha256(url)
-    row = await db_backend.fetch_one("SELECT content_hash, content_storage_path, redirected_to_url FROM visited_urls WHERE url_sha256 = ?", (expected_url_sha256,))
+    expected_url_hash = expected_url_sha256[:16]
+    
+    visited_data = await redis_test_client.hgetall(f'visited:{expected_url_hash}')
+    
+    assert visited_data is not None
+    assert visited_data['content_path'] == ''
+    assert 'content_hash' not in visited_data
+    assert visited_data['redirected_to_url'] == redirected_to_url
+    
+    logger.info("Add visited page with no content test passed.")
 
-    assert row is not None
-    content_hash, content_storage_path, db_redirected_to = row
-    assert content_hash is None
-    assert content_storage_path is None
-    assert db_redirected_to == redirected_to_url
-    logger.info("Add visited page with no content test passed.") 
+
+@pytest.mark.asyncio
+async def test_add_visited_page_update_existing(storage_manager: StorageManager, redis_test_client: redis.Redis):
+    """Test updating an existing visited page in Redis."""
+    url = "http://example.com/update_test"
+    domain = "example.com"
+
+    # First visit
+    first_timestamp = int(time.time())
+    await storage_manager.add_visited_page(
+        url=url,
+        domain=domain,
+        status_code=404,
+        crawled_timestamp=first_timestamp,
+        content_type="text/html",
+        content_text=None
+    )
+
+    # Second visit (e.g., page is now available)
+    await asyncio.sleep(0.01) # Ensure timestamp changes
+    second_timestamp = first_timestamp + 100
+    text_content = "Now it has content!"
+    url_hash_for_file = storage_manager.get_url_sha256(url)
+    content_storage_path_str = str(storage_manager.content_dir / f"{url_hash_for_file}.txt")
+    
+    await storage_manager.add_visited_page(
+        url=url,
+        domain=domain,
+        status_code=200,
+        crawled_timestamp=second_timestamp,
+        content_type="text/html",
+        content_text=text_content,
+        content_storage_path_str=content_storage_path_str
+    )
+    
+    # Check that data was updated
+    expected_url_sha256 = storage_manager.get_url_sha256(url)
+    expected_url_hash = expected_url_sha256[:16]
+    
+    visited_key = f"visited:{expected_url_hash}"
+    stored_data = await redis_test_client.hgetall(visited_key)
+    
+    assert stored_data is not None
+    assert int(stored_data['status_code']) == 200
+    assert int(stored_data['fetched_at']) == second_timestamp
+    assert stored_data['content_path'] == content_storage_path_str
+    assert stored_data['content_hash'] != ""
+    logger.info("Update visited page test passed.") 
