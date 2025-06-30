@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ROBOTS_TXT_TTL = 24 * 60 * 60  # 24 hours in seconds
 MIN_CRAWL_DELAY_SECONDS = 70 # Our project's default minimum
-ROBOTS_TXT_MAX_LEN = 200_000 # 200k chars
+ROBOTS_TXT_MAX_LEN = 100 * 1024 # 100KB - same as fetcher limit
 
 class PolitenessEnforcer:
     """Redis-backed implementation of PolitenessEnforcer.

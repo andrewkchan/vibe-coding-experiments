@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 MAX_CONTENT_SIZE_BYTES = 100 * 1024 * 1024 # Content over 100MB is discarded to avoid memory issues
 MAX_PAGE_LENGTH = 100 * 1024 # Truncate page content over 100KB before parsing
+MAX_ROBOTS_LENGTH = 100 * 1024 # Keep robots.txt limit same as page content for consistency
 
 @dataclass
 class FetchResult:
@@ -201,12 +202,15 @@ class Fetcher:
                         is_redirect=is_redirect,
                     )
                 
+                # Use different truncation limits for robots.txt vs regular pages
+                max_length = MAX_ROBOTS_LENGTH if is_robots_txt else MAX_PAGE_LENGTH
+                
                 return FetchResult(
                     initial_url=url,
                     final_url=actual_final_url,
                     status_code=status_code,
                     content_type=content_type,
-                    text_content=text_content[:MAX_PAGE_LENGTH] if text_content else None,
+                    text_content=text_content[:max_length] if text_content else None,
                     is_redirect=is_redirect,
                 )
 
