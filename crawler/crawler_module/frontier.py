@@ -302,19 +302,14 @@ class FrontierManager:
                 # Update Redis metadata
                 pipe = self.redis.pipeline()
                 
-                # Get is_seeded status
-                is_seeded_result = self.redis.hget(domain_key, 'is_seeded')
-                if asyncio.iscoroutine(is_seeded_result):
-                    is_seeded = await is_seeded_result
-                else:
-                    is_seeded = is_seeded_result
-                
-                # Update metadata
+                # Update metadata - we'll preserve is_seeded if it exists
                 pipe.hset(domain_key, mapping={
                     'frontier_size': str(new_size_bytes),
-                    'file_path': str(frontier_path.relative_to(self.frontier_dir)),
-                    'is_seeded': '1' if is_seeded else '0'
+                    'file_path': str(frontier_path.relative_to(self.frontier_dir))
                 })
+                
+                # Only set is_seeded to '0' if it doesn't exist
+                pipe.hsetnx(domain_key, 'is_seeded', '0')
                 
                 # Initialize offset if needed (0 bytes)
                 pipe.hsetnx(domain_key, 'frontier_offset', '0')

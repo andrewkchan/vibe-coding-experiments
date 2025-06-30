@@ -132,7 +132,11 @@ class CrawlerConfig:
             'host': self.redis_host,
             'port': self.redis_port,
             'db': self.redis_db,
-            'decode_responses': True
+            'decode_responses': True,
+            'max_connections': 100,
+            'timeout': None, # Block forever waiting for a connection from the pool
+            # Health check interval - helps detect stale connections
+            'health_check_interval': 30,
         }
         
         if self.redis_password:

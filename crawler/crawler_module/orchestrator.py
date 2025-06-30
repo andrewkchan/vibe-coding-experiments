@@ -12,6 +12,7 @@ from pympler import tracker, muppy, summary
 import objgraph
 from multiprocessing import Process
 import redis.asyncio as redis
+from redis.asyncio import BlockingConnectionPool
 import random
 
 from .config import CrawlerConfig
@@ -19,6 +20,7 @@ from .storage import StorageManager
 from .fetcher import Fetcher, FetchResult
 from .politeness import PolitenessEnforcer
 from .frontier import FrontierManager
+from .redis_shield import ShieldedRedis
 
 from .utils import extract_domain # For getting domain for storage
 from .metrics import (
@@ -105,31 +107,40 @@ class CrawlerOrchestrator:
         # Initialize fetcher (common to all backends)
         self.fetcher: Fetcher = Fetcher(config)
         
-        # Initialize Redis client with configurable connection
-        self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
+        # Initialize Redis client with BlockingConnectionPool to prevent "Too many connections" errors
+        redis_kwargs = config.get_redis_connection_kwargs()
+        # Create a blocking connection pool for text data
+        text_pool = BlockingConnectionPool(**redis_kwargs)
+        base_redis_client = redis.Redis(connection_pool=text_pool)
         # Monkey-patch redis client method to remove a useless decorator which incurs extra overhead
-        self.redis_client.connection_pool.get_connection = functools.partial(
-            self.redis_client.connection_pool.get_connection.__wrapped__, 
-            self.redis_client.connection_pool
+        base_redis_client.connection_pool.get_connection = functools.partial(
+            base_redis_client.connection_pool.get_connection.__wrapped__, 
+            base_redis_client.connection_pool
         )
+        # Wrap with ShieldedRedis to prevent connection leaks from cancelled operations
+        self.redis_client = ShieldedRedis(base_redis_client)
         
         # Create a separate Redis client for binary data (pickle)
         binary_redis_kwargs = config.get_redis_connection_kwargs()
         binary_redis_kwargs['decode_responses'] = False
-        self.redis_client_binary = redis.Redis(**binary_redis_kwargs)
+        # Create a blocking connection pool for binary data
+        binary_pool = BlockingConnectionPool(**binary_redis_kwargs)
+        base_redis_client_binary = redis.Redis(connection_pool=binary_pool)
         # Same monkey patching as above
-        self.redis_client_binary.connection_pool.get_connection = functools.partial(
-            self.redis_client_binary.connection_pool.get_connection.__wrapped__, 
-            self.redis_client_binary.connection_pool
+        base_redis_client_binary.connection_pool.get_connection = functools.partial(
+            base_redis_client_binary.connection_pool.get_connection.__wrapped__, 
+            base_redis_client_binary.connection_pool
         )
+        # Wrap with ShieldedRedis to prevent connection leaks
+        self.redis_client_binary = ShieldedRedis(base_redis_client_binary)
         
         # Use Redis-based components
-        self.storage: StorageManager = StorageManager(config, self.redis_client)
+        self.storage: StorageManager = StorageManager(config, self.redis_client) # type: ignore
         self.politeness: PolitenessEnforcer = PolitenessEnforcer(config, self.redis_client, self.fetcher)
         self.frontier: FrontierManager = FrontierManager(
             config, 
             self.politeness,
-            self.redis_client
+            self.redis_client # type: ignore
         )
 
         self.pages_crawled_count: int = 0
@@ -368,10 +379,6 @@ class CrawlerOrchestrator:
             
             logger.info(f"[Metrics] FD breakdown: {fd_stats}")
             
-            # Also log connection pool stats
-            if hasattr(self, 'redis_client') and hasattr(self.redis_client.connection_pool, '_created_connections'):
-                logger.info(f"[Metrics] Redis pool connections: {self.redis_client.connection_pool._created_connections}")
-            
             if hasattr(self, 'fetcher') and hasattr(self.fetcher, 'session') and self.fetcher.session:
                 connector = self.fetcher.session.connector
                 if hasattr(connector, '_acquired'):
@@ -407,6 +414,13 @@ class CrawlerOrchestrator:
             memory_free_gauge.set(mem.free)
             memory_available_gauge.set(mem.available)
             logger.info(f"[Metrics] Memory: Free={mem.free/1024/1024/1024:.1f}GB, Available={mem.available/1024/1024/1024:.1f}GB, Used={mem.percent:.1f}%")
+            
+            # Warn if system memory is low (important for Redis fork operations)
+            available_gb = mem.available / 1024 / 1024 / 1024
+            if available_gb < 2.0:
+                logger.warning(f"[Metrics] SYSTEM MEMORY WARNING: Only {available_gb:.1f}GB available - Redis background operations may fail!")
+            elif available_gb < 4.0:
+                logger.info(f"[Metrics] System memory getting low: {available_gb:.1f}GB available")
             
             # Disk metrics (for the crawler's data directory)
             disk = psutil.disk_usage(self.config.data_dir)
@@ -461,6 +475,23 @@ class CrawlerOrchestrator:
             instantaneous_ops = redis_stats.get('instantaneous_ops_per_sec', 0)
             redis_ops_per_sec_gauge.set(instantaneous_ops)
             
+            # Additional Redis memory metrics
+            redis_rss = redis_memory.get('used_memory_rss_human', 'N/A')
+            redis_dataset_perc = redis_memory.get('used_memory_dataset_perc', 'N/A')
+            redis_used = redis_memory.get('used_memory_human', 'N/A')
+            redis_max = redis_memory.get('maxmemory_human', 'N/A')
+            redis_evicted_keys = redis_stats.get('evicted_keys', 0)
+            
+            # Check Redis memory usage percentage and warn if high
+            used_memory_bytes = redis_memory.get('used_memory', 0)
+            max_memory_bytes = redis_memory.get('maxmemory', 0)
+            if max_memory_bytes > 0:
+                memory_usage_percent = (used_memory_bytes / max_memory_bytes) * 100
+                if memory_usage_percent > 90:
+                    logger.warning(f"[Metrics] REDIS MEMORY WARNING: Using {memory_usage_percent:.1f}% of maxmemory ({redis_used}/{redis_max})")
+                elif memory_usage_percent > 80:
+                    logger.info(f"[Metrics] Redis memory usage at {memory_usage_percent:.1f}% of maxmemory")
+            
             # Calculate hit rate
             if self.last_redis_stats:
                 time_diff = current_time - self.last_redis_stats_time
@@ -471,11 +502,11 @@ class CrawlerOrchestrator:
                     if total_diff > 0:
                         hit_rate = (hits_diff / total_diff) * 100
                         redis_hit_rate_gauge.set(hit_rate)
-                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_memory.get('used_memory_human', 'N/A')}, Hit Rate={hit_rate:.1f}%")
+                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Hit Rate={hit_rate:.1f}%, Evicted={redis_evicted_keys}")
                     else:
-                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_memory.get('used_memory_human', 'N/A')}")
+                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Evicted={redis_evicted_keys}")
             else:
-                logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_memory.get('used_memory_human', 'N/A')}")
+                logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Evicted={redis_evicted_keys}")
             
             self.last_redis_stats = redis_stats
             self.last_redis_stats_time = current_time

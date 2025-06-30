@@ -12,6 +12,7 @@ import signal
 import sys
 
 import redis.asyncio as redis
+from redis.asyncio import BlockingConnectionPool
 
 from .config import CrawlerConfig, parse_args
 from .parser import PageParser
@@ -40,12 +41,17 @@ class ParserConsumer:
     def __init__(self, config: CrawlerConfig, num_workers: int = 80):
         self.config = config
         self.num_workers = num_workers
-        self.redis_client = redis.Redis(**config.get_redis_connection_kwargs())
+        
+        # Create Redis client with BlockingConnectionPool to prevent "Too many connections" errors
+        redis_kwargs = config.get_redis_connection_kwargs()
+        text_pool = BlockingConnectionPool(**redis_kwargs)
+        self.redis_client = redis.Redis(connection_pool=text_pool)
         
         # Create a separate Redis client for binary data (pickle)
         binary_redis_kwargs = config.get_redis_connection_kwargs()
         binary_redis_kwargs['decode_responses'] = False
-        self.redis_client_binary = redis.Redis(**binary_redis_kwargs)
+        binary_pool = BlockingConnectionPool(**binary_redis_kwargs)
+        self.redis_client_binary = redis.Redis(connection_pool=binary_pool)
         
         self.parser = PageParser()
         
