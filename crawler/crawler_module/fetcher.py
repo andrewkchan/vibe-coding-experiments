@@ -115,6 +115,7 @@ class Fetcher:
                 headers={"User-Agent": self.config.user_agent},
                 connector=connector,
                 trace_configs=[self.trace_config],
+                cookie_jar=aiohttp.DummyCookieJar(),
             )
             logger.debug(f"Created new aiohttp.ClientSession with limit={max_total_connections}, limit_per_host={max_per_host}, SSL verification disabled")
         return self.session
