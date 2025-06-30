@@ -10,7 +10,7 @@ from typing import OrderedDict as TypingOrderedDict # For type hinting
 
 from .config import CrawlerConfig
 from .storage import StorageManager
-from .utils import extract_domain
+from .utils import extract_domain, LRUCache
 from .fetcher import Fetcher, FetchResult # Added Fetcher import
 
 logger = logging.getLogger(__name__)
@@ -31,13 +31,11 @@ class PolitenessEnforcer:
         self.redis = redis_client
         self.fetcher = fetcher
         self.robots_parsers_max_size = 100_000
-        self.robots_parsers: dict[str, RobotFileParser] = {}  # In-memory cache for parsed robots.txt
-        self.robots_parsers_order: TypingOrderedDict[str, None] = OrderedDict()
+        self.robots_parsers: LRUCache[str, RobotFileParser] = LRUCache(self.robots_parsers_max_size)
         
         # In-memory exclusion cache (LRU-style)
         self.exclusion_cache_max_size = 100_000
-        self.exclusion_cache: dict[str, bool] = {}
-        self.exclusion_cache_order: TypingOrderedDict[str, None] = OrderedDict()
+        self.exclusion_cache: LRUCache[str, bool] = LRUCache(self.exclusion_cache_max_size)
         
         self._manual_exclusions_loaded = False
     
@@ -108,9 +106,9 @@ class PolitenessEnforcer:
     async def _get_robots_for_domain(self, domain: str) -> RobotFileParser | None:
         """Fetches (async), parses, and caches robots.txt for a domain."""
         # 1. Check in-memory cache first
-        if domain in self.robots_parsers:
-            self.robots_parsers_order.move_to_end(domain) # Mark as recently used
-            return self.robots_parsers[domain]
+        cached_rfp = self.robots_parsers.get(domain)
+        if cached_rfp is not None:
+            return cached_rfp
         
         # 2. Check Redis cache
         robots_content, expires_timestamp = await self._get_cached_robots(domain)
@@ -120,8 +118,7 @@ class PolitenessEnforcer:
             logger.debug(f"Loaded fresh robots.txt for {domain} from Redis.")
             rfp = RobotFileParser()
             rfp.parse(robots_content.split('\n'))
-            self.robots_parsers[domain] = rfp
-            self.robots_parsers_order[domain] = None
+            self.robots_parsers.put(domain, rfp)
             return rfp
         
         # 3. If not cached or stale, fetch from the web
@@ -154,15 +151,8 @@ class PolitenessEnforcer:
         # 5. Parse and update in-memory cache
         rfp = RobotFileParser()
         rfp.parse(fetched_robots_content.split('\n'))
-        self.robots_parsers[domain] = rfp
-        self.robots_parsers_order[domain] = None
+        self.robots_parsers.put(domain, rfp)
         
-        # 6. Enforce memory cache size
-        if len(self.robots_parsers_order) > self.robots_parsers_max_size:
-            oldest_domain, _ = self.robots_parsers_order.popitem(last=False)
-            if oldest_domain in self.robots_parsers:
-                del self.robots_parsers[oldest_domain]
-                
         return rfp
     
     async def _check_manual_exclusion(self, domain: str) -> bool:
@@ -170,9 +160,9 @@ class PolitenessEnforcer:
         Uses an in-memory LRU cache to reduce Redis queries.
         """
         # 1. Check cache first
-        if domain in self.exclusion_cache:
-            self.exclusion_cache_order.move_to_end(domain)  # Mark as recently used
-            return self.exclusion_cache[domain]
+        cached_result = self.exclusion_cache.get(domain)
+        if cached_result is not None:
+            return cached_result
         
         # 2. If not in cache, query Redis
         try:
@@ -191,13 +181,7 @@ class PolitenessEnforcer:
             return False  # Default to not excluded on error
         
         # 3. Update cache
-        self.exclusion_cache[domain] = result_bool
-        self.exclusion_cache_order[domain] = None
-        
-        # 4. Enforce cache size limit
-        if len(self.exclusion_cache) > self.exclusion_cache_max_size:
-            oldest_domain, _ = self.exclusion_cache_order.popitem(last=False)
-            del self.exclusion_cache[oldest_domain]
+        self.exclusion_cache.put(domain, result_bool)
         
         return result_bool
     

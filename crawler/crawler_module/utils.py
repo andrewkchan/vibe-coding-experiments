@@ -1,5 +1,7 @@
 from urllib.parse import urlparse, urlunparse, urldefrag
 import tldextract # type: ignore
+from collections import OrderedDict
+from typing import Generic, TypeVar, Optional
 
 def normalize_url(url: str) -> str:
     """Normalize a URL to a canonical form."""
@@ -68,3 +70,85 @@ def extract_domain(url: str) -> str | None:
     except Exception:
         # tldextract can sometimes fail on very malformed inputs
         return None 
+
+K = TypeVar('K')
+V = TypeVar('V')
+
+class LRUCache(Generic[K, V]):
+    """A thread-safe LRU (Least Recently Used) cache implementation.
+    
+    Uses an OrderedDict to maintain insertion order. When the cache reaches
+    its maximum size, the least recently used item is evicted.
+    """
+    
+    def __init__(self, max_size: int):
+        """Initialize the LRU cache with a maximum size.
+        
+        Args:
+            max_size: Maximum number of items to store in the cache.
+        """
+        if max_size <= 0:
+            raise ValueError("max_size must be positive")
+        self.max_size = max_size
+        self._cache: OrderedDict[K, V] = OrderedDict()
+    
+    def get(self, key: K) -> Optional[V]:
+        """Get a value from the cache.
+        
+        If the key exists, it's moved to the end (most recently used).
+        
+        Args:
+            key: The key to look up.
+            
+        Returns:
+            The value if found, None otherwise.
+        """
+        if key not in self._cache:
+            return None
+        
+        # Move to end (mark as recently used)
+        self._cache.move_to_end(key)
+        return self._cache[key]
+    
+    def put(self, key: K, value: V) -> None:
+        """Put a key-value pair in the cache.
+        
+        If the key already exists, it's updated and moved to the end.
+        If the cache is full, the least recently used item is evicted.
+        
+        Args:
+            key: The key to store.
+            value: The value to store.
+        """
+        if key in self._cache:
+            # Update existing key and move to end
+            self._cache.move_to_end(key)
+            self._cache[key] = value
+        else:
+            # Add new key
+            self._cache[key] = value
+            
+            # Evict LRU item if necessary
+            if len(self._cache) > self.max_size:
+                self._cache.popitem(last=False)
+    
+    def __contains__(self, key: K) -> bool:
+        """Check if a key exists in the cache.
+        
+        Note: This doesn't update the access order.
+        
+        Args:
+            key: The key to check.
+            
+        Returns:
+            True if the key exists, False otherwise.
+        """
+        return key in self._cache
+    
+    def __len__(self) -> int:
+        """Get the current number of items in the cache."""
+        return len(self._cache)
+    
+    def clear(self) -> None:
+        """Clear all items from the cache."""
+        self._cache.clear() 
