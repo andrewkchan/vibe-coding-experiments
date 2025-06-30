@@ -933,21 +933,6 @@ class CrawlerOrchestrator:
                     
                     # Analyze FD types
                     await self._analyze_fd_types()
-                    
-                    # Log lightweight memory tracker summary
-                    try:
-                        from .memory_tracker import memory_tracker
-                        memory_tracker.log_summary()
-                        
-                        # Check for potential leaks (objects older than 5 minutes)
-                        old_allocs = memory_tracker.find_potential_leaks(age_threshold=300)
-                        if old_allocs:
-                            logger.warning(f"POTENTIAL MEMORY LEAKS: {len(old_allocs)} allocations older than 5 minutes")
-                            for alloc in old_allocs[:3]:  # Top 3
-                                age = time.time() - alloc.timestamp
-                                logger.warning(f"  - {alloc.size / 1024 / 1024:.1f} MB, age: {age:.1f}s, from: {alloc.location}, URL: {alloc.url}")
-                    except ImportError:
-                        pass  # Memory tracker not available
                 
 
                 if LOG_MEM_DIAGNOSTICS and time.time() - self.last_mem_diagnostics_time >= MEM_DIAGNOSTICS_INTERVAL_SECONDS:
