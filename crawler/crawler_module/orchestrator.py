@@ -24,6 +24,7 @@ from .frontier import FrontierManager
 from .redis_shield import ShieldedRedis
 
 from .utils import extract_domain # For getting domain for storage
+from .memory_diagnostics import memory_diagnostics
 from .metrics import (
     start_metrics_server,
     pages_crawled_counter,
@@ -711,108 +712,6 @@ class CrawlerOrchestrator:
         # This is handled by the orchestrator's main loop watching worker states and frontier count.
         return False
 
-    def log_mem_diagnostics(self):
-        ENABLE_TRACEMALLOC = os.environ.get('ENABLE_TRACEMALLOC', '').lower() == 'true'
-        current_process = psutil.Process(os.getpid())
-        t = time.time()
-        logger.info(f"Logging memory diagnostics to mem_diagnostics/mem_diagnostics_{t}.txt")
-        with open(f'mem_diagnostics/mem_diagnostics_{t}.txt', 'w+') as f:
-            gc.collect()
-            # Tracemalloc analysis if enabled
-            if ENABLE_TRACEMALLOC:
-                import tracemalloc
-                snapshot = tracemalloc.take_snapshot()
-                
-                # Compare with previous snapshot if available
-                if self.tracemalloc_snapshots:
-                    previous = self.tracemalloc_snapshots[-1]
-                    top_stats = snapshot.compare_to(previous, 'lineno')
-                    
-                    f.write("\n=== TRACEMALLOC: Top 10 memory allocation increases ===")
-                    for stat in top_stats[:10]:
-                        if stat.size_diff > 0:
-                            logger.info(f"{stat}")
-                    
-                    # Find allocations of large byte objects
-                    f.write("\n=== TRACEMALLOC: Checking for large allocations ===")
-                    for stat in snapshot.statistics('lineno')[:20]:
-                        # Look for allocations over 10MB
-                        if stat.size > 10 * 1024 * 1024:
-                            f.write(f"\nLARGE ALLOCATION: {stat.size / 1024 / 1024:.1f} MB at {stat}")
-                            # Get traceback for this allocation
-                            for line in stat.traceback.format():
-                                f.write(f"\n  {line}")
-                
-                # Keep only last 5 snapshots to avoid memory growth
-                self.tracemalloc_snapshots.append(snapshot)
-                if len(self.tracemalloc_snapshots) > 5:
-                    self.tracemalloc_snapshots.pop(0)
-                
-                self.last_tracemalloc_time = time.time()
-                
-                # Also get current memory usage
-                current, peak = tracemalloc.get_traced_memory()
-                logger.info(f"TRACEMALLOC: Current traced: {current / 1024 / 1024:.1f} MB, Peak: {peak / 1024 / 1024:.1f} MB")
-            all_objects = muppy.get_objects()
-            sum1 = summary.summarize(all_objects)
-            f.write("\n".join(summary.format_(sum1)))
-            rss_mem_bytes = current_process.memory_info().rss
-            rss_mem_mb = f"{rss_mem_bytes / (1024 * 1024):.2f} MB"
-            f.write(f"\nRSS Memory: {rss_mem_mb}")
-            delta_bytes = rss_mem_bytes - self.last_mem_diagnostics_rss
-            self.last_mem_diagnostics_rss = rss_mem_bytes
-            strings = [obj for obj in all_objects if isinstance(obj, str)]
-            bytes_objects = [obj for obj in all_objects if isinstance(obj, bytes)]
-            # Sample the largest strings
-            strings_by_size = sorted(strings, key=len, reverse=True)
-            f.write("\nTop 5 largest strings:")
-            for i, s in enumerate(strings_by_size[:5]):
-                preview = repr(s[:100]) if len(s) > 100 else repr(s)
-                f.write(f"\n{i+1:2d}. Size: {len(s):,} chars - {preview}")
-                if delta_bytes > 500_000_000:
-                    objgraph.show_backrefs(s, max_depth=4, filename=f'mem_diagnostics/mem_diagnostics_{t}_str_{i+1:2d}.png')
-            bytes_by_size = sorted(bytes_objects, key=len, reverse=True)
-            f.write("\nTop 5 largest bytes objects:")
-            for i, s in enumerate(bytes_by_size[:5]):
-                preview = repr(s[:100]) if len(s) > 100 else repr(s)
-                f.write(f"\n{i+1:2d}. Size: {len(s):,} bytes - {preview}")
-                if delta_bytes > 500_000_000:
-                    objgraph.show_backrefs(s, max_depth=4, filename=f'mem_diagnostics/mem_diagnostics_{t}_bytes_{i+1:2d}.png')
-            if delta_bytes > 100_000_000 and rss_mem_bytes > 1_500_000_000:
-                # Enhanced debugging for memory leak investigation
-                logger.warning(f"MEMORY SPIKE DETECTED! Delta: {delta_bytes/1024/1024:.1f} MB, Total RSS: {rss_mem_bytes/1024/1024:.1f} MB")
-                def trace_refs(obj, depth=3, seen=None):
-                    """Helper to trace reference chain from an object"""
-                    if seen is None:
-                        seen = set()
-                    if id(obj) in seen or depth == 0:
-                        return
-                    seen.add(id(obj))
-                    
-                    refs = gc.get_referrers(obj)
-                    print(f"\n{'  ' * (3-depth)}Object: {type(obj).__name__} at {hex(id(obj))}")
-                    print(f"{'  ' * (3-depth)}Referrers: {len(refs)}")
-                    
-                    for i, ref in enumerate(refs[:3]):  # First 3 refs at each level
-                        ref_type = type(ref).__name__
-                        ref_module = getattr(type(ref), '__module__', 'unknown')
-                        print(f"{'  ' * (3-depth)}  [{i}] {ref_module}.{ref_type}")
-                        
-                        if isinstance(ref, dict) and 'url' in ref:
-                            print(f"{'  ' * (3-depth)}      URL: {ref.get('url')}")
-                        elif hasattr(ref, 'url'):
-                            print(f"{'  ' * (3-depth)}      URL attr: {ref.url}")
-                        
-                        if depth > 1:
-                            trace_refs(ref, depth-1, seen)
-                
-                logger.warning("Entering debugger. Useful variables: largest_bytes, referrers, bytes_by_size, all_objects")
-                logger.warning("Helper function available: trace_refs(obj, depth=3) to trace reference chains")
-                f.close()
-                import pdb; pdb.set_trace()
-        self.last_mem_diagnostics_time = t
-        logger.info(f"Logged memory diagnostics to mem_diagnostics/mem_diagnostics_{t}.txt")
-
     async def run_crawl(self):
         self.start_time = time.time()
         logger.info(f"Crawler starting with config: {self.config}")
@@ -941,7 +840,24 @@ class CrawlerOrchestrator:
                 
 
                 if LOG_MEM_DIAGNOSTICS and time.time() - self.last_mem_diagnostics_time >= MEM_DIAGNOSTICS_INTERVAL_SECONDS:
-                    self.log_mem_diagnostics()
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    rss_mem_bytes = current_process.memory_info().rss
+                    rss_mem_mb = rss_mem_bytes / (1024 * 1024)
+                    report_file = f"mem_diagnostics/memory_report_{timestamp}_{rss_mem_mb:.0f}MB.txt"
+                    try:
+                        # Enhanced memory diagnostics every GC interval
+                        logger.info("[Memory] Generating detailed memory diagnostics...")
+                        report = memory_diagnostics.generate_report(self)
+                        
+                        # Log the report line by line to avoid truncation
+                        for line in report.split('\n'):
+                            logger.info(f"[Memory] {line}")
+                        with open(report_file, 'w') as f:
+                            f.write(report)
+                        logger.warning(f"[Memory] High memory usage detected! Detailed report saved to {report_file}")
+                    except Exception as e:
+                        logger.error(f"[Memory] Failed to save memory report: {e}")
                 
                 if time.time() - self.last_gc_time >= GC_INTERVAL_SECONDS:
                     import pympler
@@ -950,10 +866,6 @@ class CrawlerOrchestrator:
                     if rss_mem_mb > GC_RSS_THRESHOLD_MB:
                         logger.info(f"[GC] Running garbage collection due to memory usage: {rss_mem_mb:.2f} MB")
                         gc.collect()
-                    robots_cache_size_bytes = pympler.asizeof.asizeof(self.politeness.robots_parsers)
-                    robots_cache_size_mb = robots_cache_size_bytes / (1024 * 1024)
-                    logger.info(f"[GC] Approx size of robots in-mem cache: {robots_cache_size_mb:.2f} MB")
-                    logger.info(f"[GC] Items in robots in-mem cache: {len(self.politeness.robots_parsers)}")
                     self.last_gc_time = time.time()
 
                 # TODO: frontier count is very slow with redis right now
