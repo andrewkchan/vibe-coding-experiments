@@ -14,6 +14,7 @@ from multiprocessing import Process
 import redis.asyncio as redis
 from redis.asyncio import BlockingConnectionPool
 import random
+import gc
 
 from .config import CrawlerConfig
 from .storage import StorageManager
@@ -81,6 +82,9 @@ ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
 METRICS_LOG_INTERVAL_SECONDS = 60
 LOG_MEM_DIAGNOSTICS = False
 MEM_DIAGNOSTICS_INTERVAL_SECONDS = 60
+
+GC_INTERVAL_SECONDS = 120
+GC_RSS_THRESHOLD_MB = 4096
 
 # Number of domain shards - hardcoded to 500 to match the database index
 # This is not scalable but we're testing performance with a matching index
@@ -154,6 +158,8 @@ class CrawlerOrchestrator:
         self.mem_tracker = tracker.SummaryTracker()
         self.last_mem_diagnostics_time: float = time.time()
         self.last_mem_diagnostics_rss: int = 0
+
+        self.last_gc_time: float = time.time()
         
         # System metrics tracking for rate calculations
         self.last_io_stats = None
@@ -711,7 +717,6 @@ class CrawlerOrchestrator:
         t = time.time()
         logger.info(f"Logging memory diagnostics to mem_diagnostics/mem_diagnostics_{t}.txt")
         with open(f'mem_diagnostics/mem_diagnostics_{t}.txt', 'w+') as f:
-            import gc
             gc.collect()
             # Tracemalloc analysis if enabled
             if ENABLE_TRACEMALLOC:
@@ -937,6 +942,19 @@ class CrawlerOrchestrator:
 
                 if LOG_MEM_DIAGNOSTICS and time.time() - self.last_mem_diagnostics_time >= MEM_DIAGNOSTICS_INTERVAL_SECONDS:
                     self.log_mem_diagnostics()
+                
+                if time.time() - self.last_gc_time >= GC_INTERVAL_SECONDS:
+                    import pympler
+                    rss_mem_bytes = current_process.memory_info().rss
+                    rss_mem_mb = rss_mem_bytes / (1024 * 1024)
+                    if rss_mem_mb > GC_RSS_THRESHOLD_MB:
+                        logger.info(f"[GC] Running garbage collection due to memory usage: {rss_mem_mb:.2f} MB")
+                        gc.collect()
+                    robots_cache_size_bytes = pympler.asizeof.asizeof(self.politeness.robots_parsers)
+                    robots_cache_size_mb = robots_cache_size_bytes / (1024 * 1024)
+                    logger.info(f"[GC] Approx size of robots in-mem cache: {robots_cache_size_mb:.2f} MB")
+                    logger.info(f"[GC] Items in robots in-mem cache: {len(self.politeness.robots_parsers)}")
+                    self.last_gc_time = time.time()
 
                 # TODO: frontier count is very slow with redis right now
                 estimated_frontier_size = -1

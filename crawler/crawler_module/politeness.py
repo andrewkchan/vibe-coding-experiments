@@ -30,7 +30,7 @@ class PolitenessEnforcer:
         self.config = config
         self.redis = redis_client
         self.fetcher = fetcher
-        self.robots_parsers_max_size = 500_000
+        self.robots_parsers_max_size = 100_000
         self.robots_parsers: dict[str, RobotFileParser] = {}  # In-memory cache for parsed robots.txt
         self.robots_parsers_order: TypingOrderedDict[str, None] = OrderedDict()
         
@@ -120,8 +120,6 @@ class PolitenessEnforcer:
             logger.debug(f"Loaded fresh robots.txt for {domain} from Redis.")
             rfp = RobotFileParser()
             rfp.parse(robots_content.split('\n'))
-            # Store the content for reference
-            rfp._content = robots_content  # type: ignore[attr-defined]
             self.robots_parsers[domain] = rfp
             self.robots_parsers_order[domain] = None
             return rfp
@@ -156,7 +154,6 @@ class PolitenessEnforcer:
         # 5. Parse and update in-memory cache
         rfp = RobotFileParser()
         rfp.parse(fetched_robots_content.split('\n'))
-        rfp._content = fetched_robots_content  # type: ignore[attr-defined]
         self.robots_parsers[domain] = rfp
         self.robots_parsers_order[domain] = None
         
