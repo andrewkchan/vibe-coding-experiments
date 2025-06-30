@@ -49,7 +49,11 @@ services:
       --save 900 1
       --save 300 10
       --save 60 10000
-      --appendonly yes
+      --appendonly no
+      --rdbcompression yes
+      --rdbchecksum yes
+      --dbfilename dump.rdb
+      --stop-writes-on-bgsave-error yes
       --logfile /var/log/redis/redis.log
       --loglevel notice
     healthcheck:

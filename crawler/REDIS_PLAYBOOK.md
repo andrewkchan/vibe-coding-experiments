@@ -22,21 +22,28 @@ docker volume inspect crawler_redis-data
 - **Volume Name**: `crawler_redis-data`
 - **Max Memory**: 24GB
 - **Memory Policy**: `noeviction`
-- **Persistence**: RDB + AOF enabled
+- **Persistence**: RDB only (AOF disabled for simplicity and lower memory usage)
 
 ### Snapshot Schedule
 - **Every 1 minute**: if ≥10,000 keys changed
 - **Every 5 minutes**: if ≥10 keys changed
 - **Every 15 minutes**: if ≥1 key changed
 
+### RDB Configuration
+- **Compression**: Enabled (`rdbcompression yes`)
+- **Checksum**: Enabled (`rdbchecksum yes`)
+- **Stop on Error**: Enabled (`stop-writes-on-bgsave-error yes`)
+- **Filename**: `dump.rdb`
+
 ## Automatic Recovery
 
 ### Normal Startup Behavior
 When Redis starts, it automatically:
-1. Checks for `appendonly.aof` (most recent data)
-2. If AOF exists → loads from AOF
-3. If no AOF → loads from `dump.rdb`
-4. Starts with restored data
+1. Looks for `dump.rdb` in the data directory
+2. Loads the RDB file if it exists
+3. Starts accepting connections with restored data
+
+Note: With AOF disabled, recovery always uses the last successful RDB snapshot.
 
 ### Commands
 ```bash
@@ -66,9 +73,6 @@ docker run --rm -v crawler_redis-data:/data -it alpine sh
 cd /data
 ls -la  # View available .rdb files
 cp your_backup.rdb dump.rdb
-# Forces Redis to load from RDB by deleting the AOF files
-rm appendonly.aof
-rm -rf appendonlydir
 
 # 5. Exit and restart
 exit
@@ -191,8 +195,8 @@ docker exec crawler-redis redis-cli MONITOR
 # Verify RDB file
 docker exec crawler-redis redis-check-rdb /data/dump.rdb
 
-# Verify AOF file
-docker exec crawler-redis redis-check-aof /data/appendonly.aof
+# Check RDB file from outside container
+docker run --rm -v crawler_redis-data:/data --entrypoint redis-check-rdb redis:latest /data/dump.rdb
 ```
 
 ## Common Operations
@@ -244,9 +248,9 @@ docker-compose up -d redis
 docker-compose logs redis
 
 # Common issues:
-# 1. Corrupted AOF - remove it and restart
-# 2. Corrupted RDB - use backup
-# 3. Permission issues - check volume permissions
+# 1. Corrupted RDB - use backup or recovery procedure
+# 2. Permission issues - check volume permissions
+# 3. Wrong Redis version - ensure using redis:latest
 ```
 
 ### High Memory Usage
@@ -287,6 +291,59 @@ docker exec crawler-redis redis-cli EXISTS seen:bloom
 docker exec crawler-redis redis-cli TYPE domains:ready  # Should be "zset"
 docker exec crawler-redis redis-cli ZCARD domains:ready # Check size
 ```
+
+### Recovering from Corrupted RDB Files
+
+When encountering corrupted RDB files (e.g. `temp-*.rdb` from interrupted background saves), you may see errors like:
+- `Unexpected EOF reading RDB file`
+- `Internal error in RDB reading offset X`
+- `Unknown RDB string encoding type`
+
+#### Diagnosis
+```bash
+# Check if RDB file is corrupted
+docker run --rm -v crawler_redis-data:/data --entrypoint redis-check-rdb redis:latest /data/dump.rdb
+
+# Look for error messages showing:
+# - Offset where corruption occurred
+# - Number of keys successfully read before error
+# - The key being read when failure occurred
+```
+
+#### Partial Recovery Process
+If you have a corrupted RDB file but want to recover as much data as possible:
+
+```bash
+# 1. Identify the corruption point
+docker run --rm -v crawler_redis-data:/data --entrypoint redis-check-rdb redis:latest /data/temp-XXXXX.rdb 2>&1 | grep -E "offset|keys read"
+
+# 2. Find the last complete key-value pair before corruption
+# Look at hex dump before the error offset to find structure boundaries
+docker run --rm -v crawler_redis-data:/data alpine sh -c "cd /data && dd if=corrupted.rdb bs=1 skip=$((ERROR_OFFSET-1000)) count=1000 2>/dev/null | od -A x -t x1 -v"
+
+# 3. Truncate file at clean boundary (use head for speed, not dd with bs=1)
+docker run --rm -v crawler_redis-data:/data alpine sh -c "cd /data && head -c TRUNCATE_POSITION corrupted.rdb > recovery.rdb"
+
+# 4. Add proper RDB EOF marker and empty checksum
+docker run --rm -v crawler_redis-data:/data alpine sh -c "cd /data && printf '\xff\x00\x00\x00\x00\x00\x00\x00\x00' >> recovery.rdb"
+
+# 5. Load with checksum validation disabled
+# Note: Must use --appendonly no to prevent AOF from overriding the recovered RDB
+docker run -d --name redis-recovery -v crawler_redis-data:/data -p 6379:6379 redis:latest redis-server --rdbchecksum no --appendonly no
+
+# 6. After successful load, save with proper checksum
+docker exec redis-recovery redis-cli SAVE
+
+# 7. Verify recovery
+docker exec redis-recovery redis-cli INFO keyspace
+```
+
+#### Prevention
+- **Monitor background saves**: Check `rdb_bgsave_in_progress` regularly
+- **Clean up temp files**: Remove old `temp-*.rdb` files after successful saves
+- **Ensure adequate disk space**: Need 2x your dataset size for safe BGSAVE
+- **Set up monitoring**: Alert on `rdb_last_bgsave_status:err` in INFO persistence
+- **Control save timing**: Use manual BGSAVE during low-traffic periods
 
 ## Emergency Contacts & Resources
 

@@ -65,6 +65,17 @@ Host: $(hostname)
 User: $(whoami)
 EOF
 
+# Clean up old temp RDB files (older than 7 days)
+echo -e "\n${YELLOW}Cleaning up old temp RDB files...${NC}"
+docker run --rm -v $VOLUME_NAME:/data alpine \
+    find /data -name "temp-*.rdb" -mtime +7 -delete 2>/dev/null
+TEMP_FILES_CLEANED=$?
+if [ $TEMP_FILES_CLEANED -eq 0 ]; then
+    echo -e "${GREEN}Old temp files cleaned up${NC}"
+else
+    echo -e "${YELLOW}No old temp files found or cleanup skipped${NC}"
+fi
+
 # List backup contents
 echo -e "${GREEN}Backup completed successfully!${NC}"
 echo "Contents:"
