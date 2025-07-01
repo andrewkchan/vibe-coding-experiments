@@ -113,11 +113,11 @@ The project uses `pytest`.
 2.  Navigate to the `crawler/` directory.
 3.  Run pytest:
     ```bash
-    pytest
+    pytest tests/
     ```
     Or, for more verbose output:
     ```bash
-    pytest -v
+    pytest -v tests/
     ```
 
 ## Monitoring

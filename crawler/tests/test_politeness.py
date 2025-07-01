@@ -72,8 +72,7 @@ async def test_get_robots_from_memory_cache(politeness_enforcer: PolitenessEnfor
     """Tests that if a parser is in memory, Redis is not hit."""
     domain = "example.com"
     mock_rfp = MagicMock(spec=RobotFileParser)
-    politeness_enforcer.robots_parsers[domain] = mock_rfp
-    politeness_enforcer.robots_parsers_order[domain] = None # Ensure order dict is also updated
+    politeness_enforcer.robots_parsers.put(domain, mock_rfp)
 
     # Act
     rfp = await politeness_enforcer._get_robots_for_domain(domain)
@@ -91,7 +90,7 @@ async def test_get_robots_from_redis_cache_fresh(politeness_enforcer: Politeness
     future_expiry = int(time.time()) + DEFAULT_ROBOTS_TXT_TTL
 
     # Setup: Ensure not in memory, but Redis will return a fresh record
-    politeness_enforcer.robots_parsers.pop(domain, None)
+    assert domain not in politeness_enforcer.robots_parsers
     
     # Store in Redis
     await politeness_enforcer.redis.hset(f'domain:{domain}', mapping={
@@ -110,7 +109,7 @@ async def test_get_robots_from_redis_cache_fresh(politeness_enforcer: Politeness
     assert rfp.can_fetch(test_config.user_agent, f"http://{domain}/private") is False
     # 3. In-memory cache is now populated
     assert domain in politeness_enforcer.robots_parsers
-    assert politeness_enforcer.robots_parsers[domain] == rfp
+    assert politeness_enforcer.robots_parsers.get(domain) == rfp
 
 @pytest.mark.asyncio
 async def test_get_robots_redis_cache_stale_then_fetch_success(politeness_enforcer: PolitenessEnforcer):
@@ -120,7 +119,7 @@ async def test_get_robots_redis_cache_stale_then_fetch_success(politeness_enforc
     new_robots_text = "User-agent: *\nDisallow: /new"
 
     # Setup: Redis returns a stale record
-    politeness_enforcer.robots_parsers.pop(domain, None)
+    assert domain not in politeness_enforcer.robots_parsers
     await politeness_enforcer.redis.hset(f'domain:{domain}', mapping={
         'robots_txt': 'stale content',
         'robots_expires': str(past_expiry)
@@ -152,7 +151,7 @@ async def test_get_robots_no_cache_fetch_http_success(politeness_enforcer: Polit
     robots_text = "User-agent: *\nAllow: /"
 
     # Setup: No in-memory or Redis cache
-    politeness_enforcer.robots_parsers.pop(domain, None)
+    assert domain not in politeness_enforcer.robots_parsers
     # Mock web fetch
     politeness_enforcer.fetcher.fetch_url.return_value = FetchResult(
         initial_url=f"http://{domain}/robots.txt", final_url=f"http://{domain}/robots.txt",
@@ -176,7 +175,7 @@ async def test_get_robots_http_fail_then_https_success(politeness_enforcer: Poli
     robots_text_https = "User-agent: *\nDisallow: /onlyhttps"
 
     # Setup
-    politeness_enforcer.robots_parsers.pop(domain, None)
+    assert domain not in politeness_enforcer.robots_parsers
     # Mock fetcher to fail on HTTP and succeed on HTTPS
     fetch_result_http = FetchResult(initial_url="...", final_url="...", status_code=500)
     fetch_result_https = FetchResult(
@@ -198,7 +197,7 @@ async def test_get_robots_http_404_https_404(politeness_enforcer: PolitenessEnfo
     """Tests that two 404s result in an empty (allow all) robots rule."""
     domain = "all404.com"
     # Setup
-    politeness_enforcer.robots_parsers.pop(domain, None)
+    assert domain not in politeness_enforcer.robots_parsers
     # Mock fetcher to return 404 for both calls
     fetch_result_404 = FetchResult(initial_url="...", final_url="...", status_code=404)
     politeness_enforcer.fetcher.fetch_url.side_effect = [fetch_result_404, fetch_result_404]
@@ -222,8 +221,7 @@ async def test_is_url_allowed_manually_excluded(politeness_enforcer: PolitenessE
     url = f"http://{domain}/somepage"
     
     # Setup: Prime the manual exclusion cache correctly
-    politeness_enforcer.exclusion_cache[domain] = True
-    politeness_enforcer.exclusion_cache_order[domain] = None
+    politeness_enforcer.exclusion_cache.put(domain, True)
 
     # Act
     is_allowed = await politeness_enforcer.is_url_allowed(url)
@@ -244,8 +242,7 @@ async def test_is_url_allowed_by_robots(politeness_enforcer: PolitenessEnforcer,
     robots_text = "User-agent: TestCrawler\nDisallow: /disallowed"
 
     # Setup: Ensure not manually excluded (prime cache correctly)
-    politeness_enforcer.exclusion_cache[domain] = False
-    politeness_enforcer.exclusion_cache_order[domain] = None
+    politeness_enforcer.exclusion_cache.put(domain, False)
     
     # Create a RobotFileParser and parse the robots.txt
     rfp = RobotFileParser()
@@ -426,8 +423,9 @@ async def test_record_domain_fetch_attempt_existing_domain(politeness_enforcer: 
 @pytest.mark.asyncio
 async def test_exclusion_cache_lru_behavior(politeness_enforcer: PolitenessEnforcer):
     """Test that exclusion cache implements LRU eviction."""
-    # Set a small cache size for testing
-    politeness_enforcer.exclusion_cache_max_size = 3
+    # Create a new cache with a small size for testing
+    from crawler_module.utils import LRUCache
+    politeness_enforcer.exclusion_cache = LRUCache(3)
     
     # Add domains to cache
     domains = ["domain1.com", "domain2.com", "domain3.com", "domain4.com"]
