@@ -141,21 +141,6 @@ process_open_fds_gauge = Gauge(
     registry=registry
 )
 
-# Legacy single-value metrics for backward compatibility
-memory_usage_gauge = Gauge(
-    'crawler_memory_usage_bytes', 
-    'Current memory usage in bytes (deprecated, use crawler_process_memory_usage_bytes)',
-    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
-    registry=registry
-)
-
-open_fds_gauge = Gauge(
-    'crawler_open_fds', 
-    'Number of open file descriptors (deprecated, use crawler_process_open_fds)',
-    multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
-    registry=registry
-)
-
 # FD type breakdown metrics
 fd_redis_gauge = Gauge(
     'crawler_fd_redis_connections',

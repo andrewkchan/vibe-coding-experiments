@@ -47,13 +47,6 @@ def parse_args(sys_args: Optional[List[str]] = None) -> argparse.Namespace:
         default=DEFAULT_FETCHER_WORKERS,
         help=f"Number of concurrent fetcher tasks per fetcher process (default: {DEFAULT_FETCHER_WORKERS})"
     )
-    # Backward compatibility
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        dest="fetcher_workers",
-        help="Deprecated: Use --fetcher-workers instead"
-    )
     parser.add_argument(
         "--parser-workers",
         type=int,

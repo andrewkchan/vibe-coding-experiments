@@ -27,8 +27,6 @@ from .memory_diagnostics import memory_diagnostics
 from .metrics import (
     start_metrics_server,
     frontier_size_gauge,
-    memory_usage_gauge,
-    open_fds_gauge,
     content_size_histogram,
     # System metrics
     cpu_usage_gauge,
