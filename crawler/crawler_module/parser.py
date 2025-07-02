@@ -1,12 +1,11 @@
 import logging
 from dataclasses import dataclass, field
 from typing import List, Set, Optional
-from urllib.parse import urljoin, urlparse
+from .utils import normalize_and_join_url, normalize_url_parts
+from urllib.parse import urlparse
 
 from lxml import html, etree # For parsing HTML
 from lxml.html.clean import Cleaner # For basic text extraction
-
-from .utils import normalize_url, extract_domain # For normalizing and validating URLs
 
 logger = logging.getLogger(__name__)
 
@@ -59,20 +58,13 @@ class PageParser:
         extracted_links: Set[str] = set()
         try:
             # Make sure the base_url is properly set for link resolution
-            doc.make_links_absolute(base_url, resolve_base_href=True)
-            
-            for element, attribute, link, pos in doc.iterlinks():
+            doc.resolve_base_href()
+            base_parsed = normalize_url_parts(urlparse(base_url.strip()))
+            for _, attribute, link, _ in doc.iterlinks():
                 if attribute == 'href':
-                    try:
-                        parsed_link = urlparse(link)
-                        if parsed_link.scheme not in ['http', 'https']:
-                            continue 
-                    except Exception as e:
-                        continue 
-
-                    normalized = normalize_url(link) 
-                    if normalized:
-                        extracted_links.add(normalized)
+                    u = normalize_and_join_url(base_parsed, link.strip())
+                    if u:
+                        extracted_links.add(u)
         except Exception as e:
             logger.error(f"Error during link extraction for {base_url}: {e}")
 

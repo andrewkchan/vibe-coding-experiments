@@ -10,7 +10,7 @@ import shutil
 
 from .config import CrawlerConfig
 from .storage import StorageManager
-from .utils import normalize_url, extract_domain
+from .utils import extract_domain
 from .politeness import PolitenessEnforcer
 from .redis_lock import LockManager
 
@@ -231,19 +231,14 @@ class FrontierManager:
     
     async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
         """Add URLs to frontier files."""
-        # 1. Normalize and pre-filter
+        # 1. Pre-filter
         candidates = set()
         for u in urls:
-            try:
-                normalized = normalize_url(u)
-                if normalized:
-                    # Skip non-text URLs early
-                    if is_likely_non_text_url(normalized):
-                        logger.debug(f"Skipping non-text URL during add: {normalized}")
-                        continue
-                    candidates.add(normalized)
-            except Exception as e:
-                logger.debug(f"Failed to normalize URL {u}: {e}")
+            # Skip non-text URLs early
+            if is_likely_non_text_url(u):
+                logger.debug(f"Skipping non-text URL during add: {u}")
+                continue
+            candidates.add(u)
         
         if not candidates:
             return 0

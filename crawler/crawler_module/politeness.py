@@ -1,15 +1,8 @@
 import logging
 import time
-from pathlib import Path
-from urllib.parse import urljoin
 from urllib.robotparser import RobotFileParser
-from robotexclusionrulesparser import RobotExclusionRulesParser # type: ignore
-import asyncio
-from collections import OrderedDict
-from typing import OrderedDict as TypingOrderedDict # For type hinting
 
 from .config import CrawlerConfig
-from .storage import StorageManager
 from .utils import extract_domain, LRUCache
 from .fetcher import Fetcher, MAX_ROBOTS_LENGTH
 

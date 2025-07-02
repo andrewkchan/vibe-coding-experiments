@@ -1,6 +1,5 @@
 import pytest
-from crawler_module.parser import PageParser, ParseResult
-from crawler_module.utils import normalize_url # For expected link normalization
+from crawler_module.parser import PageParser
 
 @pytest.fixture
 def page_parser() -> PageParser:
@@ -37,12 +36,12 @@ def test_parse_sample_html(page_parser: PageParser):
     assert result.title == "Test Page Title"
     
     expected_links = {
-        normalize_url("http://example.com/path/subpage.html"),
-        normalize_url("http://another.com/abs_link"),
-        normalize_url("http://example.com/another_relative_link"),
-        normalize_url("https://secure.example.com/secure"),
-        normalize_url("http://example.com/path/subpage.html"), # from link with fragment
-        normalize_url("http://example.com/UPPERCASE"),
+        "http://example.com/path/subpage.html",
+        "http://another.com/abs_link",
+        "http://example.com/another_relative_link",
+        "https://secure.example.com/secure",
+        "http://example.com/path/subpage.html", # from link with fragment
+        "http://example.com/UPPERCASE",
     }
     assert result.extracted_links == expected_links
 
@@ -62,7 +61,7 @@ def test_parse_broken_html(page_parser: PageParser):
     # or just http://broken.com/ if malformed.html cannot be resolved or link not found.
     # Based on current parser, it should find it.
     if result.extracted_links:
-        assert normalize_url("http://broken.com/malformed.html") in result.extracted_links
+        assert "http://broken.com/malformed.html" in result.extracted_links
     else:
         pass 
     # The text content should be the original broken HTML string
@@ -99,7 +98,7 @@ def test_base_href_resolution(page_parser: PageParser):
     # The page itself is at page_url, but it declares a different base href
     page_url = "http://actual.com/page.html"
     result = page_parser.parse_html_content(html_with_base_href, page_url)
-    assert result.extracted_links == {normalize_url("http://different.com/basepath/relative.html")}
+    assert result.extracted_links == {"http://different.com/basepath/relative.html"}
 
 def test_no_links(page_parser: PageParser):
     html_no_links = "<html><body><p>Just text.</p></body></html>"
