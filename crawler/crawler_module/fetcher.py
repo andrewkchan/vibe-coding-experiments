@@ -175,6 +175,16 @@ class Fetcher:
                         logger.warning(f"Large page fetched: {content_size:,} bytes ({content_size / 1024 / 1024:.1f} MB) from {actual_final_url}")
                 
                 text_content: Optional[str] = None
+                # TODO: consider handling
+                # - application/xhtml+xml
+                # - application/xml
+                # - application/rss+xml
+                # - application/atom+xml
+                # - application/rdf+xml
+                # - application/rss+xml
+                # - application/pdf
+                # and other common types that may contain meaningful text 
+                # from https://stackoverflow.com/a/48704300/4151721
                 if content_bytes and content_type and content_type.startswith('text/'):
                     # Try to decode using cchardet for speed and accuracy
                     try:
