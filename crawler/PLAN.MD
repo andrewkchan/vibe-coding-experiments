@@ -249,7 +249,7 @@ crawler/
 *   **Python 3.8+**
 *   **`redis`**: For Redis communication with async support.
 *   **`aiohttp`**: For asynchronous HTTP requests.
-*   **`lxml`**: For fast HTML parsing.
+*   **`selectolax`**: For fast HTML parsing.
 *   **`robotexclusionrulesparser`**: For `robots.txt` parsing.
 *   **`aiofiles`**: For asynchronous file I/O.
 *   **`prometheus_client`**: For exposing metrics (with multiprocess support).

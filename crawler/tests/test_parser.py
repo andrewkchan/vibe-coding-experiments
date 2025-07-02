@@ -55,8 +55,6 @@ def test_parse_broken_html(page_parser: PageParser):
     base_url = "http://broken.com/"
     result = page_parser.parse_html_content(broken_html, base_url)
 
-    # lxml is quite robust and might still parse this.
-    # Check what it extracts.
     # Expected: http://broken.com/malformed.html (if base URL is applied before error)
     # or just http://broken.com/ if malformed.html cannot be resolved or link not found.
     # Based on current parser, it should find it.
