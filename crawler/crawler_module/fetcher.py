@@ -7,7 +7,6 @@ from typing import Optional
 import aiohttp
 from aiohttp import TraceConfig
 import time
-import cchardet # For fast character encoding detection
 
 from .config import CrawlerConfig
 from .metrics import fetch_counter, fetch_error_counter, fetch_timing_histogram, content_size_histogram
