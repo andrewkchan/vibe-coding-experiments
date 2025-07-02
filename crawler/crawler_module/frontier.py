@@ -12,7 +12,7 @@ from .config import CrawlerConfig
 from .storage import StorageManager
 from .utils import extract_domain
 from .politeness import PolitenessEnforcer
-from .redis_lock import LockManager
+from .redis_lock import LockManager, DomainLock
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,8 @@ class FrontierManager:
         self.lock_manager = LockManager(redis_client)
         # Process-local locks for reading - no need for Redis round-trips
         self._read_locks: Dict[str, asyncio.Lock] = {}
+        # Process-local write locks (only used if num_parser_processes == 1)
+        self._write_locks: Dict[str, asyncio.Lock] = {}
         self._shard_count: Optional[int] = None  # Cached shard count
         
     def _get_frontier_path(self, domain: str) -> Path:
@@ -90,6 +92,16 @@ class FrontierManager:
         # Note: In a long-running crawler with millions of domains, this dict could grow large.
         # Consider implementing an LRU cache or periodic cleanup if memory becomes an issue.
         return self._read_locks[domain]
+
+    def _get_write_lock(self, domain: str) -> asyncio.Lock | DomainLock:
+        """Get process-local write lock for domain."""
+        if self.config.num_parser_processes > 1:
+            # Use Redis-based lock for cross-process safety
+            domain_lock = self.lock_manager.get_domain_write_lock(domain)
+            return domain_lock
+        if domain not in self._write_locks:
+            self._write_locks[domain] = asyncio.Lock()
+        return self._write_locks[domain]
     
     async def _get_shard_count(self) -> int:
         """Get the total number of shards."""
@@ -289,8 +301,7 @@ class FrontierManager:
     
     async def _add_urls_to_domain(self, domain: str, urls: List[Tuple[str, int]]) -> int:
         """Add URLs to a specific domain's frontier file."""
-        # Use Redis-based lock for cross-process safety
-        domain_lock = self.lock_manager.get_domain_write_lock(domain)
+        domain_lock = self._get_write_lock(domain)
         
         try:
             async with domain_lock:
