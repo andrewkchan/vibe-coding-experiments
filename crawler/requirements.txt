@@ -9,7 +9,4 @@ pytest
 pytest-asyncio
 httpx
 redis>=4.5.0
-
-# Optional dependencies for PostgreSQL support
-# Uncomment the following line to install PostgreSQL driver:
-psycopg[binary,pool]>=3.1 
+pympler

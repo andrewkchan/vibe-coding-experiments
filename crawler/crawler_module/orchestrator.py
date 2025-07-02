@@ -6,8 +6,7 @@ from typing import Optional, List
 import os # For process ID
 import psutil
 import functools
-from pympler import tracker, muppy, summary
-import objgraph
+from pympler import muppy, summary
 from multiprocessing import Process
 import redis.asyncio as redis
 from redis.asyncio import BlockingConnectionPool
