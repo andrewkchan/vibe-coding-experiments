@@ -186,9 +186,7 @@ class Fetcher:
                 # and other common types that may contain meaningful text 
                 # from https://stackoverflow.com/a/48704300/4151721
                 if content_bytes and content_type and content_type.startswith('text/'):
-                    # Try to decode using cchardet for speed and accuracy
                     try:
-                        # Fallback to aiohttp's guessed encoding or utf-8
                         text_content = await response.text(errors='replace') # response.text() re-reads if not careful
                     except (UnicodeDecodeError, LookupError, TypeError) as e:
                         logger.warning(f"Encoding detection/decoding error for {actual_final_url}: {e}. Falling back.")
