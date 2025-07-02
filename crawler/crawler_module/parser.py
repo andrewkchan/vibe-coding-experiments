@@ -4,7 +4,7 @@ from typing import List, Set, Optional
 from .utils import normalize_and_join_url, normalize_url_parts
 from urllib.parse import urlparse
 
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class PageParser:
             return ParseResult()
 
         try:
-            tree = HTMLParser(html_string)
+            tree = LexborHTMLParser(html_string)
         except Exception as e:
             logger.error(f"Error parsing HTML for {base_url}: {e}. Content preview: {html_string[:200]}")
             return ParseResult()
