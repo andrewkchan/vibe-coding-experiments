@@ -4,8 +4,7 @@ from typing import List, Set, Optional
 from .utils import normalize_and_join_url, normalize_url_parts
 from urllib.parse import urlparse
 
-from lxml import html, etree # For parsing HTML
-from lxml.html.clean import Cleaner # For basic text extraction
+from selectolax.parser import HTMLParser
 
 logger = logging.getLogger(__name__)
 
@@ -17,22 +16,7 @@ class ParseResult:
 
 class PageParser:
     def __init__(self):
-        # Initialize a cleaner object. Configure as needed.
-        self.cleaner = Cleaner(
-            scripts=True, # Remove script tags
-            javascript=True, # Remove inline JS
-            comments=True, # Remove comments
-            style=True, # Remove style tags and attributes
-            links=False, # Keep <link> tags if they might be useful, e.g. canonical, but usually for crawler, no
-            meta=False, # Keep <meta> tags for now, could remove if noisy
-            page_structure=False, # Keep page structure (divs, p, etc.)
-            processing_instructions=True, # Remove PIs
-            frames=True, # Remove frames
-            forms=False, # Keep forms if their text content is desired, else True
-            annoying_tags=True, # Remove blink, marquee
-            remove_unknown_tags=False, # Keep unknown tags
-            safe_attrs_only=False, # Keep all attributes for now
-        )
+        pass
 
     def parse_html_content(
         self, 
@@ -45,24 +29,42 @@ class PageParser:
             return ParseResult()
 
         try:
-            # Use lxml.html.fromstring which is more robust for potentially broken HTML
-            doc = html.fromstring(html_string)
-        except etree.ParserError as e:
-            logger.error(f"lxml ParserError for {base_url}: {e}. Content preview: {html_string[:200]}")
-            return ParseResult() # Return empty result on severe parsing error
+            tree = HTMLParser(html_string)
         except Exception as e:
-            logger.error(f"Unexpected error parsing HTML for {base_url}: {e}. Content preview: {html_string[:200]}")
+            logger.error(f"Error parsing HTML for {base_url}: {e}. Content preview: {html_string[:200]}")
             return ParseResult()
+
+        # Check for base href in the document
+        effective_base_url = base_url
+        try:
+            base_tags = tree.css('base[href]')
+            if base_tags:
+                base_href = base_tags[0].attributes.get('href')
+                if base_href:
+                    # If base href is absolute, use it directly
+                    # Otherwise, resolve it relative to the document URL
+                    if base_href.startswith(('http://', 'https://', '//')):
+                        effective_base_url = base_href
+                    else:
+                        # Resolve relative base href against document URL
+                        base_parsed = normalize_url_parts(urlparse(base_url.strip()))
+                        resolved_base = normalize_and_join_url(base_parsed, base_href)
+                        if resolved_base:
+                            effective_base_url = resolved_base
+        except Exception as e:
+            logger.warning(f"Error processing base href for {base_url}: {e}")
 
         # 1. Extract and resolve links
         extracted_links: Set[str] = set()
         try:
-            # Make sure the base_url is properly set for link resolution
-            doc.resolve_base_href()
-            base_parsed = normalize_url_parts(urlparse(base_url.strip()))
-            for _, attribute, link, _ in doc.iterlinks():
-                if attribute == 'href':
-                    u = normalize_and_join_url(base_parsed, link.strip())
+            # Don't normalize the effective_base_url to preserve trailing slashes
+            base_parsed = urlparse(effective_base_url.strip())
+            
+            # In selectolax, we use css() to find all anchor tags
+            for link_tag in tree.css('a'):
+                href = link_tag.attributes.get('href')
+                if href:
+                    u = normalize_and_join_url(base_parsed, href.strip())
                     if u:
                         extracted_links.add(u)
         except Exception as e:
@@ -76,9 +78,11 @@ class PageParser:
         # 3. Extract title
         title: Optional[str] = None
         try:
-            title_element = doc.find('.//title')
-            if title_element is not None and title_element.text:
-                title = title_element.text.strip()
+            title_tags = tree.css('title')
+            if title_tags and len(title_tags) > 0:
+                title_text = title_tags[0].text(strip=True)
+                if title_text:
+                    title = title_text
         except Exception as e:
             logger.warning(f"Error extracting title for {base_url}: {e}")
 
