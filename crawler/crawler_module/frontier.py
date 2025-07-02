@@ -72,6 +72,7 @@ class FrontierManager:
         self.lock_manager = LockManager(redis_client)
         # Process-local locks for reading - no need for Redis round-trips
         self._read_locks: Dict[str, asyncio.Lock] = {}
+        self._shard_count: Optional[int] = None  # Cached shard count
         
     def _get_frontier_path(self, domain: str) -> Path:
         """Get file path for domain's frontier."""
@@ -90,8 +91,32 @@ class FrontierManager:
         # Consider implementing an LRU cache or periodic cleanup if memory becomes an issue.
         return self._read_locks[domain]
     
+    async def _get_shard_count(self) -> int:
+        """Get the total number of shards."""
+        if self._shard_count is None:
+            count = await self.redis.get('crawler:shard_count')
+            self._shard_count = int(count) if count else 1
+        return self._shard_count
+    
+    def _get_domain_shard(self, domain: str) -> int:
+        """Get the shard number for a domain using simple modulo hashing.
+        
+        With 1 shard per fetcher, shard assignment is straightforward:
+        fetcher 0 handles shard 0, fetcher 1 handles shard 1, etc.
+        """
+        # Use MD5 hash for consistent hashing across processes
+        # Python's built-in hash() is not consistent across runs/processes
+        domain_hash = hashlib.md5(domain.encode()).digest()
+        # Convert first 8 bytes to integer for modulo operation
+        hash_int = int.from_bytes(domain_hash[:8], byteorder='big')
+        return hash_int % (self._shard_count or 1)
+    
     async def initialize_frontier(self):
         """Initialize the frontier, loading seeds or resuming from existing data."""
+        # Load shard count
+        await self._get_shard_count()
+        logger.info(f"Frontier using {self._shard_count} shard(s)")
+        
         # Initialize bloom filter if it doesn't exist
         try:
             # Try to get bloom filter info - will fail if it doesn't exist
@@ -135,6 +160,12 @@ class FrontierManager:
             if cursor == 0:
                 break
         
+        # Clear all sharded queues
+        shard_count = await self._get_shard_count()
+        for shard in range(shard_count):
+            pipe.delete(f'domains:queue:{shard}')
+        
+        # Also clear old single queue if it exists
         pipe.delete('domains:queue')
         await pipe.execute()
         
@@ -174,8 +205,8 @@ class FrontierManager:
                     logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
                 return added_count
             seed_tasks = []
-            chunk_size = (len(urls) + self.config.max_workers - 1) // self.config.max_workers
-            for i in range(self.config.max_workers):
+            chunk_size = (len(urls) + self.config.fetcher_workers - 1) // self.config.fetcher_workers
+            for i in range(self.config.fetcher_workers):
                 url_chunk = urls[i*chunk_size:(i+1)*chunk_size]
                 seed_tasks.append(add_urls_batch_worker(i, url_chunk))
             added_counts = await asyncio.gather(*seed_tasks)
@@ -314,9 +345,10 @@ class FrontierManager:
                 # Initialize offset if needed (0 bytes)
                 pipe.hsetnx(domain_key, 'frontier_offset', '0')
                 
-                # Add domain to queue
+                # Add domain to the correct shard queue
                 # Note: This might add duplicates, but we handle that when popping
-                pipe.rpush('domains:queue', domain)
+                shard = self._get_domain_shard(domain)
+                pipe.rpush(f'domains:queue:{shard}', domain)
                 
                 await pipe.execute()
                 
@@ -331,9 +363,17 @@ class FrontierManager:
     
     async def is_empty(self) -> bool:
         """Check if frontier is empty."""
-        # Check if there are any domains in the queue
-        count = await self.redis.llen('domains:queue')  # type: ignore[misc]
-        return count == 0
+        # Check if there are any domains in any shard queue
+        shard_count = await self._get_shard_count()
+        
+        pipe = self.redis.pipeline()
+        for shard in range(shard_count):
+            pipe.llen(f'domains:queue:{shard}')
+        
+        counts = await pipe.execute()
+        total_count = sum(counts)
+        
+        return total_count == 0
     
     async def count_frontier(self) -> int:
         """Estimate the number of URLs in the frontier."""
@@ -373,17 +413,28 @@ class FrontierManager:
                     
         return total
     
-    async def get_next_url(self, worker_id: int = 0, total_workers: int = 1) -> Optional[Tuple[str, str, int, int]]:
+    async def get_next_url(self, fetcher_id: int = 0) -> Optional[Tuple[str, str, int, int]]:
         """Get next URL to crawl.
+        
+        Args:
+            fetcher_id: ID of this fetcher process (0-based), which directly maps to shard number
         
         Returns None if no URLs are available OR if politeness rules prevent fetching.
         The caller is responsible for retrying.
         """
-        # Atomically pop a domain from the front of the queue
-        domain = await self.redis.lpop('domains:queue')  # type: ignore[misc]
+        # With 1 shard per fetcher, this fetcher only handles its own shard
+        shard = fetcher_id
+        
+        # Verify shard exists (in case of misconfiguration)
+        shard_count = await self._get_shard_count()
+        if shard >= shard_count:
+            logger.error(f"Fetcher {fetcher_id} has no shard to handle (only {shard_count} shards exist)")
+            return None
+        # Atomically pop a domain from the front of the shard queue
+        domain = await self.redis.lpop(f'domains:queue:{shard}')  # type: ignore[misc]
         
         if not domain:
-            return None  # Queue is empty
+            return None  # This shard is empty
         
         try:
             # Check if we can fetch from this domain now
@@ -410,8 +461,9 @@ class FrontierManager:
                 # Return URL with a dummy ID (for interface compatibility)
                 return (url, domain, -1, depth)
         finally:
-            # Domain always goes back to the end of the queue, regardless of success or failure
-            await self.redis.rpush('domains:queue', domain)  # type: ignore[misc]
+            # Domain always goes back to the end of the same shard queue
+            if domain:  # Only push back if we actually got a domain
+                await self.redis.rpush(f'domains:queue:{shard}', domain)  # type: ignore[misc]
         
         return None
     

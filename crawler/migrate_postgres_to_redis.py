@@ -222,7 +222,10 @@ async def main():
         data_dir=Path("./crawler_data"),
         seed_file=Path("./seeds.txt"),  # Not used in migration
         exclude_file=None,
-        max_workers=100,
+        fetcher_workers=1,
+        parser_workers=1,
+        num_fetcher_processes=1,
+        num_parser_processes=1,
         max_pages=None,
         max_duration=None,
         user_agent="MigrationCrawler/1.0",

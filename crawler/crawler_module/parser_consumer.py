@@ -7,14 +7,14 @@ import logging
 import pickle
 import time
 from typing import Optional, Dict, Any, Set
-from pathlib import Path
 import signal
-import sys
+import os
+import psutil
 
 import redis.asyncio as redis
 from redis.asyncio import BlockingConnectionPool
 
-from .config import CrawlerConfig, parse_args
+from .config import CrawlerConfig
 from .parser import PageParser
 from .storage import StorageManager
 from .frontier import FrontierManager
@@ -28,7 +28,9 @@ from .metrics import (
     parse_processed_counter,
     parse_errors_counter,
     active_parser_workers_gauge,
-    parser_pages_per_second_gauge
+    parser_pages_per_second_gauge,
+    process_memory_usage_gauge,
+    process_open_fds_gauge,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,7 +76,12 @@ class ParserConsumer:
         self.pages_parsed_count: int = 0
         self.pages_parsed_in_interval: int = 0
         self.last_metrics_log_time: float = time.time()
+        self.last_metrics_update_time: float = time.time()  # For 5-second updates
         self.start_time: float = 0.0
+        
+        # Process monitoring
+        self.process = psutil.Process(os.getpid())
+        self.process_id = os.getpid()  # Save PID for consistent labeling
         
     def _setup_signal_handlers(self):
         """Setup graceful shutdown on SIGINT/SIGTERM."""
@@ -92,32 +99,48 @@ class ParserConsumer:
             pass
     
     async def _log_metrics(self):
-        """Log parsing metrics similar to orchestrator."""
+        """Log parsing metrics and update Prometheus gauges."""
         current_time = time.time()
-        time_elapsed_seconds = current_time - self.last_metrics_log_time
-        if time_elapsed_seconds == 0: 
-            time_elapsed_seconds = 1  # Avoid division by zero
-
-        pages_per_second = self.pages_parsed_in_interval / time_elapsed_seconds
-        logger.info(f"[Parser Metrics] Pages Parsed/sec: {pages_per_second:.2f}")
+        time_elapsed = current_time - self.last_metrics_update_time
         
-        # Update Prometheus gauge
-        parser_pages_per_second_gauge.set(pages_per_second)
-        
-        # Additional parser-specific metrics
-        queue_size = await self.redis_client.llen('fetch:queue')
-        active_workers = sum(1 for task in self.worker_tasks if not task.done())
-        
-        logger.info(f"[Parser Metrics] Queue size: {queue_size}, Active workers: {active_workers}/{self.num_workers}")
-        
-        # Log cumulative stats
-        total_runtime = current_time - self.start_time
-        overall_rate = self.pages_parsed_count / total_runtime if total_runtime > 0 else 0
-        logger.info(f"[Parser Metrics] Total parsed: {self.pages_parsed_count}, Overall rate: {overall_rate:.2f}/sec, Runtime: {total_runtime:.0f}s")
-        
-        # Reset interval counter
-        self.pages_parsed_in_interval = 0
-        self.last_metrics_log_time = current_time
+        if time_elapsed >= 5.0:
+            # Calculate pages per second
+            pages_per_second = self.pages_parsed_in_interval / time_elapsed if time_elapsed > 0 else 0
+            parser_pages_per_second_gauge.set(pages_per_second)
+            
+            # Update resource metrics
+            try:
+                memory_usage = self.process.memory_info().rss
+                process_memory_usage_gauge.labels(
+                    process_type='parser',
+                    process_id=str(self.process_id)
+                ).set(memory_usage)
+                
+                open_fds = self.process.num_fds()
+                process_open_fds_gauge.labels(
+                    process_type='parser',
+                    process_id=str(self.process_id)
+                ).set(open_fds)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass  # Process might be shutting down
+            
+            # Get current metrics for logging
+            queue_size = await self.redis_client.llen('fetch:queue')
+            active_workers = sum(1 for task in self.worker_tasks if not task.done())
+            
+            # Log metrics
+            logger.info(f"[Parser Metrics] Pages/sec: {pages_per_second:.2f}, Queue: {queue_size}, Active workers: {active_workers}/{self.num_workers}")
+            
+            # Log cumulative stats periodically (every 60 seconds)
+            if current_time - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
+                total_runtime = current_time - self.start_time
+                overall_rate = self.pages_parsed_count / total_runtime if total_runtime > 0 else 0
+                logger.info(f"[Parser Metrics] Total parsed: {self.pages_parsed_count}, Overall rate: {overall_rate:.2f}/sec, Runtime: {total_runtime:.0f}s")
+                self.last_metrics_log_time = current_time
+            
+            # Reset counter and update time
+            self.pages_parsed_in_interval = 0
+            self.last_metrics_update_time = current_time
     
     async def _process_item(self, item_data: Dict[str, Any]) -> None:
         """Process a single item from the queue."""
@@ -264,9 +287,8 @@ class ParserConsumer:
             
             # Monitor queue size and log metrics periodically
             while not self._shutdown_event.is_set():
-                # Check if it's time to log metrics
-                if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
-                    await self._log_metrics()
+                # Update metrics (both Prometheus and logging)
+                await self._log_metrics()
                 
                 # Update real-time metrics
                 queue_size = await self.redis_client.llen('fetch:queue')
@@ -321,7 +343,7 @@ async def main():
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    config = parse_args()
+    config = CrawlerConfig.from_args()
     
     # When run standalone, assume the developer has initialized Redis properly
     logger.info("Starting standalone parser consumer (assuming Redis is initialized)")

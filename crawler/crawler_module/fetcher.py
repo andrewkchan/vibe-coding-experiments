@@ -86,7 +86,7 @@ class Fetcher:
         if self.session is None or self.session.closed:
             # Create a connector with conservative limits for high worker count
             # With 500 workers, we need to be careful about file descriptors
-            max_total_connections = min(1000, self.config.max_workers * 2)  # Scale with workers
+            max_total_connections = min(1000, self.config.fetcher_workers * 2)  # Scale with workers
             max_per_host = max(5, min(20, max_total_connections // 50))  # Conservative per-host limit
             
             # Create SSL context that doesn't verify certificates (similar to curl -k)

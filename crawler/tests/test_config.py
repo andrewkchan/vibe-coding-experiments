@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 import pytest
-from crawler_module.config import CrawlerConfig, DEFAULT_DATA_DIR, DEFAULT_MAX_WORKERS, DEFAULT_LOG_LEVEL
+from crawler_module.config import CrawlerConfig, DEFAULT_DATA_DIR, DEFAULT_FETCHER_WORKERS, DEFAULT_LOG_LEVEL
 
 def test_config_from_args_required(monkeypatch):
     """Test that CrawlerConfig can be created with only the required arguments."""
@@ -23,7 +23,7 @@ def test_config_from_args_required(monkeypatch):
     assert config.seed_file == Path(test_seed_file)
     assert config.email == test_email
     assert config.data_dir == Path(DEFAULT_DATA_DIR)
-    assert config.max_workers == DEFAULT_MAX_WORKERS
+    assert config.fetcher_workers == DEFAULT_FETCHER_WORKERS
     assert config.log_level == DEFAULT_LOG_LEVEL.upper()
     assert config.user_agent == f"MyEducationalCrawler/1.0 (mailto:{test_email})"
     
@@ -35,7 +35,7 @@ def test_config_from_args_all(monkeypatch):
     test_email = "all_args@example.com"
     test_data_dir = "./custom_data"
     test_exclude_file = "excludes.txt"
-    test_max_workers = "100"
+    test_fetcher_workers = "100"
     test_max_pages = "1000"
     test_max_duration = "3600"
     test_log_level = "DEBUG"
@@ -51,7 +51,7 @@ def test_config_from_args_all(monkeypatch):
         '--email', test_email,
         '--data-dir', test_data_dir,
         '--exclude-file', test_exclude_file,
-        '--max-workers', test_max_workers,
+        '--fetcher-workers', test_fetcher_workers,
         '--max-pages', test_max_pages,
         '--max-duration', test_max_duration,
         '--log-level', test_log_level,
@@ -64,7 +64,7 @@ def test_config_from_args_all(monkeypatch):
     assert config.email == test_email
     assert config.data_dir == Path(test_data_dir)
     assert config.exclude_file == Path(test_exclude_file)
-    assert config.max_workers == int(test_max_workers)
+    assert config.fetcher_workers == int(test_fetcher_workers)
     assert config.max_pages == int(test_max_pages)
     assert config.max_duration == int(test_max_duration)
     assert config.log_level == test_log_level.upper()

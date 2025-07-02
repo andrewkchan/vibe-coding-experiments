@@ -33,7 +33,10 @@ def test_config(tmp_path: Path) -> CrawlerConfig:
     return CrawlerConfig(
         seed_file=seed_file,
         data_dir=data_dir,
-        max_workers=1, # Keep low for tests unless testing concurrency
+        fetcher_workers=1,
+        parser_workers=1,
+        num_fetcher_processes=1,
+        num_parser_processes=1,
         log_level="DEBUG",
         user_agent="TestCrawler/1.0",
         max_pages=10,

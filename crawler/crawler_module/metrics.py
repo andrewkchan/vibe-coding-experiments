@@ -79,9 +79,12 @@ parse_errors_counter = Counter(
 # For gauges in multiprocess mode, we need to specify the multiprocess_mode
 # 'livesum' means the gauge shows the sum of all process values
 # Other options: 'liveall' (show all values), 'min', 'max'
-pages_per_second_gauge = Gauge(
-    'crawler_pages_per_second', 
-    'Pages crawled per second (recent rate)',
+
+# Rate gauges - these will be set per process and summed
+fetcher_pages_per_second_gauge = Gauge(
+    'crawler_fetcher_pages_per_second', 
+    'Pages fetched per second per fetcher process',
+    ['fetcher_id'],
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
@@ -121,16 +124,34 @@ parse_queue_size_gauge = Gauge(
     registry=registry
 )
 
+# Per-process resource metrics with labels
+process_memory_usage_gauge = Gauge(
+    'crawler_process_memory_usage_bytes', 
+    'Memory usage by process type',
+    ['process_type', 'process_id'],  # e.g., ('fetcher', '0'), ('parser', '1')
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+process_open_fds_gauge = Gauge(
+    'crawler_process_open_fds', 
+    'Open file descriptors by process type',
+    ['process_type', 'process_id'],
+    multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
+    registry=registry
+)
+
+# Legacy single-value metrics for backward compatibility
 memory_usage_gauge = Gauge(
     'crawler_memory_usage_bytes', 
-    'Current memory usage in bytes',
+    'Current memory usage in bytes (deprecated, use crawler_process_memory_usage_bytes)',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
 
 open_fds_gauge = Gauge(
     'crawler_open_fds', 
-    'Number of open file descriptors',
+    'Number of open file descriptors (deprecated, use crawler_process_open_fds)',
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )

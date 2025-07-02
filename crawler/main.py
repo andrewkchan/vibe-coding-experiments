@@ -60,8 +60,10 @@ async def main():
     logger.info(f"Logging reconfigured to level: {config.log_level}")
     logger.info("Starting crawler...")
 
-    if 3*config.max_workers > resource.getrlimit(resource.RLIMIT_OFILE)[0]:
-        raise ValueError(f"3x Max workers (3x{config.max_workers}) exceeds the number of open files limit ({resource.getrlimit(resource.RLIMIT_OFILE)[0]}). Suggest increasing the limit with 'ulimit -n <new_limit>'.")
+    # Account for multiple fetcher processes when checking file descriptor limits
+    total_workers = config.fetcher_workers * config.num_fetcher_processes
+    if 3*total_workers > resource.getrlimit(resource.RLIMIT_OFILE)[0]:
+        raise ValueError(f"3x Total workers (3x{total_workers}) exceeds the number of open files limit ({resource.getrlimit(resource.RLIMIT_OFILE)[0]}). Suggest increasing the limit with 'ulimit -n <new_limit>'.")
 
     orchestrator = CrawlerOrchestrator(config)
 

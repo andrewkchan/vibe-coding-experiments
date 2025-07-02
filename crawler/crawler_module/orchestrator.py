@@ -1,45 +1,34 @@
 import asyncio
 import logging
 import time
-import pickle
 from pathlib import Path
-from typing import Set, Optional, Dict, List, Union
+from typing import Optional, List
 import os # For process ID
 import psutil
-from collections import defaultdict
 import functools
 from pympler import tracker, muppy, summary
 import objgraph
 from multiprocessing import Process
 import redis.asyncio as redis
 from redis.asyncio import BlockingConnectionPool
-import random
 import gc
+import hashlib
 
 from .config import CrawlerConfig
+from .redis_shield import ShieldedRedis
+from .fetcher_process import FetcherProcess, run_fetcher_process
+from .parser_consumer import ParserConsumer
+from .redis_lock import LockManager
 from .storage import StorageManager
-from .fetcher import Fetcher, FetchResult
+from .fetcher import Fetcher
 from .politeness import PolitenessEnforcer
 from .frontier import FrontierManager
-from .redis_shield import ShieldedRedis
-
-from .utils import extract_domain # For getting domain for storage
 from .memory_diagnostics import memory_diagnostics
 from .metrics import (
     start_metrics_server,
-    pages_crawled_counter,
-    urls_added_counter,
-    errors_counter,
-    backpressure_events_counter,
-    pages_per_second_gauge,
     frontier_size_gauge,
-    active_workers_gauge,
     memory_usage_gauge,
     open_fds_gauge,
-    db_pool_available_gauge,
-    fetch_duration_histogram,
-    db_connection_acquire_histogram,
-    db_query_duration_histogram,
     content_size_histogram,
     # System metrics
     cpu_usage_gauge,
@@ -60,7 +49,6 @@ from .metrics import (
     redis_memory_usage_gauge,
     redis_connected_clients_gauge,
     redis_hit_rate_gauge,
-    redis_latency_histogram,
     # FD type metrics
     fd_redis_gauge,
     fd_http_gauge,
@@ -69,7 +57,9 @@ from .metrics import (
     fd_prometheus_gauge,
     fd_other_sockets_gauge,
     fd_pipes_gauge,
-    fd_other_gauge
+    fd_other_gauge,
+    process_memory_usage_gauge,
+    process_open_fds_gauge
 )
 
 logger = logging.getLogger(__name__)
@@ -87,9 +77,6 @@ MEM_DIAGNOSTICS_INTERVAL_SECONDS = 60
 GC_INTERVAL_SECONDS = 120
 GC_RSS_THRESHOLD_MB = 4096
 
-# Number of domain shards - hardcoded to 500 to match the database index
-# This is not scalable but we're testing performance with a matching index
-DOMAIN_SHARD_COUNT = 500
 
 class CrawlerOrchestrator:
     def __init__(self, config: CrawlerConfig):
@@ -109,10 +96,7 @@ class CrawlerOrchestrator:
         os.environ['PROMETHEUS_PARENT_PROCESS'] = str(os.getpid())
         logger.info(f"Set PROMETHEUS_PARENT_PROCESS to {os.getpid()}")
 
-        # Initialize fetcher (common to all backends)
-        self.fetcher: Fetcher = Fetcher(config)
-        
-        # Initialize Redis client with BlockingConnectionPool to prevent "Too many connections" errors
+        # Initialize Redis client (only for orchestrator tasks like resharding)
         redis_kwargs = config.get_redis_connection_kwargs()
         # Create a blocking connection pool for text data
         text_pool = BlockingConnectionPool(**redis_kwargs)
@@ -138,25 +122,13 @@ class CrawlerOrchestrator:
         )
         # Wrap with ShieldedRedis to prevent connection leaks
         self.redis_client_binary = ShieldedRedis(base_redis_client_binary)
-        
-        # Use Redis-based components
-        self.storage: StorageManager = StorageManager(config, self.redis_client) # type: ignore
-        self.politeness: PolitenessEnforcer = PolitenessEnforcer(config, self.redis_client, self.fetcher)
-        self.frontier: FrontierManager = FrontierManager(
-            config, 
-            self.politeness,
-            self.redis_client # type: ignore
-        )
 
         self.pages_crawled_count: int = 0
         self.start_time: float = 0.0
-        self.worker_tasks: Set[asyncio.Task] = set()
         self._shutdown_event: asyncio.Event = asyncio.Event()
         self.total_urls_added_to_frontier: int = 0
 
-        self.pages_crawled_in_interval: int = 0
         self.last_metrics_log_time: float = time.time()
-        self.mem_tracker = tracker.SummaryTracker()
         self.last_mem_diagnostics_time: float = time.time()
         self.last_mem_diagnostics_rss: int = 0
 
@@ -168,10 +140,11 @@ class CrawlerOrchestrator:
         self.last_redis_stats = None
         self.last_redis_stats_time = None
         
-        # Parser process management
+        # Process management
         self.parser_process: Optional[Process] = None
         self.parser_processes: List[Process] = []  # Support multiple parsers
-        self.num_parser_processes = 2
+        self.fetcher_processes: List[Process] = []  # Additional fetcher processes (1+)
+        self.local_fetcher: Optional[FetcherProcess] = None  # Orchestrator's own fetcher (fetcher 0)
         
         # Backpressure configuration
         self.fetch_queue_soft_limit = 20000  # Start slowing down at this size
@@ -185,7 +158,6 @@ class CrawlerOrchestrator:
             # Import inside the function to avoid issues with multiprocessing
             import asyncio
             import logging
-            from .parser_consumer import ParserConsumer
             
             # Setup logging for the child process
             logging.basicConfig(
@@ -205,7 +177,7 @@ class CrawlerOrchestrator:
     
     def _start_parser_processes(self, num_processes: Optional[int] = None):
         """Start multiple parser consumer processes."""
-        num_processes = num_processes or self.num_parser_processes
+        num_processes = num_processes or self.config.num_parser_processes
         
         def run_parser(parser_id: int):
             """Function to run in the parser process."""
@@ -271,26 +243,156 @@ class CrawlerOrchestrator:
         
         self.parser_processes.clear()
         logger.info("All parser consumer processes stopped.")
+    
+    def _start_fetcher_processes(self):
+        """Start additional fetcher processes (fetcher 1+).
+        The orchestrator runs fetcher 0 internally."""
+        def run_fetcher(fetcher_id: int):
+            """Function to run in the fetcher process."""
+            # Import inside the function to avoid issues with multiprocessing
+            import asyncio
+            import logging
+            from .fetcher_process import run_fetcher_process
+            
+            # Run the fetcher
+            run_fetcher_process(self.config, fetcher_id)
+        
+        # Start additional fetcher processes (1+)
+        if self.config.num_fetcher_processes > 1:
+            logger.info(f"Starting {self.config.num_fetcher_processes - 1} additional fetcher processes...")
+            for i in range(1, self.config.num_fetcher_processes):  # Start from 1, not 0
+                process = Process(
+                    target=run_fetcher,
+                    args=(i,),
+                    name=f"FetcherProcess-{i}"
+                )
+                process.daemon = False  # Don't make it daemon so it can clean up properly
+                process.start()
+                self.fetcher_processes.append(process)
+                logger.info(f"Fetcher process {i} started with PID: {process.pid}")
+    
+    def _stop_fetcher_processes(self):
+        """Stop all fetcher processes gracefully."""
+        if not self.fetcher_processes:
+            return
+            
+        logger.info(f"Stopping {len(self.fetcher_processes)} fetcher processes...")
+        
+        # First try to terminate gracefully
+        for process in self.fetcher_processes:
+            if process.is_alive():
+                process.terminate()
+        
+        # Wait for all to terminate
+        for process in self.fetcher_processes:
+            process.join(timeout=10)  # Wait up to 10 seconds
+            
+            if process.is_alive():
+                logger.warning(f"Fetcher process {process.name} didn't terminate gracefully, forcing...")
+                process.kill()
+                process.join()
+        
+        self.fetcher_processes.clear()
+        logger.info("All fetcher processes stopped.")
+
+    async def _reshard_domain_queues(self):
+        """Reshard domain queues based on the number of fetcher processes."""
+        # One shard per fetcher for simplicity
+        new_shard_count = self.config.num_fetcher_processes
+        
+        # Get current shard count
+        current_shard_count = await self.redis_client.get('crawler:shard_count')
+        if current_shard_count:
+            current_shard_count = int(current_shard_count)
+        else:
+            # Check if old single queue exists
+            old_queue_size = await self.redis_client.llen('domains:queue')
+            if old_queue_size > 0:
+                logger.info("Detected old single domain queue, will migrate to sharded queues")
+                current_shard_count = 0  # Indicates migration needed
+            else:
+                # Fresh start
+                current_shard_count = new_shard_count
+                await self.redis_client.set('crawler:shard_count', new_shard_count)
+                logger.info(f"Initialized with {new_shard_count} domain queue shards")
+                return
+        
+        if current_shard_count == new_shard_count:
+            logger.info(f"Domain queues already sharded correctly ({new_shard_count} shards)")
+            return
+        
+        logger.info(f"Resharding domain queues from {current_shard_count} to {new_shard_count} shards...")
+        
+        # Collect all domains from existing queues
+        all_domains = []
+        
+        if current_shard_count == 0:
+            # Migration from old single queue
+            while True:
+                domain = await self.redis_client.lpop('domains:queue')
+                if not domain:
+                    break
+                all_domains.append(domain)
+            logger.info(f"Migrated {len(all_domains)} domains from old single queue")
+        else:
+            # Collect from existing sharded queues
+            for shard in range(current_shard_count):
+                queue_key = f'domains:queue:{shard}'
+                while True:
+                    domain = await self.redis_client.lpop(queue_key)
+                    if not domain:
+                        break
+                    all_domains.append(domain)
+            logger.info(f"Collected {len(all_domains)} domains from {current_shard_count} shards")
+        
+        # Redistribute to new shards
+        for domain in all_domains:
+            # Use consistent hash to determine shard
+            # Use MD5 hash for consistent hashing across processes
+            domain_hash = hashlib.md5(domain.encode()).digest()
+            hash_int = int.from_bytes(domain_hash[:8], byteorder='big')
+            shard = hash_int % new_shard_count
+            await self.redis_client.rpush(f'domains:queue:{shard}', domain)
+        
+        # Update shard count
+        await self.redis_client.set('crawler:shard_count', new_shard_count)
+        logger.info(f"Resharding complete. Redistributed {len(all_domains)} domains to {new_shard_count} shards")
 
     async def _initialize_components(self):
-        """Initializes all crawler components that require async setup."""
-        logger.info("Initializing crawler components...")
+        """Initializes orchestrator components that require async setup."""
+        logger.info("Initializing orchestrator components...")
         
         # Clear any zombie locks from previous runs
-        from .redis_lock import LockManager
         lock_manager = LockManager(self.redis_client)
         cleared_count = await lock_manager.clear_all_locks()
         if cleared_count > 0:
             logger.warning(f"Cleared {cleared_count} zombie locks from previous run")
         
-        # Redis-based initialization
-        await self.storage.init_db_schema()  # Sets schema version
-        # PolitenessEnforcer loads exclusions differently
-        if hasattr(self.politeness, '_load_manual_exclusions'):
-            await self.politeness._load_manual_exclusions()
-        await self.frontier.initialize_frontier()
+        # Perform domain queue resharding if needed
+        await self._reshard_domain_queues()
+        
+        # One-time initialization shared across all processes
+        logger.info("Performing one-time initialization...")
+        
+        # Initialize storage schema
+        storage = StorageManager(self.config, self.redis_client)  # type: ignore
+        await storage.init_db_schema()
+        await storage.close()
+        
+        # Load manual exclusions
+        temp_fetcher = Fetcher(self.config)
+        politeness = PolitenessEnforcer(self.config, self.redis_client, temp_fetcher)
+        if hasattr(politeness, '_load_manual_exclusions'):
+            await politeness._load_manual_exclusions()
+        
+        # Initialize frontier
+        frontier = FrontierManager(self.config, politeness, self.redis_client)  # type: ignore
+        await frontier.initialize_frontier()
+        
+        # Clean up temporary instances
+        await temp_fetcher.close_session()
             
-        logger.info("Crawler components initialized.")
+        logger.info("Orchestrator components initialized.")
 
     async def _analyze_fd_types(self):
         """Analyze FD types and update Prometheus metrics."""
@@ -385,14 +487,6 @@ class CrawlerOrchestrator:
             fd_other_gauge.set(fd_stats['other'])
             
             logger.info(f"[Metrics] FD breakdown: {fd_stats}")
-            
-            if hasattr(self, 'fetcher') and hasattr(self.fetcher, 'session') and self.fetcher.session:
-                connector = self.fetcher.session.connector
-                if hasattr(connector, '_acquired'):
-                    logger.info(f"[Metrics] aiohttp acquired connections: {len(connector._acquired)}")
-                if hasattr(connector, '_conns'):
-                    total_conns = sum(len(conns) for conns in connector._conns.values())
-                    logger.info(f"[Metrics] aiohttp total cached connections: {total_conns}")
                     
         except Exception as e:
             logger.error(f"Error in FD analysis: {e}")
@@ -402,11 +496,9 @@ class CrawlerOrchestrator:
         time_elapsed_seconds = current_time - self.last_metrics_log_time
         if time_elapsed_seconds == 0: time_elapsed_seconds = 1 # Avoid division by zero
 
-        pages_per_second = self.pages_crawled_in_interval / time_elapsed_seconds
-        logger.info(f"[Metrics] Pages Crawled/sec: {pages_per_second:.2f}")
-        
-        # Update Prometheus gauge
-        pages_per_second_gauge.set(pages_per_second)
+        # Note: pages_per_second is now calculated by individual fetcher processes
+        # and aggregated by Prometheus across all processes
+        logger.info(f"[Metrics] Check Prometheus endpoint for aggregated pages/sec across all fetchers")
         
         # Collect system metrics
         try:
@@ -550,167 +642,7 @@ class CrawlerOrchestrator:
             logger.info("[Metrics] Content size metrics available at Prometheus endpoint /metrics")
 
         # Reset for next interval
-        self.pages_crawled_in_interval = 0
         self.last_metrics_log_time = current_time
-
-    async def _worker(self, worker_id: int):
-        """Core logic for a single crawl worker."""
-        logger.info(f"Worker-{worker_id}: Starting.")
-        
-        # Add small random delay to spread out initial DB access
-        startup_delay = (worker_id % 100) * (5 / 100)  # 0-5 second delay based on worker ID
-        await asyncio.sleep(startup_delay)
-        
-        try:
-            while not self._shutdown_event.is_set():
-                try:
-                    # Calculate which domain shard this worker should handle
-                    shard_id = (worker_id - 1) % DOMAIN_SHARD_COUNT  # worker_id is 1-based, convert to 0-based
-                    next_url_info = await self.frontier.get_next_url(shard_id, DOMAIN_SHARD_COUNT)
-
-                    if next_url_info is None:
-                        # Check if the frontier is truly empty before sleeping
-                        if await self.frontier.is_empty():
-                            logger.info(f"Worker-{worker_id}: Frontier is confirmed empty. Waiting...")
-                        else:
-                            # logger.debug(f"Worker-{worker_id}: No suitable URL available (cooldowns?). Waiting...")
-                            pass # Still URLs, but none fetchable now
-                        await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS) 
-                        continue
-
-                    url_to_crawl, domain, frontier_id, depth = next_url_info
-                    logger.info(f"Worker-{worker_id}: Processing URL ID {frontier_id} at depth {depth}: {url_to_crawl} from domain {domain}")
-
-                    # Track fetch duration
-                    fetch_start_time = time.time()
-                    fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
-                    fetch_duration = time.time() - fetch_start_time
-                    fetch_duration_histogram.labels(fetch_type='page').observe(fetch_duration)
-                    
-                    crawled_timestamp = int(time.time())
-
-                    if fetch_result.error_message or fetch_result.status_code >= 400:
-                        logger.warning(f"Worker-{worker_id}: Fetch failed for {url_to_crawl}. Status: {fetch_result.status_code}, Error: {fetch_result.error_message}")
-                        
-                        # Track error in Prometheus
-                        if fetch_result.error_message:
-                            errors_counter.labels(error_type='fetch_error').inc()
-                        else:
-                            errors_counter.labels(error_type=f'http_{fetch_result.status_code}').inc()
-                        
-                        # Record failed attempt
-                        await self.storage.add_visited_page(
-                            url=fetch_result.final_url, 
-                            domain=extract_domain(fetch_result.final_url) or domain, # Use original domain as fallback
-                            status_code=fetch_result.status_code,
-                            crawled_timestamp=crawled_timestamp,
-                            content_type=fetch_result.content_type,
-                            redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
-                        )
-                    else: # Successful fetch (2xx or 3xx that was followed)
-                        self.pages_crawled_count += 1
-                        pages_crawled_counter.inc()  # Increment Prometheus counter
-                        logger.info(f"Worker-{worker_id}: Successfully fetched {fetch_result.final_url} (Status: {fetch_result.status_code}). Total crawled: {self.pages_crawled_count}")
-                        
-                        if fetch_result.text_content and fetch_result.content_type and "html" in fetch_result.content_type.lower():
-                            # Push to parse queue instead of parsing inline
-                            queue_item = {
-                                'url': fetch_result.final_url,
-                                'domain': domain,
-                                'depth': depth,
-                                'html_content': fetch_result.text_content,
-                                'content_type': fetch_result.content_type,
-                                'crawled_timestamp': crawled_timestamp,
-                                'status_code': fetch_result.status_code,
-                                'is_redirect': fetch_result.is_redirect,
-                                'initial_url': fetch_result.initial_url
-                            }
-                            
-                            # Push to Redis queue for parsing
-                            queue_size = await self.redis_client_binary.rpush('fetch:queue', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
-                            logger.debug(f"Worker-{worker_id}: Pushed HTML content to parse queue for {fetch_result.final_url}")
-                            
-                            # Explicitly delete to keep peak memory down
-                            del queue_item
-                            # Backpressure
-                            if queue_size > self.fetch_queue_hard_limit:
-                                # Hard limit - wait until queue shrinks
-                                logger.warning(f"Worker-{worker_id}: Fetch queue at hard limit ({queue_size}/{self.fetch_queue_hard_limit}), waiting...")
-                                backpressure_events_counter.labels(backpressure_type='hard_limit').inc()
-                                while queue_size > self.fetch_queue_soft_limit:
-                                    await asyncio.sleep(5.0)
-                                    queue_size = await self.redis_client_binary.llen('fetch:queue')
-                                logger.info(f"Worker-{worker_id}: Fetch queue below soft limit ({queue_size}), resuming")
-                                
-                            elif queue_size > self.fetch_queue_soft_limit:
-                                # Soft limit - progressive backoff based on queue size
-                                # Sleep between 0 and 2 seconds based on how far above soft limit we are
-                                overflow_ratio = (queue_size - self.fetch_queue_soft_limit) / (self.fetch_queue_hard_limit - self.fetch_queue_soft_limit)
-                                overflow_ratio = min(overflow_ratio, 1.0)  # Cap at 1.0
-                                
-                                # Add randomization to prevent thundering herd
-                                base_sleep = overflow_ratio * 2.0
-                                jitter = random.random() * 0.5  # 0-0.5 seconds of jitter
-                                sleep_time = base_sleep + jitter
-                                
-                                if worker_id % 10 == 1:  # Log from only 10% of workers to reduce spam
-                                    logger.debug(f"Worker-{worker_id}: Fetch queue at {queue_size}, applying backpressure (sleep {sleep_time:.2f}s)")
-                                backpressure_events_counter.labels(backpressure_type='soft_limit').inc()
-                                await asyncio.sleep(sleep_time)
-                        else:
-                            logger.debug(f"Worker-{worker_id}: Not HTML or no text content for {fetch_result.final_url} (Type: {fetch_result.content_type})")
-                            
-                            # For non-HTML content, still record in visited pages
-                            await self.storage.add_visited_page(
-                                url=fetch_result.final_url,
-                                domain=extract_domain(fetch_result.final_url) or domain,
-                                status_code=fetch_result.status_code,
-                                crawled_timestamp=crawled_timestamp,
-                                content_type=fetch_result.content_type,
-                                content_text=None,
-                                content_storage_path_str=None,
-                                redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
-                            )
-                    
-                    # Delete the fetched results here because otherwise they cannot be garbage 
-                    # collected until the worker issues a new fetch, increasing peak memory usage
-                    del fetch_result
-                    
-                    # Check stopping conditions after processing a page
-                    if self._check_stopping_conditions():
-                        self._shutdown_event.set()
-                        logger.info(f"Worker-{worker_id}: Stopping condition met, signaling shutdown.")
-                        break 
-                    
-                    await asyncio.sleep(0) # Yield control to event loop
-
-                    self.pages_crawled_in_interval += 1
-
-                except asyncio.CancelledError:
-                    # Re-raise to allow proper shutdown
-                    raise
-                except Exception as e:
-                    # Log the error but continue processing
-                    logger.error(f"Worker-{worker_id}: Error processing URL: {e}")
-                    errors_counter.labels(error_type='worker_error').inc()
-                    # Small delay before continuing to avoid tight error loops
-                    await asyncio.sleep(1)
-
-        except asyncio.CancelledError:
-            logger.info(f"Worker-{worker_id}: Cancelled.")
-        finally:
-            logger.info(f"Worker-{worker_id}: Shutting down.")
-
-    def _check_stopping_conditions(self) -> bool:
-        if self.config.max_pages and self.pages_crawled_count >= self.config.max_pages:
-            logger.info(f"Stopping: Max pages reached ({self.pages_crawled_count}/{self.config.max_pages})")
-            return True
-        if self.config.max_duration and (time.time() - self.start_time) >= self.config.max_duration:
-            logger.info(f"Stopping: Max duration reached ({time.time() - self.start_time:.0f}s / {self.config.max_duration}s)")
-            return True
-        # More complex: check if frontier is empty AND all workers are idle (e.g. waiting on frontier.get_next_url)
-        # This is handled by the orchestrator's main loop watching worker states and frontier count.
-        return False
 
     async def run_crawl(self):
         self.start_time = time.time()
@@ -740,28 +672,19 @@ class CrawlerOrchestrator:
             if start_metrics_server(port=8001):
                 logger.info("Prometheus metrics server started on port 8001")
             
-            # Start parser process
+            # Create and start the local fetcher (fetcher 0) in this process
+            self.local_fetcher = FetcherProcess(self.config, fetcher_id=0)
+            local_fetcher_task = asyncio.create_task(self.local_fetcher.run())
+            logger.info("Started local fetcher (fetcher 0) in orchestrator process")
+            
+            # Start additional fetcher processes (1+)
+            self._start_fetcher_processes()
             self._start_parser_processes()
-            # Give parser a moment to initialize
+            
+            # Give all processes a moment to initialize
             await asyncio.sleep(2)
-
-            # Start worker tasks
-            logger.info(f"Starting {self.config.max_workers} workers with staggered startup...")
             
-            # Stagger worker startup to avoid thundering herd on DB pool
-            workers_per_batch = 100  # Start 100 workers at a time
-            startup_delay = 5  # Delay between batches in seconds
-            
-            for i in range(self.config.max_workers):
-                task = asyncio.create_task(self._worker(i + 1))
-                self.worker_tasks.add(task)
-                
-                # Add delay between batches
-                if (i + 1) % workers_per_batch == 0:
-                    logger.info(f"Started {i + 1}/{self.config.max_workers} workers...")
-                    await asyncio.sleep(startup_delay)
-            
-            logger.info(f"Started all {len(self.worker_tasks)} worker tasks.")
+            logger.info("All processes started.")
 
             if LOG_MEM_DIAGNOSTICS:
                 with open(f'mem_diagnostics/mem_diagnostics.txt', 'w+') as f:
@@ -773,10 +696,40 @@ class CrawlerOrchestrator:
 
             # Main monitoring loop
             while not self._shutdown_event.is_set():
-                if not any(not task.done() for task in self.worker_tasks):
-                    logger.info("All worker tasks have completed.")
+                # Check if all processes are still alive
+                all_processes_dead = True
+                for process in self.fetcher_processes + self.parser_processes:
+                    if process.is_alive():
+                        all_processes_dead = False
+                        break
+                
+                if all_processes_dead and (self.fetcher_processes or self.parser_processes):
+                    logger.error("All child processes have died!")
                     self._shutdown_event.set()
                     break
+                
+                # Check fetcher process health
+                dead_fetchers = []
+                for i, process in enumerate(self.fetcher_processes):
+                    if not process.is_alive():
+                        logger.error(f"Fetcher process {process.name} died unexpectedly!")
+                        if process.exitcode != 0:
+                            logger.error(f"Fetcher process {process.name} exit code: {process.exitcode}")
+                        dead_fetchers.append(i)
+                
+                # Remove dead fetcher processes
+                for i in reversed(dead_fetchers):
+                    self.fetcher_processes.pop(i)
+                
+                # For now, don't restart dead fetcher processes automatically
+                # as it would require careful resharding
+                if dead_fetchers:
+                    logger.error(f"Lost {len(dead_fetchers)} additional fetcher processes. Manual restart required.")
+                    # Check if we have no fetchers at all (local + additional)
+                    if not self.fetcher_processes and not self.local_fetcher:
+                        logger.critical("All fetcher processes dead! Shutting down...")
+                        self._shutdown_event.set()
+                        break
                 
                 # Check parser process health
                 # Handle single parser process (backward compatibility)
@@ -803,7 +756,7 @@ class CrawlerOrchestrator:
                     
                     # Restart if any died
                     if dead_processes:
-                        missing_count = self.num_parser_processes - len(self.parser_processes)
+                        missing_count = self.config.num_parser_processes - len(self.parser_processes)
                         logger.info(f"Restarting {missing_count} parser processes...")
                         
                         def run_parser(parser_id: int):
@@ -870,11 +823,13 @@ class CrawlerOrchestrator:
 
                 # TODO: frontier count is very slow with redis right now
                 estimated_frontier_size = -1
-                active_workers = sum(1 for task in self.worker_tasks if not task.done())
+                # Count active fetcher processes
+                # Include local fetcher (orchestrator) plus additional fetcher processes
+                active_fetcher_processes = 1 if self.local_fetcher else 0  # Orchestrator's fetcher
+                active_fetcher_processes += sum(1 for p in self.fetcher_processes if p.is_alive())
                 
                 # Update Prometheus gauges
                 frontier_size_gauge.set(estimated_frontier_size)
-                active_workers_gauge.set(active_workers)
                 
                 # Resource monitoring
                 rss_mem_mb = "N/A"
@@ -888,9 +843,15 @@ class CrawlerOrchestrator:
                         fds_count_int = current_process.num_fds()
                         fds_count = fds_count_int
                         
-                        # Update Prometheus gauges
-                        memory_usage_gauge.set(rss_mem_bytes)
-                        open_fds_gauge.set(fds_count_int)
+                        # Update Prometheus gauges with labels
+                        process_memory_usage_gauge.labels(
+                            process_type='orchestrator',
+                            process_id='0'
+                        ).set(rss_mem_bytes)
+                        process_open_fds_gauge.labels(
+                            process_type='orchestrator',
+                            process_id='0'
+                        ).set(fds_count_int)
                     except psutil.Error as e:
                         logger.warning(f"psutil error during resource monitoring: {e}")
                         # Fallback or disable further psutil calls for this iteration if needed
@@ -899,27 +860,45 @@ class CrawlerOrchestrator:
                     f"Crawled={self.pages_crawled_count}",
                     f"Frontier={estimated_frontier_size}",
                     f"AddedToFrontier={self.total_urls_added_to_frontier}",
-                    f"ActiveWorkers={active_workers}/{len(self.worker_tasks)}",
+                    f"FetcherProcs={active_fetcher_processes}/{self.config.num_fetcher_processes}",
                     f"MemRSS={rss_mem_mb}",
                     f"OpenFDs={fds_count}",
                     f"Runtime={(time.time() - self.start_time):.0f}s"
                 ]
                 logger.info(f"Status: {', '.join(status_parts)}")
                 
-                # If frontier is empty and workers might be idle, it could be a natural end
-                # Use the accurate is_empty() check for shutdown logic
-                if await self.frontier.is_empty() and self.pages_crawled_count > 0: # Check if any crawling happened
-                    # Wait a bit to see if workers add more URLs or finish
-                    logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring workers...")
-                    await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2) # Wait longer than worker sleep
+                # Check if frontier is empty by checking all shard queues
+                shard_count = await self.redis_client.get('crawler:shard_count')
+                if shard_count:
+                    shard_count = int(shard_count)
+                    pipe = self.redis_client.pipeline()
+                    for shard in range(shard_count):
+                        pipe.llen(f'domains:queue:{shard}')
+                    counts = await pipe.execute()
+                    total_queue_size = sum(counts)
                     
-                    # Final, accurate check before shutdown
-                    if await self.frontier.is_empty():
-                        logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
-                        self._shutdown_event.set()
-                        break
-
-                if self._check_stopping_conditions(): # Check global conditions again
+                    if total_queue_size == 0 and self.pages_crawled_count > 0:
+                        logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
+                        await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
+                        
+                        # Re-check after wait
+                        pipe = self.redis_client.pipeline()
+                        for shard in range(shard_count):
+                            pipe.llen(f'domains:queue:{shard}')
+                        counts = await pipe.execute()
+                        total_queue_size = sum(counts)
+                        
+                        if total_queue_size == 0:
+                            logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
+                            self._shutdown_event.set()
+                            break
+                
+                # Check global stopping conditions (max_pages, max_duration)
+                if self.config.max_pages and self.pages_crawled_count >= self.config.max_pages:
+                    logger.info(f"Stopping: Max pages reached ({self.pages_crawled_count}/{self.config.max_pages})")
+                    self._shutdown_event.set()
+                if self.config.max_duration and (time.time() - self.start_time) >= self.config.max_duration:
+                    logger.info(f"Stopping: Max duration reached ({time.time() - self.start_time:.0f}s / {self.config.max_duration}s)")
                     self._shutdown_event.set()
 
                 try:
@@ -927,40 +906,53 @@ class CrawlerOrchestrator:
                 except asyncio.TimeoutError:
                     pass # Continue loop for status update and checks
             
-            logger.info("Shutdown signaled. Waiting for workers to finish...")
-            if self.worker_tasks:
-                # Give workers a chance to finish up gracefully
-                done, pending = await asyncio.wait(self.worker_tasks, timeout=EMPTY_FRONTIER_SLEEP_SECONDS * 2)
-                for task in pending:
-                    logger.warning(f"Worker task {task.get_name()} did not finish in time, cancelling.")
-                    task.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True) # Await cancellations
-            logger.info("All worker tasks are finalized.")
+            logger.info("Shutdown signaled. Stopping processes...")
+            
+            # Stop the local fetcher first
+            if self.local_fetcher:
+                logger.info("Stopping local fetcher...")
+                self.local_fetcher._shutdown_event.set()
+                # The local fetcher task will finish on its own
+            
+            # Stop additional fetcher processes (they push to parser queue)
+            self._stop_fetcher_processes()
+            
+            # Then stop parser processes
+            self._stop_parser_processes()
+            
+            logger.info("All processes stopped.")
 
         except Exception as e:
             logger.critical(f"Orchestrator critical error: {e}", exc_info=True)
             self._shutdown_event.set() # Ensure shutdown on critical error
-            # Propagate worker cancellations if any are still running
-            for task in self.worker_tasks:
-                if not task.done():
-                    task.cancel()
-            if self.worker_tasks:
-                 await asyncio.gather(*[task for task in self.worker_tasks if not task.done()], return_exceptions=True)
         finally:
             logger.info("Performing final cleanup...")
             
-            # Stop parser process first to prevent it from trying to process more items
+            # Ensure local fetcher is stopped
+            if self.local_fetcher:
+                self.local_fetcher._shutdown_event.set()
+                await asyncio.sleep(1)  # Give it a moment to clean up
+            
+            # Processes should already be stopped, but ensure they are
+            self._stop_fetcher_processes()
             self._stop_parser_processes()
             
-            await self.fetcher.close_session()
+            # Wait for local fetcher task to complete
+            if 'local_fetcher_task' in locals() and not local_fetcher_task.done():
+                logger.info("Waiting for local fetcher to finish...")
+                try:
+                    await asyncio.wait_for(local_fetcher_task, timeout=10)
+                except asyncio.TimeoutError:
+                    logger.warning("Local fetcher didn't finish in time, cancelling...")
+                    local_fetcher_task.cancel()
+                    try:
+                        await local_fetcher_task
+                    except asyncio.CancelledError:
+                        pass
             
-            # Close storage and database connections
-            await self.storage.close()
-            
-            # Close Redis connection
+            # Close Redis connections
             await self.redis_client.aclose()
             await self.redis_client_binary.aclose()
             
-            logger.info(f"Crawl finished. Total pages crawled: {self.pages_crawled_count}")
+            logger.info(f"Crawl finished. Total pages crawled across all fetchers: {self.pages_crawled_count}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

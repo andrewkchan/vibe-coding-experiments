@@ -14,6 +14,7 @@ from typing import List, Dict, Tuple
 from crawler_module.frontier import FrontierManager
 from crawler_module.config import CrawlerConfig
 from crawler_module.politeness import PolitenessEnforcer
+from crawler_module.orchestrator import CrawlerOrchestrator
 
 # Configure basic logging for tests
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
@@ -25,7 +26,10 @@ class FrontierTestConfig:
     seed_file: Path
     email: str = "frontier_test@example.com"
     exclude_file: Path | None = None
-    max_workers: int = 1
+    fetcher_workers: int = 1
+    parser_workers: int = 1
+    num_fetcher_processes: int = 1
+    num_parser_processes: int = 1
     max_pages: int | None = None
     max_duration: int | None = None
     log_level: str = "DEBUG"
@@ -165,7 +169,7 @@ async def test_get_next_url(frontier_manager: FrontierManager, mock_politeness_e
     # Get URLs one by one
     retrieved_urls = []
     for _ in range(3):
-        result = await frontier_manager.get_next_url()
+        result = await frontier_manager.get_next_url(fetcher_id=0)
         assert result is not None
         url, domain, url_id, depth = result
         retrieved_urls.append(url)
@@ -176,7 +180,7 @@ async def test_get_next_url(frontier_manager: FrontierManager, mock_politeness_e
     
     # Frontier should be empty now
     assert await frontier_manager.count_frontier() == 0
-    assert await frontier_manager.get_next_url() is None
+    assert await frontier_manager.get_next_url(fetcher_id=0) is None
     
     logger.info("get_next_url test passed.")
 
@@ -256,7 +260,7 @@ async def test_frontier_file_persistence(
     assert "example.org" in urls_from_files
     
     # Get one URL and verify the offset is updated
-    url_retrieved = await frontier_run1.get_next_url()
+    url_retrieved = await frontier_run1.get_next_url(fetcher_id=0)
     assert url_retrieved is not None
     
     # Check Redis metadata for the domain we just fetched from
@@ -274,7 +278,7 @@ async def test_frontier_file_persistence(
     all_retrieved_urls = [url_retrieved[0]]  # Start with the one we already got
     
     while True:
-        next_url = await frontier_run1.get_next_url()
+        next_url = await frontier_run1.get_next_url(fetcher_id=0)
         if next_url is None:
             break
         all_retrieved_urls.append(next_url[0])
@@ -342,19 +346,28 @@ async def test_domain_ready_queue(
     ]
     await frontier_manager.add_urls_batch(urls)
     
-    # Check domains in queue
-    queued_domains = await redis_test_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
-    # Convert to set to ignore order and potential duplicates
-    assert set(queued_domains) == {"domain1.com", "domain2.com"}
+    # Initialize shard count if not set (for compatibility)
+    await redis_test_client.set('crawler:shard_count', 1)
+    shard_count = 1
     
-    # Get a URL from a domain
-    result = await frontier_manager.get_next_url()
+    # Collect all domains from all shards
+    all_queued_domains = set()
+    for shard in range(shard_count):
+        shard_domains = await redis_test_client.lrange(f'domains:queue:{shard}', 0, -1)  # type: ignore[misc]
+        all_queued_domains.update(shard_domains)
+    
+    # Convert to set to ignore order and potential duplicates
+    assert all_queued_domains == {"domain1.com", "domain2.com"}
+    
+    # Get a URL from a domain (fetcher_id=0 for test)
+    result = await frontier_manager.get_next_url(fetcher_id=0)
     assert result is not None
     url, domain, _, _ = result
     
-    # After fetching, domain should still be in the queue (at the end)
-    updated_queue = await redis_test_client.lrange('domains:queue', 0, -1)  # type: ignore[misc]
-    assert domain in updated_queue  # Domain should still be there
+    # After fetching, check the domain's shard queue
+    domain_shard = frontier_manager._get_domain_shard(domain)
+    updated_queue = await redis_test_client.lrange(f'domains:queue:{domain_shard}', 0, -1)  # type: ignore[misc]
+    assert domain in updated_queue  # Domain should be at the end
     
     logger.info("Domain ready queue test passed.")
 
@@ -447,7 +460,7 @@ async def test_atomic_domain_claiming_high_concurrency(
         """Simulates a worker claiming and processing URLs."""
         local_claims = []
         for _ in range(max_claims):
-            result = await frontier.get_next_url(worker_id=worker_id, total_workers=num_workers)
+            result = await frontier.get_next_url(fetcher_id=0)
             
             if result:
                 url, domain, url_id, depth = result
@@ -559,7 +572,7 @@ async def test_frontier_resume_with_politeness(
     assert await frontier_run1.count_frontier() == 3
     
     # Get one URL (should be from first domain in queue)
-    url_to_retrieve = await frontier_run1.get_next_url()
+    url_to_retrieve = await frontier_run1.get_next_url(fetcher_id=0)
     assert url_to_retrieve is not None
     assert await frontier_run1.count_frontier() == 2
     
@@ -586,11 +599,11 @@ async def test_frontier_resume_with_politeness(
     
     # Get the remaining URLs
     remaining_urls = []
-    next_url = await frontier_run2.get_next_url()
+    next_url = await frontier_run2.get_next_url(fetcher_id=0)
     assert next_url is not None
     remaining_urls.append(next_url[0])
     
-    next_url = await frontier_run2.get_next_url()
+    next_url = await frontier_run2.get_next_url(fetcher_id=0)
     assert next_url is not None
     remaining_urls.append(next_url[0])
     
@@ -636,7 +649,7 @@ async def test_url_filtering_in_add_urls_batch(
     # Verify the correct URLs were added by retrieving them
     retrieved_urls = []
     while True:
-        result = await frontier_manager.get_next_url()
+        result = await frontier_manager.get_next_url(fetcher_id=0)
         if result is None:
             break
         retrieved_urls.append(result[0])
@@ -699,13 +712,22 @@ async def test_url_filtering_in_get_next_url(
         'frontier_offset': '0'
     })
     
-    # Add domain to queue
-    await redis_test_client.rpush('domains:queue', domain)  # type: ignore[misc]
+    # Add domain to the appropriate shard queue
+    shard_count = await redis_test_client.get('crawler:shard_count')
+    if not shard_count:
+        # Initialize shard count if not set
+        await redis_test_client.set('crawler:shard_count', 1)
+        shard_count = 1
+    else:
+        shard_count = int(shard_count)
+    
+    domain_shard = fm._get_domain_shard(domain)
+    await redis_test_client.rpush(f'domains:queue:{domain_shard}', domain)  # type: ignore[misc]
     
     # Get URLs and verify only text URLs are returned
     retrieved_urls = []
     while True:
-        result = await fm.get_next_url()
+        result = await fm.get_next_url(fetcher_id=0)
         if result is None:
             break
         retrieved_urls.append(result[0])
@@ -728,3 +750,286 @@ async def test_url_filtering_in_get_next_url(
         f"Expected offset to be at end of file ({file_size}), got {final_offset}"
     
     logger.info("URL filtering in get_next_url test passed.")
+
+@pytest.mark.asyncio
+async def test_multi_shard_domain_distribution(
+    temp_test_frontier_dir: Path,
+    frontier_test_config_obj: FrontierTestConfig,
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    redis_test_client: redis.Redis
+):
+    """Test that domains are properly distributed across multiple shards."""
+    logger.info("Testing multi-shard domain distribution")
+    
+    # Setup with 3 fetcher processes
+    config_dict = vars(frontier_test_config_obj).copy()
+    config_dict['num_fetcher_processes'] = 3  # 3 shards
+    config = CrawlerConfig(**config_dict)
+    
+    # Set shard count in Redis
+    await redis_test_client.set('crawler:shard_count', 3)
+    
+    # Create frontier manager
+    fm = FrontierManager(
+        config=config,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_test_client
+    )
+    
+    # Force load shard count
+    await fm._get_shard_count()
+    
+    # Setup
+    await fm._clear_frontier()
+    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
+    
+    # Add URLs from many domains
+    test_domains = [f"domain{i}.com" for i in range(30)]
+    urls_to_add = []
+    for domain in test_domains:
+        urls_to_add.extend([
+            f"http://{domain}/page1",
+            f"http://{domain}/page2"
+        ])
+    
+    added = await fm.add_urls_batch(urls_to_add)
+    assert added == len(urls_to_add)
+    
+    # Check domain distribution across shards
+    shard_domains: Dict[int, List[str]] = {0: [], 1: [], 2: []}
+    
+    for shard in range(3):
+        domains = await redis_test_client.lrange(f'domains:queue:{shard}', 0, -1)  # type: ignore[misc]
+        shard_domains[shard] = list(set(domains))  # Remove duplicates
+        logger.info(f"Shard {shard} has {len(shard_domains[shard])} domains")
+    
+    # Verify each domain is in exactly one shard
+    all_domains_in_shards = set()
+    for shard, domains in shard_domains.items():
+        for domain in domains:
+            assert domain not in all_domains_in_shards, f"Domain {domain} found in multiple shards!"
+            all_domains_in_shards.add(domain)
+    
+    assert all_domains_in_shards == set(test_domains), "Not all domains were distributed to shards"
+    
+    # Verify distribution is reasonably balanced
+    # With hash-based distribution, perfect balance isn't guaranteed
+    # We'll check that no shard has more than 60% of domains
+    max_allowed = int(len(test_domains) * 0.6)
+    min_allowed = int(len(test_domains) * 0.1)  # At least 10% per shard
+    
+    for shard, domains in shard_domains.items():
+        assert min_allowed <= len(domains) <= max_allowed, \
+            f"Shard {shard} has unbalanced count: {len(domains)} (expected {min_allowed}-{max_allowed})"
+    
+    # Verify that domains are assigned to correct shards based on hash
+    for domain in test_domains:
+        expected_shard = fm._get_domain_shard(domain)
+        assert domain in shard_domains[expected_shard], \
+            f"Domain {domain} not in expected shard {expected_shard}"
+    
+    logger.info("Multi-shard domain distribution test passed.")
+
+@pytest.mark.asyncio
+async def test_multi_shard_fetcher_isolation(
+    temp_test_frontier_dir: Path,
+    frontier_test_config_obj: FrontierTestConfig,
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    redis_test_client: redis.Redis
+):
+    """Test that fetchers only get URLs from their assigned shard."""
+    logger.info("Testing multi-shard fetcher isolation")
+    
+    # Setup with 2 fetcher processes
+    config_dict = vars(frontier_test_config_obj).copy()
+    config_dict['num_fetcher_processes'] = 2  # 2 shards
+    config = CrawlerConfig(**config_dict)
+    
+    # Set shard count in Redis
+    await redis_test_client.set('crawler:shard_count', 2)
+    
+    # Create two frontier managers (simulating two fetcher processes)
+    fm0 = FrontierManager(
+        config=config,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_test_client
+    )
+    
+    fm1 = FrontierManager(
+        config=config,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_test_client
+    )
+    
+    # Force load shard count
+    await fm0._get_shard_count()
+    await fm1._get_shard_count()
+    
+    # Setup
+    await fm0._clear_frontier()
+    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
+    mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
+    
+    # Add URLs from domains that we know will hash to different shards
+    # We'll add many domains and track which ones go to which shard
+    test_urls = []
+    for i in range(20):
+        domain = f"test{i}.com"
+        test_urls.append(f"http://{domain}/page1")
+    
+    added = await fm0.add_urls_batch(test_urls)
+    assert added > 0
+    
+    # Track which domains are in which shard
+    shard0_domains = set()
+    shard1_domains = set()
+    
+    for i in range(20):
+        domain = f"test{i}.com"
+        shard = fm0._get_domain_shard(domain)
+        if shard == 0:
+            shard0_domains.add(domain)
+        else:
+            shard1_domains.add(domain)
+    
+    logger.info(f"Shard 0 has {len(shard0_domains)} domains, Shard 1 has {len(shard1_domains)} domains")
+    
+    # Both shards should have some domains
+    assert len(shard0_domains) > 0, "Shard 0 has no domains"
+    assert len(shard1_domains) > 0, "Shard 1 has no domains"
+    
+    # Fetcher 0 should only get URLs from shard 0
+    fetcher0_urls = []
+    for _ in range(len(shard0_domains)):
+        result = await fm0.get_next_url(fetcher_id=0)
+        if result:
+            url, domain, _, _ = result
+            fetcher0_urls.append(url)
+            assert domain in shard0_domains, f"Fetcher 0 got URL from wrong shard: {domain}"
+    
+    # Fetcher 0 should not be able to get any more URLs
+    result = await fm0.get_next_url(fetcher_id=0)
+    assert result is None, "Fetcher 0 got URL from wrong shard"
+    
+    # Fetcher 1 should only get URLs from shard 1
+    fetcher1_urls = []
+    for _ in range(len(shard1_domains)):
+        result = await fm1.get_next_url(fetcher_id=1)
+        if result:
+            url, domain, _, _ = result
+            fetcher1_urls.append(url)
+            assert domain in shard1_domains, f"Fetcher 1 got URL from wrong shard: {domain}"
+    
+    # Fetcher 1 should not be able to get any more URLs
+    result = await fm1.get_next_url(fetcher_id=1)
+    assert result is None, "Fetcher 1 got URL from wrong shard"
+    
+    # Verify total URLs fetched
+    assert len(fetcher0_urls) == len(shard0_domains)
+    assert len(fetcher1_urls) == len(shard1_domains)
+    assert len(fetcher0_urls) + len(fetcher1_urls) == added
+    
+    logger.info("Multi-shard fetcher isolation test passed.")
+
+@pytest.mark.asyncio
+async def test_resharding_on_config_change(
+    temp_test_frontier_dir: Path,
+    frontier_test_config_obj: FrontierTestConfig,
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    redis_test_client: redis.Redis
+):
+    """Test that the orchestrator properly reshards when fetcher count changes."""
+    logger.info("Testing resharding on configuration change")
+    
+    # Start with 2 shards
+    await redis_test_client.set('crawler:shard_count', 2)
+    
+    # Create a dummy frontier to use its sharding method
+    config_2_shards_dict = vars(frontier_test_config_obj).copy()
+    config_2_shards_dict['num_fetcher_processes'] = 2
+    config_2_shards = CrawlerConfig(**config_2_shards_dict)
+    
+    dummy_frontier_2 = FrontierManager(
+        config=config_2_shards,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_test_client
+    )
+    await dummy_frontier_2._get_shard_count()  # Load shard count
+    
+    # Manually add domains to the old shard structure
+    test_domains = [f"domain{i}.com" for i in range(10)]
+    
+    # Distribute domains to 2 shards using frontier's sharding method
+    for domain in test_domains:
+        shard = dummy_frontier_2._get_domain_shard(domain)
+        await redis_test_client.rpush(f'domains:queue:{shard}', domain)
+    
+    # Verify initial distribution
+    shard0_before = await redis_test_client.lrange('domains:queue:0', 0, -1)
+    shard1_before = await redis_test_client.lrange('domains:queue:1', 0, -1)
+    total_before = len(shard0_before) + len(shard1_before)
+    assert total_before == len(test_domains)
+    logger.info(f"Initial distribution: shard 0={len(shard0_before)}, shard 1={len(shard1_before)}")
+    
+    # Create config with 3 fetcher processes
+    config_3_shards_dict = vars(frontier_test_config_obj).copy()
+    config_3_shards_dict['num_fetcher_processes'] = 3  # This will trigger resharding to 3 shards
+    config_3_shards = CrawlerConfig(**config_3_shards_dict)
+    
+    # Create orchestrator (just for resharding, won't run the crawler)
+    orchestrator = CrawlerOrchestrator(config_3_shards)
+    orchestrator.redis_client = redis_test_client  # Use test Redis client
+    
+    # Call the actual resharding method
+    await orchestrator._reshard_domain_queues()
+    
+    # Create a dummy frontier with 3 shards to verify the results
+    dummy_frontier_3 = FrontierManager(
+        config=config_3_shards,
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_test_client
+    )
+    await dummy_frontier_3._get_shard_count()  # Load shard count
+    
+    # Verify new distribution
+    shard_counts = {}
+    all_redistributed_domains = set()
+    
+    for shard in range(3):  # New shard count
+        domains = await redis_test_client.lrange(f'domains:queue:{shard}', 0, -1)
+        shard_counts[shard] = len(domains)
+        all_redistributed_domains.update(domains)
+        
+        # Verify each domain is in the correct shard using frontier's method
+        for domain in domains:
+            expected_shard = dummy_frontier_3._get_domain_shard(domain)
+            assert expected_shard == shard, f"Domain {domain} in wrong shard after resharding"
+    
+    # All domains should still be present
+    assert len(all_redistributed_domains) == len(test_domains)
+    assert all_redistributed_domains == set(test_domains)
+    
+    # Verify shard count was updated
+    new_shard_count = await redis_test_client.get('crawler:shard_count')
+    assert int(new_shard_count) == 3
+    
+    # Distribution should be reasonably balanced
+    # With only 10 domains and 3 shards, it's possible (though unlikely) that
+    # one shard gets 0 domains due to hash distribution
+    total_redistributed = sum(shard_counts.values())
+    assert total_redistributed == len(test_domains), \
+        f"Lost domains during resharding: {total_redistributed} vs {len(test_domains)}"
+    
+    # Log distribution for debugging
+    for shard, count in shard_counts.items():
+        logger.info(f"Shard {shard} has {count} domains after resharding")
+    
+    # With 10 domains and 3 shards, at least 2 shards should have domains
+    shards_with_domains = sum(1 for count in shard_counts.values() if count > 0)
+    assert shards_with_domains >= 2, f"Too many empty shards: only {shards_with_domains} have domains"
+    
+    # Ensure no shard has more than 70% of domains (7 out of 10)
+    max_count = max(shard_counts.values())
+    assert max_count <= 7, f"Unbalanced distribution: max shard has {max_count} domains"
+    
+    logger.info("Resharding test passed.")
