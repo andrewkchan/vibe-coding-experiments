@@ -11,13 +11,12 @@ from typing import OrderedDict as TypingOrderedDict # For type hinting
 from .config import CrawlerConfig
 from .storage import StorageManager
 from .utils import extract_domain, LRUCache
-from .fetcher import Fetcher, FetchResult # Added Fetcher import
+from .fetcher import Fetcher, MAX_ROBOTS_LENGTH
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROBOTS_TXT_TTL = 24 * 60 * 60  # 24 hours in seconds
 MIN_CRAWL_DELAY_SECONDS = 70 # Our project's default minimum
-ROBOTS_TXT_MAX_LEN = 100 * 1024 # 100KB - same as fetcher limit
 
 class PolitenessEnforcer:
     """Redis-backed implementation of PolitenessEnforcer.
@@ -84,7 +83,7 @@ class PolitenessEnforcer:
             result = await self.redis.hmget(domain_key, ['robots_txt', 'robots_expires'])
             
             if result[0] is not None and result[1] is not None:
-                return (result[0][:ROBOTS_TXT_MAX_LEN], int(result[1]))
+                return (result[0][:MAX_ROBOTS_LENGTH], int(result[1]))
             return (None, None)
         except Exception as e:
             logger.warning(f"Redis error fetching cached robots.txt for {domain}: {e}")
@@ -138,7 +137,7 @@ class PolitenessEnforcer:
             logger.error(f"Exception fetching robots.txt for {domain}: {e}")
         
         # Sanitize content
-        fetched_robots_content = fetched_robots_content[:ROBOTS_TXT_MAX_LEN]
+        fetched_robots_content = fetched_robots_content[:MAX_ROBOTS_LENGTH]
         if '\0' in fetched_robots_content:
             logger.warning(f"robots.txt for {domain} contains null bytes. Treating as empty.")
             fetched_robots_content = ""
