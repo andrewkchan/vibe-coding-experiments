@@ -153,8 +153,6 @@ class ParserConsumer:
             content_type = item_data.get('content_type', 'text/html')
             crawled_timestamp = item_data['crawled_timestamp']
             status_code = item_data['status_code']
-            is_redirect = item_data.get('is_redirect', False)
-            initial_url = item_data.get('initial_url', url)
             
             # Track parsing time
             parse_start = time.time()
@@ -195,13 +193,10 @@ class ParserConsumer:
             # Record the visited page with all metadata
             await self.storage.add_visited_page(
                 url=url,
-                domain=extract_domain(url) or domain,
                 status_code=status_code,
                 crawled_timestamp=crawled_timestamp,
                 content_type=content_type,
-                content_text=parse_result.text_content,  # For hashing
-                content_storage_path_str=content_storage_path_str,
-                redirected_to_url=url if is_redirect and initial_url != url else None
+                content_storage_path_str=content_storage_path_str
             )
             
             # Update metrics

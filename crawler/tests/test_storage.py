@@ -3,10 +3,8 @@ import pytest_asyncio
 from pathlib import Path
 import logging
 import time
-import hashlib
 import aiofiles
 import redis.asyncio as redis
-from typing import AsyncIterator
 import asyncio
 
 from crawler_module.storage import StorageManager, REDIS_SCHEMA_VERSION
@@ -151,7 +149,6 @@ async def test_save_content_to_file_io_error(storage_manager: StorageManager, mo
 async def test_add_visited_page(storage_manager: StorageManager, redis_test_client: redis.Redis): 
     """Test adding a visited page record to Redis."""
     url = "http://example.com/visited_page"
-    domain = "example.com"
     status_code = 200
     crawled_timestamp = int(time.time())
     content_type = "text/html"
@@ -161,33 +158,25 @@ async def test_add_visited_page(storage_manager: StorageManager, redis_test_clie
     
     await storage_manager.add_visited_page(
         url=url,
-        domain=domain,
         status_code=status_code,
         crawled_timestamp=crawled_timestamp,
         content_type=content_type,
-        content_text=text_content,
         content_storage_path_str=content_storage_path_str
     )
 
     # Check data in Redis
     expected_url_sha256 = storage_manager.get_url_sha256(url)
     expected_url_hash = expected_url_sha256[:16]
-    expected_content_hash = hashlib.sha256(text_content.encode('utf-8')).hexdigest()
 
     # Get the visited page data from Redis
     visited_data = await redis_test_client.hgetall(f'visited:{expected_url_hash}')
     
     assert visited_data is not None
     assert visited_data['url'] == url
-    assert visited_data['url_sha256'] == expected_url_sha256
-    assert visited_data['domain'] == domain
     assert int(visited_data['fetched_at']) == crawled_timestamp
     assert int(visited_data['status_code']) == status_code
     assert visited_data['content_type'] == content_type
-    assert visited_data['content_hash'] == expected_content_hash
     assert visited_data['content_path'] == content_storage_path_str
-    assert visited_data['error'] == ''
-    assert 'redirected_to_url' not in visited_data  # Not set when None
     
     logger.info("Add visited page test passed.")
 
@@ -196,21 +185,16 @@ async def test_add_visited_page(storage_manager: StorageManager, redis_test_clie
 async def test_add_visited_page_no_content(storage_manager: StorageManager, redis_test_client: redis.Redis):
     """Test adding a visited page with no text content (e.g., redirect or non-HTML)."""
     url = "http://example.com/redirect"
-    domain = "example.com"
     status_code = 301
     crawled_timestamp = int(time.time())
     content_type = "text/html"
-    redirected_to_url = "http://example.com/final_destination"
 
     await storage_manager.add_visited_page(
         url=url,
-        domain=domain,
         status_code=status_code,
         crawled_timestamp=crawled_timestamp,
         content_type=content_type,
-        content_text=None,
-        content_storage_path_str=None,
-        redirected_to_url=redirected_to_url
+        content_storage_path_str=None
     )
 
     expected_url_sha256 = storage_manager.get_url_sha256(url)
@@ -220,8 +204,6 @@ async def test_add_visited_page_no_content(storage_manager: StorageManager, redi
     
     assert visited_data is not None
     assert visited_data['content_path'] == ''
-    assert 'content_hash' not in visited_data
-    assert visited_data['redirected_to_url'] == redirected_to_url
     
     logger.info("Add visited page with no content test passed.")
 
@@ -230,33 +212,27 @@ async def test_add_visited_page_no_content(storage_manager: StorageManager, redi
 async def test_add_visited_page_update_existing(storage_manager: StorageManager, redis_test_client: redis.Redis):
     """Test updating an existing visited page in Redis."""
     url = "http://example.com/update_test"
-    domain = "example.com"
 
     # First visit
     first_timestamp = int(time.time())
     await storage_manager.add_visited_page(
         url=url,
-        domain=domain,
         status_code=404,
         crawled_timestamp=first_timestamp,
-        content_type="text/html",
-        content_text=None
+        content_type="text/html"
     )
 
     # Second visit (e.g., page is now available)
     await asyncio.sleep(0.01) # Ensure timestamp changes
     second_timestamp = first_timestamp + 100
-    text_content = "Now it has content!"
     url_hash_for_file = storage_manager.get_url_sha256(url)
     content_storage_path_str = str(storage_manager.content_dir / f"{url_hash_for_file}.txt")
     
     await storage_manager.add_visited_page(
         url=url,
-        domain=domain,
         status_code=200,
         crawled_timestamp=second_timestamp,
         content_type="text/html",
-        content_text=text_content,
         content_storage_path_str=content_storage_path_str
     )
     
@@ -271,5 +247,4 @@ async def test_add_visited_page_update_existing(storage_manager: StorageManager,
     assert int(stored_data['status_code']) == 200
     assert int(stored_data['fetched_at']) == second_timestamp
     assert stored_data['content_path'] == content_storage_path_str
-    assert stored_data['content_hash'] != ""
     logger.info("Update visited page test passed.") 

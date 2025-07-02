@@ -2,7 +2,6 @@ import logging
 from pathlib import Path
 import hashlib
 import time
-import json
 from typing import Optional
 import aiofiles
 import redis.asyncio as redis
@@ -78,42 +77,28 @@ class StorageManager:
     async def add_visited_page(
         self, 
         url: str, 
-        domain: str,
         status_code: int, 
         crawled_timestamp: int,
         content_type: Optional[str] = None, 
-        content_text: Optional[str] = None, 
-        content_storage_path_str: Optional[str] = None, 
-        redirected_to_url: Optional[str] = None
+        content_storage_path_str: Optional[str] = None
     ):
         """Adds a record of a visited page to Redis."""
         url_sha256 = self.get_url_sha256(url)
         # Use first 16 chars of SHA256 for the key (as per architecture doc)
         url_hash = url_sha256[:16]
         
-        content_hash: Optional[str] = None
-        if content_text:
-            content_hash = hashlib.sha256(content_text.encode('utf-8')).hexdigest()
-        
         try:
             # Prepare the hash data
             visited_data = {
                 'url': url,
-                'url_sha256': url_sha256,  # Store full hash for compatibility
-                'domain': domain,
                 'status_code': str(status_code),
                 'fetched_at': str(crawled_timestamp),
                 'content_path': content_storage_path_str or '',
-                'error': ''  # No error if we're adding a visited page
             }
             
             # Add optional fields if present
             if content_type:
                 visited_data['content_type'] = content_type
-            if content_hash:
-                visited_data['content_hash'] = content_hash
-            if redirected_to_url:
-                visited_data['redirected_to_url'] = redirected_to_url
             
             # Store in Redis using pipeline for atomicity
             pipe = self.redis.pipeline()

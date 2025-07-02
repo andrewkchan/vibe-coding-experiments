@@ -246,6 +246,10 @@ class FrontierManager:
         # 1. Pre-filter
         candidates = set()
         for u in urls:
+            # Skip URLs that are too long (> 2000 chars)
+            if len(u) > 2000:
+                logger.debug(f"Skipping URL longer than 2000 chars: {u[:100]}...")
+                continue
             # Skip non-text URLs early
             if is_likely_non_text_url(u):
                 logger.debug(f"Skipping non-text URL during add: {u}")

@@ -142,11 +142,9 @@ class FetcherProcess:
                         # Record failed attempt
                         await self.storage.add_visited_page(
                             url=fetch_result.final_url, 
-                            domain=extract_domain(fetch_result.final_url) or domain,
                             status_code=fetch_result.status_code,
                             crawled_timestamp=crawled_timestamp,
-                            content_type=fetch_result.content_type,
-                            redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
+                            content_type=fetch_result.content_type
                         )
                     else:  # Successful fetch
                         self.pages_crawled_count += 1
@@ -163,9 +161,7 @@ class FetcherProcess:
                                 'html_content': fetch_result.text_content,
                                 'content_type': fetch_result.content_type,
                                 'crawled_timestamp': crawled_timestamp,
-                                'status_code': fetch_result.status_code,
-                                'is_redirect': fetch_result.is_redirect,
-                                'initial_url': fetch_result.initial_url
+                                'status_code': fetch_result.status_code
                             }
                             
                             # Push to Redis queue for parsing
@@ -203,13 +199,10 @@ class FetcherProcess:
                             # For non-HTML content, still record in visited pages
                             await self.storage.add_visited_page(
                                 url=fetch_result.final_url,
-                                domain=extract_domain(fetch_result.final_url) or domain,
                                 status_code=fetch_result.status_code,
                                 crawled_timestamp=crawled_timestamp,
                                 content_type=fetch_result.content_type,
-                                content_text=None,
-                                content_storage_path_str=None,
-                                redirected_to_url=fetch_result.final_url if fetch_result.is_redirect and fetch_result.initial_url != fetch_result.final_url else None
+                                content_storage_path_str=None
                             )
                     
                     # Delete fetch results to free memory
