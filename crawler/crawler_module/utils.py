@@ -45,6 +45,10 @@ def normalize_url_parts(parsed: ParseResult) -> ParseResult:
 
     return ParseResult(scheme, netloc, path, params, query, fragment)
 
+def normalize_url(url: str) -> str:
+    """Normalize a URL to a canonical form."""
+    return urlunparse(normalize_url_parts(urlparse(url)))
+
 # Adapted from urllib.parse.urljoin with modifications to filter out non http/https urls
 def normalize_and_join_url(base_parsed: ParseResult, url: str) -> str | None:
     """Join a base URL and a possibly relative URL to form an absolute

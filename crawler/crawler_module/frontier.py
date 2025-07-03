@@ -10,7 +10,7 @@ import shutil
 
 from .config import CrawlerConfig
 from .storage import StorageManager
-from .utils import extract_domain
+from .utils import extract_domain, normalize_url
 from .politeness import PolitenessEnforcer
 from .redis_lock import LockManager, DomainLock
 
@@ -197,7 +197,7 @@ class FrontierManager:
             
         try:
             with open(self.config.seed_file, 'r') as f:
-                urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                urls = [normalize_url(line.strip()) for line in f if line.strip() and not line.startswith("#")]
                 
             if not urls:
                 logger.warning(f"Seed file {self.config.seed_file} is empty.")

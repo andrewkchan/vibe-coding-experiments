@@ -117,6 +117,57 @@ async def test_frontier_initialization_new(frontier_manager: FrontierManager):
     logger.info("Hybrid frontier initialization (new) test passed.")
 
 @pytest.mark.asyncio
+async def test_frontier_initialization_with_bare_domains_bug(
+    temp_test_frontier_dir: Path,
+    mock_politeness_enforcer_for_frontier: MagicMock,
+    redis_test_client: redis.Redis
+):
+    """Test when seed file contains bare domains instead of proper URLs."""
+    
+    # Create frontier from seed file with bare domains (no http://)
+    seed_file_path = temp_test_frontier_dir / "bare_domains_seeds.txt"
+    with open(seed_file_path, 'w') as sf:
+        sf.write("example.com\n")
+        sf.write("gpumagick.com\n")
+        sf.write("test.org\n")
+    test_config = FrontierTestConfig(
+        data_dir=temp_test_frontier_dir,
+        seed_file=seed_file_path
+    )
+    fm = FrontierManager(
+        config=CrawlerConfig(**vars(test_config)),
+        politeness=mock_politeness_enforcer_for_frontier,
+        redis_client=redis_test_client
+    )
+    
+    # Make politeness permissive
+    mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
+    mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
+    
+    # Initialize frontier
+    await fm.initialize_frontier()
+    
+    retrieved_urls = []
+    for _ in range(3):
+        result = await fm.get_next_url(fetcher_id=0)
+        if result:
+            url, domain, url_id, depth = result
+            retrieved_urls.append(url)
+    
+    assert len(retrieved_urls) == 3, f"Expected 3 URLs, got {len(retrieved_urls)}"
+    
+    expected_proper_urls = {
+        "http://example.com", "https://example.com",
+        "http://gpumagick.com", "https://gpumagick.com", 
+        "http://test.org", "https://test.org"
+    }
+    
+    for url in retrieved_urls:
+        assert any(url == proper_url or url == proper_url.replace('http://', 'https://') 
+                  for proper_url in expected_proper_urls), \
+            f"Retrieved URL '{url}' is not a proper URL with scheme"
+
+@pytest.mark.asyncio
 async def test_add_urls_batch(frontier_manager: FrontierManager, mock_politeness_enforcer_for_frontier: MagicMock):
     logger.info("Testing batch adding of URLs to Hybrid Frontier")
     
