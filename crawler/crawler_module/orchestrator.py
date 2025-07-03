@@ -376,13 +376,9 @@ class CrawlerOrchestrator:
         await storage.init_db_schema()
         await storage.close()
         
-        # Load manual exclusions
         temp_fetcher = Fetcher(self.config)
         politeness = PolitenessEnforcer(self.config, self.redis_client, temp_fetcher)
-        if hasattr(politeness, '_load_manual_exclusions'):
-            await politeness._load_manual_exclusions()
-        
-        # Initialize frontier
+        # Initialize frontier (also initializes politeness with manual exclusions, seeds, etc.)
         frontier = FrontierManager(self.config, politeness, self.redis_client)  # type: ignore
         await frontier.initialize_frontier()
         

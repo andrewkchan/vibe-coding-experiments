@@ -145,6 +145,7 @@ class FrontierManager:
             except:
                 logger.warning("Could not create bloom filter - it may already exist")
         
+        await self.politeness.initialize()
         if self.config.resume:
             count = await self.count_frontier()
             logger.info(f"Resuming crawl. Frontier has approximately {count} URLs.")
@@ -205,7 +206,15 @@ class FrontierManager:
                 
             # Mark domains as seeded
             seed_domains = {extract_domain(u) for u in urls if extract_domain(u)}
-            await self._mark_domains_as_seeded_batch(list(seed_domains))
+            seed_domains = [d for d in seed_domains if d]
+            await self._mark_domains_as_seeded_batch(seed_domains)
+
+            # Load robots.txt for seeds
+            # Most domains don't have robots.txt, so batch size can be large
+            chunk_size = max(self.config.fetcher_workers, 50_000)
+            for i in range(0, len(seed_domains), chunk_size):
+                await self.politeness.batch_load_robots_txt(seed_domains[i:i+chunk_size])
+                logger.info(f"Loaded robots.txt for {i+chunk_size}/{len(seed_domains)} domains")
             
             # Add URLs to frontier
             logger.info(f"Adding {len(urls)} URLs to the frontier")

@@ -1,5 +1,6 @@
 import logging
 import time
+import asyncio
 from urllib.robotparser import RobotFileParser
 
 from .config import CrawlerConfig
@@ -68,6 +69,11 @@ class PolitenessEnforcer:
             logger.info("No manual exclude file specified or found.")
         
         self._manual_exclusions_loaded = True
+    
+    async def batch_load_robots_txt(self, domains: list[str]):
+        """Batch load robots.txt for a list of domains."""
+        tasks = [self._get_robots_for_domain(domain) for domain in domains]
+        await asyncio.gather(*tasks)
     
     async def _get_cached_robots(self, domain: str) -> tuple[str | None, int | None]:
         """Get cached robots.txt content and expiry from Redis."""
