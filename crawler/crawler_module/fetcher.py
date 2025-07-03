@@ -32,7 +32,7 @@ class Fetcher:
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
         # Standard timeout settings (can be made configurable)
-        self.timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45, sock_connect=15)
+        self.timeout = aiohttp.ClientTimeout(total=90, connect=30, sock_read=60, sock_connect=30)
         
         # Create trace config for detailed timing
         self.trace_config = TraceConfig()
@@ -105,7 +105,6 @@ class Fetcher:
                 limit_per_host=max_per_host,  # Max connections per host
                 ttl_dns_cache=300,  # DNS cache timeout in seconds
                 enable_cleanup_closed=True,  # Clean up closed connections
-                force_close=True,  # Force close connections after each request to free up FDs
                 ssl=ssl_context,  # Use our SSL context that ignores certificate errors
             )
             
