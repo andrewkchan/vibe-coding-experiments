@@ -90,7 +90,7 @@ python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com
 *   `--max-duration <seconds>`: Max crawl duration.
 *   `--log-level <LEVEL>`: DEBUG, INFO, WARNING, ERROR (default: INFO).
 *   `--resume`: Attempt to resume a crawl from existing data.
-*   `--seeded-urls-only`: Only crawl seeded URLs
+*   `--seeded-urls-only`: Only crawl URLs from seeded domains
 
 ## System Requirements for High Concurrency
 

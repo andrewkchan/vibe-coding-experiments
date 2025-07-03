@@ -32,7 +32,7 @@ class Fetcher:
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
         # Standard timeout settings (can be made configurable)
-        self.timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=30, sock_connect=10)
+        self.timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45, sock_connect=15)
         
         # Create trace config for detailed timing
         self.trace_config = TraceConfig()
