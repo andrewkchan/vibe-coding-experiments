@@ -17,7 +17,7 @@ from redis.asyncio import BlockingConnectionPool
 from .config import CrawlerConfig
 from .parser import PageParser
 from .storage import StorageManager
-from .frontier import FrontierManager
+from .frontier_factory import create_frontier
 from .politeness import PolitenessEnforcer
 from .fetcher import Fetcher
 from .utils import extract_domain
@@ -62,9 +62,9 @@ class ParserConsumer:
         # Need fetcher for politeness enforcer
         self.fetcher = Fetcher(config)
         self.politeness = PolitenessEnforcer(config, self.redis_client, self.fetcher)
-        self.frontier = FrontierManager(
+        self.frontier = create_frontier(
             config, 
-            self.politeness,  # type: ignore[arg-type]
+            self.politeness,
             self.redis_client
         )
         

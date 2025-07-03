@@ -21,7 +21,7 @@ from .redis_lock import LockManager
 from .storage import StorageManager
 from .fetcher import Fetcher
 from .politeness import PolitenessEnforcer
-from .frontier import FrontierManager
+from .frontier_factory import create_frontier
 from .memory_diagnostics import memory_diagnostics
 from .metrics import (
     start_metrics_server,
@@ -379,7 +379,7 @@ class CrawlerOrchestrator:
         temp_fetcher = Fetcher(self.config)
         politeness = PolitenessEnforcer(self.config, self.redis_client, temp_fetcher)
         # Initialize frontier (also initializes politeness with manual exclusions, seeds, etc.)
-        frontier = FrontierManager(self.config, politeness, self.redis_client)  # type: ignore
+        frontier = create_frontier(self.config, politeness, self.redis_client)
         await frontier.initialize_frontier()
         
         # Clean up temporary instances

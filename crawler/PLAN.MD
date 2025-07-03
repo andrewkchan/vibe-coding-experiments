@@ -20,9 +20,14 @@ The crawler uses a multi-process, Redis-based architecture designed for high thr
 *   **Main Orchestrator (`orchestrator.py`):** The central controller that manages the entire crawl lifecycle. It runs as fetcher process 0 (leader model) while also spawning and supervising additional fetcher and parser processes.
 *   **Fetcher Processes (`fetcher_process.py`):** Independent processes that run pools of asynchronous workers for fetching URLs. Each process handles a specific shard of domains. The orchestrator runs fetcher 0 internally, while additional fetcher processes (1, 2, ...) run separately.
 *   **Parser Consumers (`parser_consumer.py`):** Separate processes dedicated to parsing HTML. They consume raw HTML from a Redis queue, extract text and links, and save results. This prevents CPU-intensive parsing from blocking the fetchers.
-*   **Frontier Manager (`frontier.py`):** Manages the URLs to be crawled using a hybrid storage approach with domain sharding:
-    *   **Redis:** Stores coordination data, domain metadata (politeness rules, next fetch times), a "seen" URL bloom filter for fast de-duplication, an exact set of "visited" URLs, and sharded domain queues (`domains:queue:0`, `domains:queue:1`, etc.).
-    *   **File System:** Stores the actual frontier of URLs in append-only files, one per domain. This allows for a virtually unlimited frontier size without consuming excessive memory.
+*   **Frontier Manager:** Manages the URLs to be crawled with two storage modes (configurable via `--frontier-type`):
+    *   **Hybrid Mode (`frontier.py`, default):** Uses a combination of Redis and filesystem:
+        *   **Redis:** Stores coordination data, domain metadata (politeness rules, next fetch times), a "seen" URL bloom filter for fast de-duplication, an exact set of "visited" URLs, and sharded domain queues (`domains:queue:0`, `domains:queue:1`, etc.).
+        *   **File System:** Stores the actual frontier of URLs in append-only files, one per domain. This allows for a virtually unlimited frontier size without consuming excessive memory.
+    *   **Redis-Only Mode (`frontier_redis.py`):** Stores everything in Redis for maximum performance:
+        *   All frontier URLs are stored in Redis lists (`frontier:{domain}`)
+        *   No file I/O, no offset tracking, simpler architecture
+        *   Requires more memory but provides better performance
 *   **Storage Manager (`storage.py`):** Handles persistence. It saves visited page metadata to Redis and the extracted text content to the file system.
 *   **Politeness Enforcer (`politeness.py`):** Manages `robots.txt` rules and crawl delays, using Redis as a cache for politeness information.
 *   **Fetcher (`fetcher.py`):** The underlying asynchronous HTTP client (`aiohttp`) used by the fetcher workers.
@@ -136,13 +141,18 @@ The crawler uses a hybrid of Redis and the file system for persistence.
 ### 3.1. Redis Data Structures
 
 *   **Domain Metadata (Hash):** `domain:{domain}`
-    *   `file_path`: Path to the domain's frontier file.
-    *   `frontier_offset`: Byte offset for the next URL to read from the file.
-    *   `frontier_size`: Total size in bytes of the frontier file.
-    *   `next_fetch_time`: UNIX timestamp for when this domain can be crawled next.
-    *   `robots_txt`: Cached content of `robots.txt`.
-    *   `robots_expires`: Expiry timestamp for the `robots.txt` cache.
-    *   `is_excluded`: Flag for manually excluded domains.
+    *   For hybrid mode:
+        *   `file_path`: Path to the domain's frontier file.
+        *   `frontier_offset`: Byte offset for the next URL to read from the file.
+        *   `frontier_size`: Total size in bytes of the frontier file.
+    *   For both modes:
+        *   `next_fetch_time`: UNIX timestamp for when this domain can be crawled next.
+        *   `robots_txt`: Cached content of `robots.txt`.
+        *   `robots_expires`: Expiry timestamp for the `robots.txt` cache.
+        *   `is_excluded`: Flag for manually excluded domains.
+*   **Frontier Lists (Redis-only mode):** `frontier:{domain}`
+    *   Lists containing URLs to crawl for each domain in "url|depth" format.
+    *   Only used when `--frontier-type=redis`.
 *   **Sharded Domain Queues (Lists):** `domains:queue:0`, `domains:queue:1`, ..., `domains:queue:N-1`
     *   N lists (where N = number of fetcher processes) that partition domains across fetchers. Domain assignment uses simple modulo hashing: `shard = hash(domain) % num_fetcher_processes`.
 *   **Shard Count (String):** `crawler:shard_count`
