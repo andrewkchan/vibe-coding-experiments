@@ -25,7 +25,7 @@ class DomainLock:
             self.lock_key = f"lock:domain:{domain}:writer"
         self.lock_acquired = False
         
-    async def acquire(self, max_wait_seconds: float = 30.0) -> bool:
+    async def acquire(self, max_wait_seconds: float = 600.0) -> bool:
         """
         Try to acquire the lock for this domain.
         

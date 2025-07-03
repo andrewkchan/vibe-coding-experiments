@@ -222,7 +222,7 @@ class FrontierManager:
                 subchunk_size = 100
                 added_count = 0
                 for i in range(0, len(urls), subchunk_size):
-                    added_count += await self.add_urls_batch(urls[i:i+subchunk_size])
+                    added_count += await self.add_urls_batch(urls[i:i+subchunk_size], worker_id=worker_id)
                     logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
                 return added_count
             seed_tasks = []
@@ -250,7 +250,7 @@ class FrontierManager:
         await pipe.execute()
         logger.debug(f"Marked {len(domains)} domains as seeded")
     
-    async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
+    async def add_urls_batch(self, urls: List[str], depth: int = 0, worker_id: int = 0) -> int:
         """Add URLs to frontier files."""
         # 1. Pre-filter
         candidates = set()
@@ -307,17 +307,18 @@ class FrontierManager:
         # 5. Add URLs to domain frontier files
         added_total = 0
         for domain, domain_urls in urls_by_domain.items():
-            added = await self._add_urls_to_domain(domain, domain_urls)
+            added = await self._add_urls_to_domain(domain, domain_urls, worker_id)
             added_total += added
             
         return added_total
     
-    async def _add_urls_to_domain(self, domain: str, urls: List[Tuple[str, int]]) -> int:
+    async def _add_urls_to_domain(self, domain: str, urls: List[Tuple[str, int]], worker_id: int = 0) -> int:
         """Add URLs to a specific domain's frontier file."""
         domain_lock = self._get_write_lock(domain)
         
         try:
             async with domain_lock:
+                logger.debug(f"[w-{worker_id}-d-{domain}] Worker {worker_id} acquired lock for domain {domain}")
                 frontier_path = self._get_frontier_path(domain)
                 domain_key = f"domain:{domain}"
                 
@@ -326,6 +327,7 @@ class FrontierManager:
                 for url, depth in urls:
                     pipe.execute_command('BF.ADD', 'seen:bloom', url)
                 bloom_add_results = await pipe.execute()
+                logger.debug(f"[w-{worker_id}-d-{domain}] Worker {worker_id} added {len(urls)} URLs to bloom filter")
                 
                 # Filter out URLs that were already in bloom filter
                 new_urls = []
@@ -345,6 +347,7 @@ class FrontierManager:
                     
                 async with aiofiles.open(frontier_path, 'a') as f:
                     await f.writelines(lines_to_write)
+                logger.debug(f"[w-{worker_id}-d-{domain}] Worker {worker_id} wrote {len(new_urls)} URLs to frontier file")
                     
                 # Get file size after writing
                 new_size_bytes = frontier_path.stat().st_size
@@ -370,6 +373,7 @@ class FrontierManager:
                 pipe.rpush(f'domains:queue:{shard}', domain)
                 
                 await pipe.execute()
+                logger.debug(f"[w-{worker_id}-d-{domain}] Worker {worker_id} updated metadata for domain {domain}")
                 
                 return len(new_urls)
                 
@@ -379,6 +383,8 @@ class FrontierManager:
         except Exception as e:
             logger.error(f"Error adding URLs to domain {domain}: {e}")
             return 0
+        finally:
+            logger.debug(f"[w-{worker_id}-d-{domain}] Worker {worker_id} released lock for domain {domain}")
     
     async def is_empty(self) -> bool:
         """Check if frontier is empty."""
