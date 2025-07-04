@@ -1,12 +1,10 @@
 # Test configuration for local development
-# Uses 4 pods instead of 16 for easier testing
+# Uses 2 pods instead of 16 for easier testing
 
-# Pod configuration - 4 pods for testing
+# Pod configuration - 2 pods for testing
 pods:
   - redis_url: "redis://localhost:6379"
   - redis_url: "redis://localhost:6380"
-  - redis_url: "redis://localhost:6381"
-  - redis_url: "redis://localhost:6382"
 
 # Test storage configuration - local directories
 data_dirs:
@@ -18,8 +16,8 @@ log_dir: "./logs"
 log_level: "DEBUG"
 
 # Reduced process configuration for testing
-fetchers_per_pod: 2      # 8 total fetcher processes (pod 0's orchestrator counts as fetcher 0)
-parsers_per_pod: 1       # 4 total parser processes
+fetchers_per_pod: 2      # 4 total fetcher processes (pod 0's orchestrator counts as fetcher 0)
+parsers_per_pod: 1       # 2 total parser processes
 fetcher_workers: 50      # Fewer async workers for testing
 parser_workers: 20       # Fewer async workers for testing
 

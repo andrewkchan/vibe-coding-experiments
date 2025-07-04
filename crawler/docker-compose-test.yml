@@ -121,98 +121,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-  redis-2:
-    image: redis:latest
-    container_name: crawler-redis-2
-    restart: unless-stopped
-    ports:
-    - 6381:6379
-    volumes:
-    - redis-data-2:/data
-    - ./logs/redis/pod-2:/var/log/redis
-    command:
-    - redis-server
-    - --maxmemory
-    - 360gb
-    - --maxmemory-policy
-    - noeviction
-    - --save
-    - '900'
-    - '1'
-    - --save
-    - '300'
-    - '10'
-    - --save
-    - '60'
-    - '10000'
-    - --appendonly
-    - 'no'
-    - --rdbcompression
-    - 'yes'
-    - --rdbchecksum
-    - 'yes'
-    - --dbfilename
-    - dump.rdb
-    - --stop-writes-on-bgsave-error
-    - 'yes'
-    - --logfile
-    - /var/log/redis/redis.log
-    - --loglevel
-    - notice
-    healthcheck:
-      test:
-      - CMD
-      - redis-cli
-      - ping
-      interval: 5s
-      timeout: 3s
-      retries: 5
-  redis-3:
-    image: redis:latest
-    container_name: crawler-redis-3
-    restart: unless-stopped
-    ports:
-    - 6382:6379
-    volumes:
-    - redis-data-3:/data
-    - ./logs/redis/pod-3:/var/log/redis
-    command:
-    - redis-server
-    - --maxmemory
-    - 360gb
-    - --maxmemory-policy
-    - noeviction
-    - --save
-    - '900'
-    - '1'
-    - --save
-    - '300'
-    - '10'
-    - --save
-    - '60'
-    - '10000'
-    - --appendonly
-    - 'no'
-    - --rdbcompression
-    - 'yes'
-    - --rdbchecksum
-    - 'yes'
-    - --dbfilename
-    - dump.rdb
-    - --stop-writes-on-bgsave-error
-    - 'yes'
-    - --logfile
-    - /var/log/redis/redis.log
-    - --loglevel
-    - notice
-    healthcheck:
-      test:
-      - CMD
-      - redis-cli
-      - ping
-      interval: 5s
-      timeout: 3s
-      retries: 5
 volumes:
   prometheus_data:
     driver: local
@@ -221,8 +129,4 @@ volumes:
   redis-data-0:
     driver: local
   redis-data-1:
-    driver: local
-  redis-data-2:
-    driver: local
-  redis-data-3:
     driver: local
