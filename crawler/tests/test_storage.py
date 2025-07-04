@@ -98,7 +98,7 @@ async def test_save_content_to_file(storage_manager: StorageManager):
     url_hash = "test_url_hash_content"
     text_content = "This is some test content.\nWith multiple lines."
     
-    file_path = await storage_manager.save_content_to_file(url_hash, text_content)
+    file_path = await storage_manager.save_content_to_file(url_hash, text_content, base_dir=storage_manager.data_dir)
     
     assert file_path is not None
     assert file_path.exists()
@@ -117,7 +117,7 @@ async def test_save_content_to_file_empty_content(storage_manager: StorageManage
     url_hash = "empty_content_hash"
     text_content = ""
     
-    file_path = await storage_manager.save_content_to_file(url_hash, text_content)
+    file_path = await storage_manager.save_content_to_file(url_hash, text_content, base_dir=storage_manager.data_dir)
     
     assert file_path is None
     # Ensure no file was created
@@ -137,7 +137,7 @@ async def test_save_content_to_file_io_error(storage_manager: StorageManager, mo
 
     monkeypatch.setattr(aiofiles, "open", mock_aio_open_raiser)
     
-    file_path = await storage_manager.save_content_to_file(url_hash, text_content)
+    file_path = await storage_manager.save_content_to_file(url_hash, text_content, base_dir=storage_manager.data_dir)
     
     assert file_path is None
     expected_file = storage_manager.content_dir / f"{url_hash}.txt"

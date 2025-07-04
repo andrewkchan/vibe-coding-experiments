@@ -25,7 +25,7 @@ def test_config_from_args_required(monkeypatch):
     assert config.data_dir == Path(DEFAULT_DATA_DIR)
     assert config.fetcher_workers == DEFAULT_FETCHER_WORKERS
     assert config.log_level == DEFAULT_LOG_LEVEL.upper()
-    assert config.user_agent == f"MyEducationalCrawler/1.0 (mailto:{test_email})"
+    assert config.user_agent == f"ExperimentalCrawler/1.0 ({test_email})"
     
     Path(test_seed_file).unlink()
 
@@ -69,7 +69,7 @@ def test_config_from_args_all(monkeypatch):
     assert config.max_duration == int(test_max_duration)
     assert config.log_level == test_log_level.upper()
     assert config.resume is True
-    assert config.user_agent == f"MyEducationalCrawler/1.0 (mailto:{test_email})"
+    assert config.user_agent == f"ExperimentalCrawler/1.0 ({test_email})"
 
     Path(test_seed_file).unlink()
     Path(test_exclude_file).unlink()

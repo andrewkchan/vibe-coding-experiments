@@ -68,6 +68,37 @@ The crawler requires a Redis instance with RedisBloom support. The simplest way 
     OK
     ```
 
+## Docker Setup and Permissions
+
+### Important: Log Directory Permissions
+
+When running Docker Compose (especially with `sudo`), Docker creates bind-mounted directories with root ownership and restrictive permissions. This causes Redis containers to fail when trying to write logs.
+
+**Solutions:**
+
+1. **Pre-create directories with proper permissions** (Recommended):
+   ```bash
+   # Run the setup script before docker-compose
+   ./setup_docker_dirs.sh
+   
+   # Then start services
+   docker-compose up -d
+   ```
+
+2. **Use the docker-compose generator with automatic directory creation**:
+   ```bash
+   # Generates docker-compose.yml and creates log directories
+   python generate_docker_compose.py --pods 16
+   
+   # Or use named volumes to avoid permission issues entirely
+   python generate_docker_compose.py --pods 16 --use-named-volumes-for-logs
+   ```
+
+3. **For production environments**, consider:
+   - Using named volumes for logs (`--use-named-volumes-for-logs`)
+   - Setting up proper user mapping between host and container
+   - Using more restrictive permissions with matching UIDs
+
 ## Running the Crawler
 
 The crawler is run via `main.py`.

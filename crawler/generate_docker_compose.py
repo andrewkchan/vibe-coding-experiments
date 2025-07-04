@@ -3,24 +3,55 @@
 
 import argparse
 import yaml
+import os
+import stat
 from pathlib import Path
 from typing import Dict, Any, List
 
 
+def create_log_directories(num_pods: int, base_path: Path = Path('.')):
+    """Create log directories with proper permissions."""
+    log_base = base_path / 'logs' / 'redis'
+    
+    for pod_id in range(num_pods):
+        log_dir = log_base / f'pod-{pod_id}'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set permissions to 777 to allow Redis container to write
+        # In production, consider more restrictive permissions with proper user mapping
+        os.chmod(log_dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        
+        print(f"Created log directory: {log_dir}")
+
+
 def generate_redis_service(pod_id: int, base_port: int = 6379, 
-                         memory_limit: str = "90gb") -> Dict[str, Any]:
-    """Generate configuration for a single Redis service."""
+                         memory_limit: str = "90gb",
+                         use_named_volumes_for_logs: bool = False) -> Dict[str, Any]:
+    """Generate configuration for a single Redis service.
+    
+    Args:
+        pod_id: Pod identifier
+        base_port: Base Redis port (default 6379)
+        memory_limit: Memory limit for Redis
+        use_named_volumes_for_logs: If True, use named volumes for logs instead of bind mounts
+    """
     port = base_port + pod_id
+    
+    volumes = [f'redis-data-{pod_id}:/data']
+    
+    if use_named_volumes_for_logs:
+        # Use named volume for logs
+        volumes.append(f'redis-logs-{pod_id}:/var/log/redis')
+    else:
+        # Use bind mount for logs (requires proper permissions)
+        volumes.append(f'./logs/redis/pod-{pod_id}:/var/log/redis')
     
     return {
         'image': 'redis:latest',
         'container_name': f'crawler-redis-{pod_id}',
         'restart': 'unless-stopped',
         'ports': [f'{port}:{base_port}'],
-        'volumes': [
-            f'redis-data-{pod_id}:/data',
-            f'./logs/redis/pod-{pod_id}:/var/log/redis'
-        ],
+        'volumes': volumes,
         'command': [
             'redis-server',
             '--maxmemory', memory_limit,
@@ -47,7 +78,8 @@ def generate_redis_service(pod_id: int, base_port: int = 6379,
 
 def generate_docker_compose(num_pods: int = 16, 
                           base_port: int = 6379,
-                          total_memory_gb: int = 1440) -> Dict[str, Any]:
+                          total_memory_gb: int = 1440,
+                          use_named_volumes_for_logs: bool = False) -> Dict[str, Any]:
     """Generate complete docker-compose configuration."""
     
     # Calculate memory per Redis instance
@@ -96,7 +128,9 @@ def generate_docker_compose(num_pods: int = 16,
     # Add Redis services
     for pod_id in range(num_pods):
         service_name = f'redis-{pod_id}'
-        services[service_name] = generate_redis_service(pod_id, base_port, memory_limit)
+        services[service_name] = generate_redis_service(
+            pod_id, base_port, memory_limit, use_named_volumes_for_logs
+        )
     
     # Generate volumes
     volumes = {
@@ -107,6 +141,10 @@ def generate_docker_compose(num_pods: int = 16,
     # Add Redis data volumes
     for pod_id in range(num_pods):
         volumes[f'redis-data-{pod_id}'] = {'driver': 'local'}
+        
+        # Add log volumes if using named volumes
+        if use_named_volumes_for_logs:
+            volumes[f'redis-logs-{pod_id}'] = {'driver': 'local'}
     
     # Complete docker-compose structure
     docker_compose = {
@@ -151,8 +189,31 @@ def main():
         action='store_true',
         help='Backup existing docker-compose.yml before overwriting'
     )
+    parser.add_argument(
+        '--use-named-volumes-for-logs',
+        action='store_true',
+        help='Use named Docker volumes for logs instead of bind mounts (avoids permission issues)'
+    )
+    parser.add_argument(
+        '--create-log-dirs',
+        action='store_true',
+        default=True,
+        help='Create log directories with proper permissions (default: True)'
+    )
+    parser.add_argument(
+        '--skip-log-dir-creation',
+        dest='create_log_dirs',
+        action='store_false',
+        help='Skip creating log directories'
+    )
     
     args = parser.parse_args()
+    
+    # Create log directories if using bind mounts
+    if not args.use_named_volumes_for_logs and args.create_log_dirs:
+        print("Creating log directories with proper permissions...")
+        create_log_directories(args.pods)
+        print()
     
     # Backup existing file if requested
     if args.backup and args.output.exists():
@@ -165,7 +226,8 @@ def main():
     config = generate_docker_compose(
         num_pods=args.pods,
         base_port=args.base_port,
-        total_memory_gb=args.total_memory_gb
+        total_memory_gb=args.total_memory_gb,
+        use_named_volumes_for_logs=args.use_named_volumes_for_logs
     )
     
     # Write to file
@@ -178,6 +240,14 @@ def main():
     print(f"  - Redis ports: {args.base_port}-{args.base_port + args.pods - 1}")
     print(f"  - Memory per pod: {args.total_memory_gb // args.pods}GB")
     print(f"  - Total memory: {args.total_memory_gb}GB")
+    print(f"  - Log storage: {'Named volumes' if args.use_named_volumes_for_logs else 'Bind mounts'}")
+    
+    if not args.use_named_volumes_for_logs:
+        print(f"\nIMPORTANT: Using bind mounts for logs.")
+        print(f"  - Log directories have been created with open permissions (777)")
+        print(f"  - For production, consider using --use-named-volumes-for-logs")
+        print(f"  - Or adjust permissions based on your security requirements")
+    
     print(f"\nTo start the services:")
     print(f"  docker-compose up -d")
     print(f"\nTo start only Redis services:")

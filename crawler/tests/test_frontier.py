@@ -42,6 +42,62 @@ class FrontierTestConfig:
     redis_db: int = 15
     redis_password: str | None = None
 
+def convert_test_config_to_crawler_config_dict(test_config: FrontierTestConfig) -> dict:
+    """Convert FrontierTestConfig to a dict compatible with new CrawlerConfig."""
+    from crawler_module.config import PodConfig
+    
+    # Create a single pod config for backward compatibility
+    pod_configs = [
+        PodConfig(
+            pod_id=0,
+            redis_url=f"redis://{test_config.redis_host}:{test_config.redis_port}/{test_config.redis_db}"
+        )
+    ]
+    
+    return {
+        'seed_file': test_config.seed_file,
+        'email': test_config.email,
+        'exclude_file': test_config.exclude_file,
+        'max_pages': test_config.max_pages,
+        'max_duration': test_config.max_duration,
+        'log_level': test_config.log_level,
+        'resume': test_config.resume,
+        'seeded_urls_only': test_config.seeded_urls_only,
+        'user_agent': f"{test_config.user_agent} ({test_config.email})",
+        
+        # Pod configuration (single pod for backward compatibility)
+        'pod_configs': pod_configs,
+        'fetchers_per_pod': test_config.num_fetcher_processes,
+        'parsers_per_pod': test_config.num_parser_processes,
+        'fetcher_workers': test_config.fetcher_workers,
+        'parser_workers': test_config.parser_workers,
+        
+        # Storage configuration
+        'data_dirs': [test_config.data_dir],  # Convert to list
+        'log_dir': test_config.data_dir / "logs",
+        
+        # Redis configuration
+        'redis_db': test_config.redis_db,
+        'redis_password': test_config.redis_password,
+        'redis_max_connections': 10,
+        
+        # Legacy support
+        'redis_host': test_config.redis_host,
+        'redis_port': test_config.redis_port,
+        
+        # Default values for new fields
+        'enable_cpu_affinity': False,
+        'politeness_delay_seconds': 1,
+        'robots_cache_ttl_seconds': 300,
+        'parse_queue_soft_limit': 100,
+        'parse_queue_hard_limit': 500,
+        'bloom_filter_capacity': 100000,
+        'bloom_filter_error_rate': 0.01,
+        'global_coordination_redis_pod': 0,
+        'global_metrics_update_interval': 5,
+        'prometheus_port': 8001
+    }
+
 # Note: The redis_client fixture is now imported from conftest.py as redis_test_client
 # This ensures we use db=15 for tests and never touch production data (db=0)
 
@@ -65,7 +121,7 @@ async def frontier_test_config_obj(temp_test_frontier_dir: Path) -> FrontierTest
 @pytest_asyncio.fixture
 async def actual_config_for_frontier(frontier_test_config_obj: FrontierTestConfig) -> CrawlerConfig:
     """Provides the actual CrawlerConfig based on FrontierTestConfig."""
-    return CrawlerConfig(**vars(frontier_test_config_obj))
+    return CrawlerConfig(**convert_test_config_to_crawler_config_dict(frontier_test_config_obj))
 
 @pytest_asyncio.fixture
 def mock_politeness_enforcer_for_frontier() -> MagicMock:
@@ -135,7 +191,7 @@ async def test_frontier_initialization_with_bare_domains_bug(
         seed_file=seed_file_path
     )
     fm = FrontierManager(
-        config=CrawlerConfig(**vars(test_config)),
+        config=CrawlerConfig(**convert_test_config_to_crawler_config_dict(test_config)),
         politeness=mock_politeness_enforcer_for_frontier,
         redis_client=redis_test_client
     )
@@ -249,7 +305,7 @@ async def test_redis_list_persistence(
     mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
     
     # First run: populate frontier
-    cfg_run1 = CrawlerConfig(**vars(frontier_test_config_obj))
+    cfg_run1 = CrawlerConfig(**convert_test_config_to_crawler_config_dict(frontier_test_config_obj))
     
     frontier_run1 = FrontierManager(
         config=cfg_run1,
@@ -430,7 +486,7 @@ async def test_atomic_domain_claiming_high_concurrency(
     mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
     
     # Create config for this test
-    config = CrawlerConfig(**vars(frontier_test_config_obj))
+    config = CrawlerConfig(**convert_test_config_to_crawler_config_dict(frontier_test_config_obj))
     
     # Prepare test URLs across multiple domains
     # With domain-level politeness, each domain can only serve one URL at a time
@@ -565,7 +621,7 @@ async def test_frontier_resume_with_politeness(
     mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
     
     # --- First run: populate and get one URL ---
-    cfg_run1_dict = vars(frontier_test_config_obj).copy()
+    cfg_run1_dict = convert_test_config_to_crawler_config_dict(frontier_test_config_obj)
     cfg_run1_dict['resume'] = False  # Ensure it's a new run
     cfg_run1 = CrawlerConfig(**cfg_run1_dict)
     
@@ -592,7 +648,7 @@ async def test_frontier_resume_with_politeness(
     logger.info(f"First run retrieved URL: {retrieved_url}")
     
     # --- Second run: resume ---
-    cfg_run2_dict = vars(frontier_test_config_obj).copy()
+    cfg_run2_dict = convert_test_config_to_crawler_config_dict(frontier_test_config_obj)
     cfg_run2_dict['resume'] = True
     cfg_run2 = CrawlerConfig(**cfg_run2_dict)
     
@@ -689,7 +745,7 @@ async def test_url_filtering_in_get_next_url(
     mock_politeness_enforcer_for_frontier.is_url_allowed.return_value = True
     mock_politeness_enforcer_for_frontier.can_fetch_domain_now.return_value = True
     
-    config = CrawlerConfig(**vars(frontier_test_config_obj))
+    config = CrawlerConfig(**convert_test_config_to_crawler_config_dict(frontier_test_config_obj))
     fm = FrontierManager(
         config=config,
         politeness=mock_politeness_enforcer_for_frontier,
