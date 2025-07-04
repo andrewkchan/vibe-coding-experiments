@@ -1,0 +1,70 @@
+# Test configuration for local development
+# Uses 4 pods instead of 16 for easier testing
+
+# Pod configuration - 4 pods for testing
+pods:
+  - redis_url: "redis://localhost:6379"
+  - redis_url: "redis://localhost:6380"
+  - redis_url: "redis://localhost:6381"
+  - redis_url: "redis://localhost:6382"
+
+# Test storage configuration - local directories
+data_dirs:
+  - "./test_data/ssd1"
+  - "./test_data/ssd2"
+
+# Local logging
+log_dir: "./logs"
+log_level: "DEBUG"
+
+# Reduced process configuration for testing
+fetchers_per_pod: 2      # 8 total fetcher processes (pod 0's orchestrator counts as fetcher 0)
+parsers_per_pod: 1       # 4 total parser processes
+fetcher_workers: 50      # Fewer async workers for testing
+parser_workers: 20       # Fewer async workers for testing
+
+# Disable CPU affinity for local testing
+enable_cpu_affinity: false
+
+# Test crawler settings
+politeness_delay_seconds: 10  # Faster for testing
+max_pages: 10000              # Limit pages for testing
+max_duration: 3600            # 1 hour max
+
+# Smaller bloom filter for testing
+bloom_filter_capacity: 1000000    # 1 million vs 10 billion
+bloom_filter_error_rate: 0.01    # Higher error rate acceptable for testing
+
+# Test email
+email: "test@example.com"
+seed_file: "./test_seeds.txt"
+
+# User agent for testing
+user_agent_template: "TestCrawler/1.0 ({email})"
+
+# Other settings remain the same as production
+redis_db: 0
+redis_password: null
+redis_socket_timeout: 30
+redis_socket_connect_timeout: 10
+redis_socket_keepalive: true
+redis_max_connections: 100
+
+robots_cache_ttl_seconds: 3600    # 1 hour for testing
+http_timeout_seconds: 30
+http_max_retries: 2
+
+max_content_length: 10485760
+extract_text: true
+store_raw_html: false
+
+frontier_batch_size: 100          # Smaller batches for testing
+
+parse_queue_soft_limit: 1000      # Much smaller for testing
+parse_queue_hard_limit: 5000
+
+global_coordination_redis_pod: 0
+global_metrics_update_interval: 5  # More frequent updates for testing
+
+prometheus_port: 8001
+enable_prometheus: true 
