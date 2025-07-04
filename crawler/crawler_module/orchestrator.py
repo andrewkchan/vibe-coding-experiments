@@ -11,7 +11,6 @@ from multiprocessing import Process
 import redis.asyncio as redis
 from redis.asyncio import BlockingConnectionPool
 import gc
-import hashlib
 
 from .config import CrawlerConfig
 from .redis_shield import ShieldedRedis
@@ -21,7 +20,7 @@ from .redis_lock import LockManager
 from .storage import StorageManager
 from .fetcher import Fetcher
 from .politeness import PolitenessEnforcer
-from .frontier_factory import create_frontier
+from .frontier import FrontierManager
 from .memory_diagnostics import memory_diagnostics
 from .metrics import (
     start_metrics_server,
@@ -292,68 +291,6 @@ class CrawlerOrchestrator:
         self.fetcher_processes.clear()
         logger.info("All fetcher processes stopped.")
 
-    async def _reshard_domain_queues(self):
-        """Reshard domain queues based on the number of fetcher processes."""
-        # One shard per fetcher for simplicity
-        new_shard_count = self.config.num_fetcher_processes
-        
-        # Get current shard count
-        current_shard_count = await self.redis_client.get('crawler:shard_count')
-        if current_shard_count:
-            current_shard_count = int(current_shard_count)
-        else:
-            # Check if old single queue exists
-            old_queue_size = await self.redis_client.llen('domains:queue')
-            if old_queue_size > 0:
-                logger.info("Detected old single domain queue, will migrate to sharded queues")
-                current_shard_count = 0  # Indicates migration needed
-            else:
-                # Fresh start
-                current_shard_count = new_shard_count
-                await self.redis_client.set('crawler:shard_count', new_shard_count)
-                logger.info(f"Initialized with {new_shard_count} domain queue shards")
-                return
-        
-        if current_shard_count == new_shard_count:
-            logger.info(f"Domain queues already sharded correctly ({new_shard_count} shards)")
-            return
-        
-        logger.info(f"Resharding domain queues from {current_shard_count} to {new_shard_count} shards...")
-        
-        # Collect all domains from existing queues
-        all_domains = []
-        
-        if current_shard_count == 0:
-            # Migration from old single queue
-            while True:
-                domain = await self.redis_client.lpop('domains:queue')
-                if not domain:
-                    break
-                all_domains.append(domain)
-            logger.info(f"Migrated {len(all_domains)} domains from old single queue")
-        else:
-            # Collect from existing sharded queues
-            for shard in range(current_shard_count):
-                queue_key = f'domains:queue:{shard}'
-                while True:
-                    domain = await self.redis_client.lpop(queue_key)
-                    if not domain:
-                        break
-                    all_domains.append(domain)
-            logger.info(f"Collected {len(all_domains)} domains from {current_shard_count} shards")
-        
-        # Redistribute to new shards
-        for domain in all_domains:
-            # Use consistent hash to determine shard
-            # Use MD5 hash for consistent hashing across processes
-            domain_hash = hashlib.md5(domain.encode()).digest()
-            hash_int = int.from_bytes(domain_hash[:8], byteorder='big')
-            shard = hash_int % new_shard_count
-            await self.redis_client.rpush(f'domains:queue:{shard}', domain)
-        
-        # Update shard count
-        await self.redis_client.set('crawler:shard_count', new_shard_count)
-        logger.info(f"Resharding complete. Redistributed {len(all_domains)} domains to {new_shard_count} shards")
 
     async def _initialize_components(self):
         """Initializes orchestrator components that require async setup."""
@@ -364,9 +301,6 @@ class CrawlerOrchestrator:
         cleared_count = await lock_manager.clear_all_locks()
         if cleared_count > 0:
             logger.warning(f"Cleared {cleared_count} zombie locks from previous run")
-        
-        # Perform domain queue resharding if needed
-        await self._reshard_domain_queues()
         
         # One-time initialization shared across all processes
         logger.info("Performing one-time initialization...")
@@ -379,7 +313,7 @@ class CrawlerOrchestrator:
         temp_fetcher = Fetcher(self.config)
         politeness = PolitenessEnforcer(self.config, self.redis_client, temp_fetcher)
         # Initialize frontier (also initializes politeness with manual exclusions, seeds, etc.)
-        frontier = create_frontier(self.config, politeness, self.redis_client)
+        frontier = FrontierManager(self.config, politeness, self.redis_client)
         await frontier.initialize_frontier()
         
         # Clean up temporary instances
@@ -860,31 +794,20 @@ class CrawlerOrchestrator:
                 ]
                 logger.info(f"Status: {', '.join(status_parts)}")
                 
-                # Check if frontier is empty by checking all shard queues
-                shard_count = await self.redis_client.get('crawler:shard_count')
-                if shard_count:
-                    shard_count = int(shard_count)
-                    pipe = self.redis_client.pipeline()
-                    for shard in range(shard_count):
-                        pipe.llen(f'domains:queue:{shard}')
-                    counts = await pipe.execute()
-                    total_queue_size = sum(counts)
+                # Check if frontier is empty by checking domain queue
+                queue_size = await self.redis_client.llen('domains:queue')
+                
+                if queue_size == 0 and self.pages_crawled_count > 0:
+                    logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
+                    await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
                     
-                    if total_queue_size == 0 and self.pages_crawled_count > 0:
-                        logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
-                        await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
-                        
-                        # Re-check after wait
-                        pipe = self.redis_client.pipeline()
-                        for shard in range(shard_count):
-                            pipe.llen(f'domains:queue:{shard}')
-                        counts = await pipe.execute()
-                        total_queue_size = sum(counts)
-                        
-                        if total_queue_size == 0:
-                            logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
-                            self._shutdown_event.set()
-                            break
+                    # Re-check after wait
+                    queue_size = await self.redis_client.llen('domains:queue')
+                    
+                    if queue_size == 0:
+                        logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
+                        self._shutdown_event.set()
+                        break
                 
                 # Check global stopping conditions (max_pages, max_duration)
                 if self.config.max_pages and self.pages_crawled_count >= self.config.max_pages:

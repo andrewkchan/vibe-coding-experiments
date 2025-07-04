@@ -118,13 +118,6 @@ def parse_args(sys_args: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Redis password."
     )
-    parser.add_argument(
-        "--frontier-type",
-        type=str,
-        default="hybrid",
-        choices=["hybrid", "redis"],
-        help="Frontier storage type: 'hybrid' (filesystem+Redis) or 'redis' (Redis-only). Default: hybrid"
-    )
 
     args = parser.parse_args(sys_args)
     
@@ -156,7 +149,6 @@ class CrawlerConfig:
     redis_port: int
     redis_db: int
     redis_password: Optional[str]
-    frontier_type: str
 
     def get_redis_connection_kwargs(self) -> dict:
         """Get Redis connection parameters as kwargs dict."""
@@ -204,5 +196,4 @@ class CrawlerConfig:
             redis_port=args.redis_port,
             redis_db=args.redis_db,
             redis_password=args.redis_password,
-            frontier_type=args.frontier_type,
         ) 

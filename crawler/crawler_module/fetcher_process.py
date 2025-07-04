@@ -16,7 +16,7 @@ from .config import CrawlerConfig
 from .storage import StorageManager
 from .fetcher import Fetcher, FetchResult
 from .politeness import PolitenessEnforcer
-from .frontier_factory import create_frontier
+from .frontier import FrontierManager
 from .redis_shield import ShieldedRedis
 from .utils import extract_domain
 from .metrics import (
@@ -76,7 +76,7 @@ class FetcherProcess:
         # Initialize components
         self.storage = StorageManager(config, self.redis_client)  # type: ignore
         self.politeness = PolitenessEnforcer(config, self.redis_client, self.fetcher)
-        self.frontier = create_frontier(config, self.politeness, self.redis_client)
+        self.frontier = FrontierManager(config, self.politeness, self.redis_client)
         
         # Fetcher state
         self.worker_tasks: Set[asyncio.Task] = set()
@@ -111,8 +111,8 @@ class FetcherProcess:
         try:
             while not self._shutdown_event.is_set():
                 try:
-                    # Get next URL from our assigned shard
-                    next_url_info = await self.frontier.get_next_url(fetcher_id=self.fetcher_id)
+                    # Get next URL
+                    next_url_info = await self.frontier.get_next_url()
 
                     if next_url_info is None:
                         # No suitable URL available

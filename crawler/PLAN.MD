@@ -18,16 +18,12 @@ The crawler uses a multi-process, Redis-based architecture designed for high thr
 ### 2.1. Core Components
 
 *   **Main Orchestrator (`orchestrator.py`):** The central controller that manages the entire crawl lifecycle. It runs as fetcher process 0 (leader model) while also spawning and supervising additional fetcher and parser processes.
-*   **Fetcher Processes (`fetcher_process.py`):** Independent processes that run pools of asynchronous workers for fetching URLs. Each process handles a specific shard of domains. The orchestrator runs fetcher 0 internally, while additional fetcher processes (1, 2, ...) run separately.
+*   **Fetcher Processes (`fetcher_process.py`):** Independent processes that run pools of asynchronous workers for fetching URLs. The orchestrator runs fetcher 0 internally, while additional fetcher processes (1, 2, ...) run separately.
 *   **Parser Consumers (`parser_consumer.py`):** Separate processes dedicated to parsing HTML. They consume raw HTML from a Redis queue, extract text and links, and save results. This prevents CPU-intensive parsing from blocking the fetchers.
-*   **Frontier Manager:** Manages the URLs to be crawled with two storage modes (configurable via `--frontier-type`):
-    *   **Hybrid Mode (`frontier.py`, default):** Uses a combination of Redis and filesystem:
-        *   **Redis:** Stores coordination data, domain metadata (politeness rules, next fetch times), a "seen" URL bloom filter for fast de-duplication, an exact set of "visited" URLs, and sharded domain queues (`domains:queue:0`, `domains:queue:1`, etc.).
-        *   **File System:** Stores the actual frontier of URLs in append-only files, one per domain. This allows for a virtually unlimited frontier size without consuming excessive memory.
-    *   **Redis-Only Mode (`frontier_redis.py`):** Stores everything in Redis for maximum performance:
-        *   All frontier URLs are stored in Redis lists (`frontier:{domain}`)
-        *   No file I/O, no offset tracking, simpler architecture
-        *   Requires more memory but provides better performance
+*   **Frontier Manager (`frontier.py`):** Manages the URLs to be crawled using Redis for all storage:
+    *   Stores frontier URLs in Redis lists (`frontier:{domain}`)
+    *   Uses Redis for coordination data, domain metadata (politeness rules, next fetch times), a "seen" URL bloom filter for fast de-duplication, an exact set of "visited" URLs, and a single domain queue (`domains:queue`)
+    *   All operations are atomic Redis commands - no locking needed
 *   **Storage Manager (`storage.py`):** Handles persistence. It saves visited page metadata to Redis and the extracted text content to the file system.
 *   **Politeness Enforcer (`politeness.py`):** Manages `robots.txt` rules and crawl delays, using Redis as a cache for politeness information.
 *   **Fetcher (`fetcher.py`):** The underlying asynchronous HTTP client (`aiohttp`) used by the fetcher workers.
@@ -36,19 +32,18 @@ The crawler uses a multi-process, Redis-based architecture designed for high thr
 
 1.  **Initialization:**
     *   The Main Orchestrator starts, connects to Redis, and performs one-time initialization (DB schema, manual exclusions, frontier initialization).
-    *   It performs domain queue resharding if the number of fetcher processes has changed. Domains are distributed across shards using simple modulo hashing.
     *   It creates its own FetcherProcess instance (fetcher 0), spawns additional fetcher processes (1+), and parser processes.
 2.  **Fetching Loop (Multiple Processes):**
-    *   Each fetcher process only accesses its assigned domain shard(s). With N fetcher processes, fetcher i handles shard i.
-    *   The Frontier Manager provides a ready URL from the fetcher's shard, respecting politeness delays.
+    *   All fetcher processes read from the single domain queue.
+    *   The Frontier Manager provides a ready URL from the queue, respecting politeness delays.
     *   The fetcher worker downloads the page content.
     *   If the content is HTML, the worker pushes the raw HTML and metadata (URL, depth, etc.) to a Redis queue (`fetch:queue`).
-    *   The fetcher worker is now free to immediately get another URL from its shard.
+    *   The fetcher worker is now free to immediately get another URL.
 3.  **Parsing Loop (Separate Process):**
     *   A Parser Consumer process pops an HTML job from the `fetch:queue`.
     *   It parses the HTML to extract the main text content and new links.
     *   The Storage Manager saves the text content to a file.
-    *   The Frontier Manager adds the new, valid, and unseen links to the appropriate domain's frontier file and shard queue.
+    *   The Frontier Manager adds the new, valid, and unseen links to the appropriate domain's frontier list in Redis.
     *   The Storage Manager records the URL as "visited" in Redis.
 4.  **Termination:** The process continues until a crawl limit is reached or the frontier is exhausted.
 
@@ -60,7 +55,7 @@ The crawler uses a multi-process, Redis-based architecture designed for high thr
 *   **Worker-Level Concurrency:**
     *   **Fetcher Workers:** Each fetcher process runs `--fetcher-workers` async tasks (default: 500).
     *   **Parser Workers:** Each parser process runs `--parser-workers` async tasks (default: 80).
-*   **Domain Sharding:** With N fetcher processes, there are N domain shards. Each fetcher exclusively handles its shard, preventing contention. The orchestrator automatically reshards on startup if the number of processes changes.
+*   **Shared Queue:** All fetcher processes read from a single domain queue in Redis, with atomic operations ensuring no contention.
 
 ### 2.4. Architecture Diagram
 
@@ -74,12 +69,12 @@ graph TD
     subgraph Crawler System
         subgraph "Orchestrator Process (Leader)"
             Main[Main Orchestrator]
-            Fetcher0["Fetcher 0<br/>(500 workers)<br/>Shard 0"]
+            Fetcher0["Fetcher 0<br/>(500 workers)"]
         end
         
         subgraph Additional Fetcher Processes
-            Fetcher1["Fetcher 1<br/>(500 workers)<br/>Shard 1"]
-            FetcherN["Fetcher N<br/>(500 workers)<br/>Shard N"]
+            Fetcher1["Fetcher 1<br/>(500 workers)"]
+            FetcherN["Fetcher N<br/>(500 workers)"]
         end
         
         subgraph Parser Processes
@@ -89,12 +84,12 @@ graph TD
 
     subgraph Data Stores
         subgraph Redis
-            DomainQueues["Sharded Domain Queues<br/>(domains:queue:0, :1, ..., :N)"]
+            DomainQueue["Domain Queue<br/>(domains:queue)"]
             FetchQueue[fetch:queue]
-            Metadata["Domain Metadata<br/>Bloom Filter<br/>Visited URLs"]
+            Metadata["Domain Metadata<br/>Bloom Filter<br/>Visited URLs<br/>Frontier Lists"]
         end
         
-        FS["File System<br/>(frontiers/, content/)"]
+        FS["File System<br/>(content/)"]
     end
 
     subgraph External Services
@@ -113,10 +108,10 @@ graph TD
     Fetcher1 --> Web
     FetcherN --> Web
     
-    %% Domain sharding
-    Fetcher0 -.->|only shard 0| DomainQueues
-    Fetcher1 -.->|only shard 1| DomainQueues
-    FetcherN -.->|only shard N| DomainQueues
+    %% Shared domain queue
+    Fetcher0 <--> DomainQueue
+    Fetcher1 <--> DomainQueue
+    FetcherN <--> DomainQueue
     
     %% Parse queue
     Fetcher0 --> FetchQueue
@@ -141,22 +136,14 @@ The crawler uses a hybrid of Redis and the file system for persistence.
 ### 3.1. Redis Data Structures
 
 *   **Domain Metadata (Hash):** `domain:{domain}`
-    *   For hybrid mode:
-        *   `file_path`: Path to the domain's frontier file.
-        *   `frontier_offset`: Byte offset for the next URL to read from the file.
-        *   `frontier_size`: Total size in bytes of the frontier file.
-    *   For both modes:
-        *   `next_fetch_time`: UNIX timestamp for when this domain can be crawled next.
-        *   `robots_txt`: Cached content of `robots.txt`.
-        *   `robots_expires`: Expiry timestamp for the `robots.txt` cache.
-        *   `is_excluded`: Flag for manually excluded domains.
-*   **Frontier Lists (Redis-only mode):** `frontier:{domain}`
+    *   `next_fetch_time`: UNIX timestamp for when this domain can be crawled next.
+    *   `robots_txt`: Cached content of `robots.txt`.
+    *   `robots_expires`: Expiry timestamp for the `robots.txt` cache.
+    *   `is_excluded`: Flag for manually excluded domains.
+*   **Frontier Lists:** `frontier:{domain}`
     *   Lists containing URLs to crawl for each domain in "url|depth" format.
-    *   Only used when `--frontier-type=redis`.
-*   **Sharded Domain Queues (Lists):** `domains:queue:0`, `domains:queue:1`, ..., `domains:queue:N-1`
-    *   N lists (where N = number of fetcher processes) that partition domains across fetchers. Domain assignment uses simple modulo hashing: `shard = hash(domain) % num_fetcher_processes`.
-*   **Shard Count (String):** `crawler:shard_count`
-    *   Stores the current number of shards. Used for detecting when resharding is needed on startup.
+*   **Domain Queue (List):** `domains:queue`
+    *   Single queue that contains all domains with URLs to crawl.
 *   **"Seen" URLs (Bloom Filter):** `seen:bloom`
     *   A probabilistic data structure used for fast, memory-efficient de-duplication of all URLs ever encountered. This prevents re-adding URLs to the frontier.
 *   **"Visited" URLs (Hashes):** `visited:{url_hash}`
@@ -168,8 +155,6 @@ The crawler uses a hybrid of Redis and the file system for persistence.
 
 ### 3.2. File System Storage
 
-*   **Frontier Files:** `crawler_data/frontiers/{domain_hash_prefix}/{domain}.frontier`
-    *   Append-only files containing the URLs to be crawled for a specific domain, with one `url|depth` entry per line.
 *   **Content Files:** `crawler_data/content/`
     *   Extracted text content is stored in files named by a hash of the URL (e.g., `<url_sha256>.txt`). The `visited:*` hashes in Redis link a URL to its content file.
 
@@ -181,12 +166,12 @@ The crawler uses a hybrid of Redis and the file system for persistence.
 
 ## 5. Fault Tolerance and Resumption
 
-*   **State Persistence:** All critical state is persisted in Redis or the file system.
+*   **State Persistence:** All critical state is persisted in Redis.
 *   **Redis Persistence:** The provided Docker Compose setup for Redis uses RDB snapshots only (AOF disabled) for simplicity and lower memory usage. Snapshots occur every 1-15 minutes based on change frequency.
-*   **Resumption:** When the crawler is started with the `--resume` flag, it picks up where it left off using the data in Redis and the frontier files.
+*   **Resumption:** When the crawler is started with the `--resume` flag, it picks up where it left off using the data in Redis.
 *   **Zombie Lock Cleanup:** On startup, the orchestrator scans Redis for and removes any stale domain write locks that might have been left over from a previous crashed run.
 
-## 6. Multiprocess Configuration and Domain Sharding
+## 6. Multiprocess Configuration
 
 ### 6.1. Process Configuration
 
@@ -198,39 +183,28 @@ The crawler supports configurable numbers of fetcher and parser processes:
 *   **`--parser-workers`** (default: 80): Async workers per parser process.
 
 Example configurations:
-*   Light workload: 1 fetcher + 1 parser (1000 total async workers)
+*   Light workload: 1 fetcher + 1 parser (500 fetchers + 80 parsers)
 *   Balanced (default): 2 fetchers + 1 parser (1000 fetchers + 80 parsers)
 *   Parser-heavy: 2 fetchers + 2 parsers (1000 fetchers + 160 parsers)
 *   Scale-out: 4 fetchers + 2 parsers (2000 fetchers + 160 parsers)
 
-### 6.2. Domain Sharding
-
-To prevent contention and maintain process-local read locks:
-
-1.  **Shard Assignment:** Each domain is assigned to exactly one fetcher using `hash(domain) % num_fetcher_processes`.
-2.  **Queue Isolation:** Each fetcher only reads from its shard's queue (`domains:queue:i`).
-3.  **Automatic Resharding:** On startup, if the number of fetcher processes changes, the orchestrator redistributes all domains to match the new configuration.
-4.  **Leader Model Benefits:** The orchestrator runs fetcher 0 internally, reducing process overhead and simplifying coordination.
-
-### 6.3. Process Responsibilities
+### 6.2. Process Responsibilities
 
 **Orchestrator (Leader)**
 *   Performs one-time initialization (schema, exclusions, frontier)
 *   Runs fetcher process 0 internally
 *   Spawns and monitors additional processes
 *   Handles global stopping conditions
-*   Performs domain resharding when needed
 
 **Fetcher Processes**
-*   Each handles one domain shard exclusively
-*   Maintains process-local domain read locks
-*   Fetches content and pushes to parse queue
-*   Respects politeness delays per domain
+*   Read from shared domain queue
+*   Fetch content and push to parse queue
+*   Respect politeness delays per domain
 
 **Parser Processes**
 *   Consume from shared parse queue
 *   Extract text and links
-*   Update frontier files with new URLs
+*   Update frontier lists with new URLs
 *   Save content to filesystem
 
 ## 7. Project Directory Structure (Simplified)
