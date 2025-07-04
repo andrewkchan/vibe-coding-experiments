@@ -332,11 +332,10 @@ class FetcherProcess:
 
 def run_fetcher_process(config: CrawlerConfig, fetcher_id: int, pod_id: int = 0):
     """Entry point for running a fetcher as a separate process."""
-    # Setup logging for the child process
-    logging.basicConfig(
-        level=config.log_level,
-        format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Fetcher-{fetcher_id}] %(message)s'
-    )
+    from .logging_utils import setup_pod_logging
+    
+    # Setup per-pod logging for the child process
+    setup_pod_logging(config, pod_id, 'fetcher', fetcher_id)
     
     # Create and run the fetcher
     fetcher = FetcherProcess(config, fetcher_id, pod_id)

@@ -61,11 +61,9 @@ class FrontierManager:
         self.redis = redis_client
         self.pod_id = pod_id
         
-        # Update logger to include pod_id if we're in a multi-pod setup
-        if config.num_pods > 1:
-            self.logger = logging.getLogger(f"{__name__}.pod{pod_id}")
-        else:
-            self.logger = logger
+        # Use pod-aware logger
+        from .logging_utils import get_process_logger
+        self.logger = get_process_logger(__name__, pod_id if config.num_pods > 1 else None)
         
         # Check debug mode once during initialization for performance
         self.debug_pod_assignment = os.environ.get('CRAWLER_DEBUG_POD_ASSIGNMENT', '').lower() == 'true'

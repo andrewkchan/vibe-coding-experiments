@@ -147,14 +147,11 @@ class CrawlerOrchestrator:
         def run_fetcher(pod_id: int, fetcher_id: int):
             """Function to run in the fetcher process."""
             import asyncio
-            import logging
+            from .logging_utils import setup_pod_logging
             from .fetcher_process import run_fetcher_process
             
-            # Setup logging with pod ID
-            logging.basicConfig(
-                level=logging.INFO,
-                format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Fetcher-{fetcher_id}] %(message)s'
-            )
+            # Setup per-pod logging
+            setup_pod_logging(self.config, pod_id, 'fetcher', fetcher_id)
             
             # Run the fetcher with pod ID
             run_fetcher_process(self.config, fetcher_id, pod_id=pod_id)
@@ -162,14 +159,11 @@ class CrawlerOrchestrator:
         def run_parser(pod_id: int, parser_id: int):
             """Function to run in the parser process."""
             import asyncio
-            import logging
+            from .logging_utils import setup_pod_logging
             from .parser_consumer import ParserConsumer
             
-            # Setup logging with pod ID
-            logging.basicConfig(
-                level=logging.INFO,
-                format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Parser-{parser_id}] %(message)s'
-            )
+            # Setup per-pod logging
+            setup_pod_logging(self.config, pod_id, 'parser', parser_id)
             
             # Create and run the parser consumer for this pod
             consumer = ParserConsumer(self.config, pod_id=pod_id)

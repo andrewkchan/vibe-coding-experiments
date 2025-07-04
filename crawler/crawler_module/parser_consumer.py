@@ -371,13 +371,13 @@ class ParserConsumer:
 
 async def main():
     """Entry point for parser consumer process."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    from .logging_utils import setup_pod_logging
+    
     config = CrawlerConfig.from_args()
     
     # When run standalone, assume pod 0
+    setup_pod_logging(config, 0, 'parser', 'standalone')
+    
     logger.info("Starting standalone parser consumer for pod 0 (assuming Redis is initialized)")
     
     consumer = ParserConsumer(config, pod_id=0)
