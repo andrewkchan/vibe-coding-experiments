@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import redis.asyncio as redis
 from urllib.robotparser import RobotFileParser
 
-from crawler_module.politeness import PolitenessEnforcer, DEFAULT_ROBOTS_TXT_TTL, MIN_CRAWL_DELAY_SECONDS
+from crawler_module.politeness import PolitenessEnforcer
 from crawler_module.config import CrawlerConfig
 from crawler_module.fetcher import Fetcher, FetchResult
 
@@ -87,7 +87,7 @@ async def test_get_robots_from_redis_cache_fresh(politeness_enforcer: Politeness
     """Tests getting a fresh robots.txt from the Redis cache when not in memory."""
     domain = "rediscached.com"
     robots_text = "User-agent: TestCrawler\nDisallow: /private"
-    future_expiry = int(time.time()) + DEFAULT_ROBOTS_TXT_TTL
+    future_expiry = int(time.time()) + test_config.robots_cache_ttl_seconds
 
     # Setup: Ensure not in memory, but Redis will return a fresh record
     assert domain not in politeness_enforcer.robots_parsers
@@ -281,7 +281,7 @@ async def test_is_url_allowed_seeded_urls_only(redis_test_client: redis.Redis, m
 @pytest.mark.asyncio
 async def test_get_crawl_delay_from_robots_agent_specific(politeness_enforcer: PolitenessEnforcer, test_config: CrawlerConfig):
     domain = "delaytest.com"
-    for agent_delay in [MIN_CRAWL_DELAY_SECONDS - 1, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 1]:
+    for agent_delay in [test_config.politeness_delay_seconds - 1, test_config.politeness_delay_seconds, test_config.politeness_delay_seconds + 1]:
         # Use simplified user agent for robots.txt (without version/parens)
         robots_text = f"User-agent: TestCrawler\nCrawl-delay: {agent_delay}"
         
@@ -294,12 +294,12 @@ async def test_get_crawl_delay_from_robots_agent_specific(politeness_enforcer: P
         politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
         delay = await politeness_enforcer.get_crawl_delay(domain)
-        assert delay == max(float(agent_delay), float(MIN_CRAWL_DELAY_SECONDS))
+        assert delay == max(float(agent_delay), float(test_config.politeness_delay_seconds))
 
 @pytest.mark.asyncio
 async def test_get_crawl_delay_from_robots_wildcard(politeness_enforcer: PolitenessEnforcer, test_config: CrawlerConfig):
     domain = "wildcarddelay.com"
-    for wildcard_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
+    for wildcard_delay in [test_config.politeness_delay_seconds - 10, test_config.politeness_delay_seconds, test_config.politeness_delay_seconds + 10]:
         robots_text = f"User-agent: AnotherBot\nCrawl-delay: 50\nUser-agent: *\nCrawl-delay: {wildcard_delay}"
 
         # Create a RobotFileParser and parse the robots.txt
@@ -311,7 +311,7 @@ async def test_get_crawl_delay_from_robots_wildcard(politeness_enforcer: Politen
         politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
         delay = await politeness_enforcer.get_crawl_delay(domain)
-        assert delay == max(float(wildcard_delay), float(MIN_CRAWL_DELAY_SECONDS))
+        assert delay == max(float(wildcard_delay), float(test_config.politeness_delay_seconds))
 
 @pytest.mark.asyncio
 async def test_get_crawl_delay_default_no_robots_rule(politeness_enforcer: PolitenessEnforcer, test_config: CrawlerConfig):
@@ -323,12 +323,12 @@ async def test_get_crawl_delay_default_no_robots_rule(politeness_enforcer: Polit
     politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
     delay = await politeness_enforcer.get_crawl_delay(domain)
-    assert delay == float(MIN_CRAWL_DELAY_SECONDS)
+    assert delay == float(test_config.politeness_delay_seconds)
 
 @pytest.mark.asyncio
 async def test_get_crawl_delay_respects_min_crawl_delay(politeness_enforcer: PolitenessEnforcer, test_config: CrawlerConfig):
     domain = "shortdelay.com"
-    for robot_delay in [MIN_CRAWL_DELAY_SECONDS - 10, MIN_CRAWL_DELAY_SECONDS, MIN_CRAWL_DELAY_SECONDS + 10]:
+    for robot_delay in [test_config.politeness_delay_seconds - 10, test_config.politeness_delay_seconds, test_config.politeness_delay_seconds + 10]:
         robots_text = f"User-agent: *\nCrawl-delay: {robot_delay}"
 
         # Create a RobotFileParser and parse the robots.txt
@@ -340,7 +340,7 @@ async def test_get_crawl_delay_respects_min_crawl_delay(politeness_enforcer: Pol
         politeness_enforcer._get_robots_for_domain = AsyncMock(return_value=rfp)
 
         delay = await politeness_enforcer.get_crawl_delay(domain)
-        assert delay == max(float(robot_delay), float(MIN_CRAWL_DELAY_SECONDS))
+        assert delay == max(float(robot_delay), float(test_config.politeness_delay_seconds))
 
 # --- Tests for can_fetch_domain_now (async) ---
 @pytest.mark.asyncio
@@ -383,11 +383,11 @@ async def test_can_fetch_domain_now_insufficient_delay(politeness_enforcer: Poli
 
 # --- Tests for record_domain_fetch_attempt (async) ---
 @pytest.mark.asyncio
-async def test_record_domain_fetch_attempt_new_domain(politeness_enforcer: PolitenessEnforcer):
+async def test_record_domain_fetch_attempt_new_domain(politeness_enforcer: PolitenessEnforcer, test_config: CrawlerConfig):
     domain = "recordnew.com"
     
     # Mock get_crawl_delay
-    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=float(MIN_CRAWL_DELAY_SECONDS))
+    politeness_enforcer.get_crawl_delay = AsyncMock(return_value=float(test_config.politeness_delay_seconds))
     
     # Record fetch
     await politeness_enforcer.record_domain_fetch_attempt(domain)

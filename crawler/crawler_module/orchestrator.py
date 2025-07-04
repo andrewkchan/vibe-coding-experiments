@@ -594,8 +594,8 @@ class CrawlerOrchestrator:
             
             # Start Prometheus metrics server
             # In multiprocess mode, this aggregates metrics from all processes
-            if start_metrics_server(port=8001):
-                logger.info("Prometheus metrics server started on port 8001")
+            if start_metrics_server(port=self.config.prometheus_port):
+                logger.info(f"Prometheus metrics server started on port {self.config.prometheus_port}")
             
             # Start processes for all pods
             logger.info(f"Starting processes for {self.config.num_pods} pods...")

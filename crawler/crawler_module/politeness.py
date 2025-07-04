@@ -9,9 +9,6 @@ from .fetcher import Fetcher, MAX_ROBOTS_LENGTH
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROBOTS_TXT_TTL = 24 * 60 * 60  # 24 hours in seconds
-MIN_CRAWL_DELAY_SECONDS = 70 # Our project's default minimum
-
 class PolitenessEnforcer:
     """Redis-backed implementation of PolitenessEnforcer.
     
@@ -143,7 +140,7 @@ class PolitenessEnforcer:
             
         # 4. Cache the result (even if it's empty)
         fetched_timestamp = int(time.time())
-        expires_timestamp = fetched_timestamp + DEFAULT_ROBOTS_TXT_TTL
+        expires_timestamp = fetched_timestamp + self.config.robots_cache_ttl_seconds
         await self._update_robots_cache(domain, fetched_robots_content, fetched_timestamp, expires_timestamp)
         
         # 5. Parse and update in-memory cache
@@ -224,10 +221,10 @@ class PolitenessEnforcer:
                     logger.debug(f"Using {delay}s crawl delay from robots.txt for {domain} (wildcard agent)")
         
         if delay is None:
-            logger.debug(f"No crawl delay specified in robots.txt for {domain}. Using default: {MIN_CRAWL_DELAY_SECONDS}s")
-            return float(MIN_CRAWL_DELAY_SECONDS)
+            logger.debug(f"No crawl delay specified in robots.txt for {domain}. Using default: {self.config.politeness_delay_seconds}s")
+            return float(self.config.politeness_delay_seconds)
         
-        return max(float(delay), float(MIN_CRAWL_DELAY_SECONDS))
+        return max(float(delay), float(self.config.politeness_delay_seconds))
     
     async def can_fetch_domain_now(self, domain: str) -> bool:
         """Checks if the domain can be fetched now based on crawl delay."""

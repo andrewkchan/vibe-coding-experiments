@@ -51,19 +51,11 @@ redis_max_connections: 1000  # Per Redis instance
 # Crawler behavior settings
 politeness_delay_seconds: 70
 robots_cache_ttl_seconds: 86400  # 24 hours
-http_timeout_seconds: 30
-http_max_retries: 2
 user_agent_template: "ExperimentalCrawler/1.0 ({email})"
-
-# Content processing
-max_content_length: 10485760  # 10MB
-extract_text: true
-store_raw_html: false
 
 # Frontier management
 bloom_filter_capacity: 10000000000  # 10 billion
 bloom_filter_error_rate: 0.001
-frontier_batch_size: 1000
 
 # Performance tuning
 parse_queue_soft_limit: 20000  # Per pod
@@ -74,20 +66,4 @@ global_coordination_redis_pod: 0  # Pod 0 handles global state
 global_metrics_update_interval: 10  # seconds
 
 # Monitoring
-prometheus_port: 8001
-enable_prometheus: true
-
-# Resource limits (optional, for containerized deployment)
-fetcher_memory_limit: "2G"    # Per fetcher process
-parser_memory_limit: "4G"     # Per parser process
-orchestrator_memory_limit: "2G"
-
-# Test mode settings (for development)
-test_mode:
-  enabled: false
-  num_pods: 4
-  fetchers_per_pod: 2
-  parsers_per_pod: 1
-  data_dirs:
-    - "./test_data/ssd1"
-    - "./test_data/ssd2" 
+prometheus_port: 8001 

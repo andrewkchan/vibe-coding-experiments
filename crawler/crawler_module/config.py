@@ -239,8 +239,6 @@ class CrawlerConfig:
     # Crawler behavior
     politeness_delay_seconds: int = DEFAULT_POLITENESS_DELAY
     robots_cache_ttl_seconds: int = 86400
-    http_timeout_seconds: int = 30
-    http_max_retries: int = 2
     
     # Performance tuning
     parse_queue_soft_limit: int = 20000
@@ -253,6 +251,9 @@ class CrawlerConfig:
     # Global coordination
     global_coordination_redis_pod: int = 0
     global_metrics_update_interval: int = 10
+    
+    # Monitoring
+    prometheus_port: int = 8001
     
     # Legacy single-Redis support (backward compatibility)
     redis_host: Optional[str] = None
@@ -327,15 +328,6 @@ class CrawlerConfig:
     def from_args(cls, sys_args: Optional[List[str]] = None) -> "CrawlerConfig":
         args, config_data = parse_args(sys_args)
         
-        # Handle test mode
-        if config_data.get('test_mode', {}).get('enabled', False):
-            logging.info("Test mode enabled - using test configuration")
-            test_config = config_data['test_mode']
-            config_data['pods'] = config_data.get('pods', [])[:test_config.get('num_pods', 4)]
-            config_data['fetchers_per_pod'] = test_config.get('fetchers_per_pod', 2)
-            config_data['parsers_per_pod'] = test_config.get('parsers_per_pod', 1)
-            if 'data_dirs' in test_config:
-                config_data['data_dirs'] = test_config['data_dirs']
         
         # Apply CLI overrides
         if args.override_num_pods and 'pods' in config_data:
@@ -424,8 +416,6 @@ class CrawlerConfig:
             # Crawler behavior
             politeness_delay_seconds=config_data.get('politeness_delay_seconds', DEFAULT_POLITENESS_DELAY),
             robots_cache_ttl_seconds=config_data.get('robots_cache_ttl_seconds', 86400),
-            http_timeout_seconds=config_data.get('http_timeout_seconds', 30),
-            http_max_retries=config_data.get('http_max_retries', 2),
             
             # Performance tuning
             parse_queue_soft_limit=config_data.get('parse_queue_soft_limit', 20000),
@@ -438,6 +428,9 @@ class CrawlerConfig:
             # Global coordination
             global_coordination_redis_pod=config_data.get('global_coordination_redis_pod', 0),
             global_metrics_update_interval=config_data.get('global_metrics_update_interval', 10),
+            
+            # Monitoring
+            prometheus_port=config_data.get('prometheus_port', 8001),
             
             # Legacy support
             redis_host=args.redis_host,

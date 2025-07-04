@@ -26,6 +26,7 @@ enable_cpu_affinity: false
 
 # Test crawler settings
 politeness_delay_seconds: 10  # Faster for testing
+robots_cache_ttl_seconds: 3600    # 1 hour for testing
 max_pages: 10000              # Limit pages for testing
 max_duration: 3600            # 1 hour max
 
@@ -48,15 +49,7 @@ redis_socket_connect_timeout: 10
 redis_socket_keepalive: true
 redis_max_connections: 100
 
-robots_cache_ttl_seconds: 3600    # 1 hour for testing
-http_timeout_seconds: 30
-http_max_retries: 2
 
-max_content_length: 10485760
-extract_text: true
-store_raw_html: false
-
-frontier_batch_size: 100          # Smaller batches for testing
 
 parse_queue_soft_limit: 1000      # Much smaller for testing
 parse_queue_hard_limit: 5000
@@ -64,5 +57,4 @@ parse_queue_hard_limit: 5000
 global_coordination_redis_pod: 0
 global_metrics_update_interval: 5  # More frequent updates for testing
 
-prometheus_port: 8001
-enable_prometheus: true 
+prometheus_port: 8001 
