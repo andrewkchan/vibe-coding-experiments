@@ -44,7 +44,7 @@ services:
       - ./logs/redis:/var/log/redis
     command: >
       redis-server
-      --maxmemory 24gb
+      --maxmemory 90gb
       --maxmemory-policy noeviction
       --save 900 1
       --save 300 10
