@@ -42,7 +42,7 @@ def setup_pod_logging(
         root_logger.removeHandler(handler)
     
     # Set up format
-    log_format = f'%(asctime)s - %(name)s - %(levelname)s - [{process_label}] %(message)s'
+    log_format = f'%(asctime)s - %(name)s - %(levelname)s - [PID:%(process)d] [{process_label}] %(message)s'
     formatter = logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S')
     
     # Console handler (always add)

@@ -84,7 +84,7 @@ parse_errors_counter = Counter(
 fetcher_pages_per_second_gauge = Gauge(
     'crawler_fetcher_pages_per_second', 
     'Pages fetched per second per fetcher process',
-    ['fetcher_id'],
+    ['pod_id', 'fetcher_id'],
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
@@ -92,6 +92,7 @@ fetcher_pages_per_second_gauge = Gauge(
 parser_pages_per_second_gauge = Gauge(
     'crawler_parser_pages_per_second', 
     'Pages parsed per second',
+    ['pod_id', 'parser_id'],
     multiprocess_mode='livesum' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
@@ -128,7 +129,7 @@ parse_queue_size_gauge = Gauge(
 process_memory_usage_gauge = Gauge(
     'crawler_process_memory_usage_bytes', 
     'Memory usage by process type',
-    ['process_type', 'process_id'],  # e.g., ('fetcher', '0'), ('parser', '1')
+    ['pod_id', 'process_type', 'process_id'],  # e.g., ('0', 'fetcher', '0'), ('1', 'parser', '1')
     multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )
@@ -136,7 +137,7 @@ process_memory_usage_gauge = Gauge(
 process_open_fds_gauge = Gauge(
     'crawler_process_open_fds', 
     'Open file descriptors by process type',
-    ['process_type', 'process_id'],
+    ['pod_id', 'process_type', 'process_id'],
     multiprocess_mode='liveall' if PROMETHEUS_MULTIPROC_DIR else 'all',
     registry=registry
 )

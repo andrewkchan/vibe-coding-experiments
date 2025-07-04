@@ -238,20 +238,25 @@ class FetcherProcess:
         if time_elapsed >= 5.0:  # Update every 5 seconds
             # Calculate pages per second
             pages_per_second = self.pages_crawled_in_interval / time_elapsed if time_elapsed > 0 else 0
-            fetcher_pages_per_second_gauge.labels(fetcher_id=f"{self.pod_id}-{self.fetcher_id}").set(pages_per_second)
+            fetcher_pages_per_second_gauge.labels(
+                pod_id=str(self.pod_id),
+                fetcher_id=str(self.fetcher_id)
+            ).set(pages_per_second)
             
             # Update resource metrics
             try:
                 memory_usage = self.process.memory_info().rss
                 process_memory_usage_gauge.labels(
+                    pod_id=str(self.pod_id),
                     process_type='fetcher',
-                    process_id=f"{self.pod_id}-{self.fetcher_id}"
+                    process_id=str(self.fetcher_id)
                 ).set(memory_usage)
                 
                 open_fds = self.process.num_fds()
                 process_open_fds_gauge.labels(
+                    pod_id=str(self.pod_id),
                     process_type='fetcher', 
-                    process_id=f"{self.pod_id}-{self.fetcher_id}"
+                    process_id=str(self.fetcher_id)
                 ).set(open_fds)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass  # Process might be shutting down

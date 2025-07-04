@@ -191,7 +191,7 @@ class CrawlerOrchestrator:
                 )
             
             # Create and run the parser consumer for this pod
-            consumer = ParserConsumer(self.config, pod_id=pod_id)
+            consumer = ParserConsumer(self.config, pod_id=pod_id, parser_id=parser_id)
             asyncio.run(consumer.run())
         
         # Start fetcher processes for this pod
@@ -732,10 +732,12 @@ class CrawlerOrchestrator:
                         
                         # Update Prometheus gauges with labels
                         process_memory_usage_gauge.labels(
+                            pod_id='0',
                             process_type='orchestrator',
                             process_id='0'
                         ).set(rss_mem_bytes)
                         process_open_fds_gauge.labels(
+                            pod_id='0',
                             process_type='orchestrator',
                             process_id='0'
                         ).set(fds_count_int)

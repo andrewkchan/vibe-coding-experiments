@@ -41,9 +41,10 @@ METRICS_LOG_INTERVAL_SECONDS = 60
 class ParserConsumer:
     """Consumes raw HTML from Redis queue and processes it."""
     
-    def __init__(self, config: CrawlerConfig, pod_id: int = 0, num_workers: int = None):
+    def __init__(self, config: CrawlerConfig, pod_id: int = 0, parser_id: int = 0, num_workers: int = None):
         self.config = config
         self.pod_id = pod_id
+        self.parser_id = parser_id
         self.num_workers = num_workers or config.parser_workers
         
         # Initialize PodManager for cross-pod frontier writes
@@ -75,7 +76,7 @@ class ParserConsumer:
         
         # Process monitoring
         self.process = psutil.Process(os.getpid())
-        self.process_id = f"{pod_id}-parser"  # Include pod ID in process identifier
+        self.pod_id = pod_id
     
     async def _init_async_components(self):
         """Initialize components that require async setup."""
@@ -126,20 +127,25 @@ class ParserConsumer:
         if time_elapsed >= 5.0:
             # Calculate pages per second
             pages_per_second = self.pages_parsed_in_interval / time_elapsed if time_elapsed > 0 else 0
-            parser_pages_per_second_gauge.set(pages_per_second)
+            parser_pages_per_second_gauge.labels(
+                pod_id=str(self.pod_id),
+                parser_id=str(self.parser_id)
+            ).set(pages_per_second)
             
             # Update resource metrics
             try:
                 memory_usage = self.process.memory_info().rss
                 process_memory_usage_gauge.labels(
+                    pod_id=str(self.pod_id),
                     process_type='parser',
-                    process_id=str(self.process_id)
+                    process_id=str(self.parser_id)
                 ).set(memory_usage)
                 
                 open_fds = self.process.num_fds()
                 process_open_fds_gauge.labels(
+                    pod_id=str(self.pod_id),
                     process_type='parser',
-                    process_id=str(self.process_id)
+                    process_id=str(self.parser_id)
                 ).set(open_fds)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass  # Process might be shutting down
