@@ -10,3 +10,4 @@ pytest-asyncio
 httpx
 redis>=4.5.0
 pympler
+pyyaml>=6.0
