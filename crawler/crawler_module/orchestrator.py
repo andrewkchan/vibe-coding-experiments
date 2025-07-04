@@ -22,6 +22,7 @@ from .fetcher import Fetcher
 from .politeness import PolitenessEnforcer
 from .frontier import FrontierManager
 from .memory_diagnostics import memory_diagnostics
+from .metrics_utils import get_pages_crawled_total
 from .metrics import (
     start_metrics_server,
     frontier_size_gauge,
@@ -148,10 +149,22 @@ class CrawlerOrchestrator:
             """Function to run in the fetcher process."""
             import asyncio
             from .logging_utils import setup_pod_logging
+            from .process_utils import set_cpu_affinity
             from .fetcher_process import run_fetcher_process
             
             # Setup per-pod logging
             setup_pod_logging(self.config, pod_id, 'fetcher', fetcher_id)
+            
+            # Set CPU affinity if enabled
+            if self.config.enable_cpu_affinity:
+                set_cpu_affinity(
+                    pod_id=pod_id,
+                    process_type='fetcher',
+                    process_id=fetcher_id,
+                    fetchers_per_pod=self.config.fetchers_per_pod,
+                    parsers_per_pod=self.config.parsers_per_pod,
+                    enabled=True
+                )
             
             # Run the fetcher with pod ID
             run_fetcher_process(self.config, fetcher_id, pod_id=pod_id)
@@ -160,10 +173,22 @@ class CrawlerOrchestrator:
             """Function to run in the parser process."""
             import asyncio
             from .logging_utils import setup_pod_logging
+            from .process_utils import set_cpu_affinity
             from .parser_consumer import ParserConsumer
             
             # Setup per-pod logging
             setup_pod_logging(self.config, pod_id, 'parser', parser_id)
+            
+            # Set CPU affinity if enabled
+            if self.config.enable_cpu_affinity:
+                set_cpu_affinity(
+                    pod_id=pod_id,
+                    process_type='parser',
+                    process_id=parser_id,
+                    fetchers_per_pod=self.config.fetchers_per_pod,
+                    parsers_per_pod=self.config.parsers_per_pod,
+                    enabled=True
+                )
             
             # Create and run the parser consumer for this pod
             consumer = ParserConsumer(self.config, pod_id=pod_id)
@@ -536,6 +561,19 @@ class CrawlerOrchestrator:
         logger.info(f"Crawler starting with config: {self.config}")
         current_process = psutil.Process(os.getpid())
         
+        # Set CPU affinity for orchestrator (pod 0)
+        if self.config.enable_cpu_affinity:
+            from .process_utils import set_cpu_affinity, log_cpu_info
+            log_cpu_info()
+            set_cpu_affinity(
+                pod_id=0,
+                process_type='orchestrator',
+                process_id=0,
+                fetchers_per_pod=self.config.fetchers_per_pod,
+                parsers_per_pod=self.config.parsers_per_pod,
+                enabled=True
+            )
+        
         # Initialize CPU monitoring for non-blocking measurements
         psutil.cpu_percent(interval=None)  # First call to establish baseline
         
@@ -564,6 +602,10 @@ class CrawlerOrchestrator:
             
             # Start pod 0's local fetcher in this process
             self.local_pod_fetchers[0] = FetcherProcess(self.config, fetcher_id=0, pod_id=0)
+            
+            # Set CPU affinity for the local fetcher (shares orchestrator's cores)
+            # Note: We already set affinity for the orchestrator process above
+            
             local_fetcher_task = asyncio.create_task(self.local_pod_fetchers[0].run())
             logger.info("Started local fetcher (Pod 0, Fetcher 0) in orchestrator process")
             
@@ -720,8 +762,11 @@ class CrawlerOrchestrator:
                         queue_size = await redis_client.llen('domains:queue')
                         total_queue_size += queue_size
                     
-                    if total_queue_size == 0 and self.pages_crawled_count > 0:
-                        logger.info(f"All frontiers empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
+                    if total_queue_size == 0:
+                        # Check if we've actually started crawling
+                        total_pages = get_pages_crawled_total()
+                        if total_pages > 0:
+                            logger.info(f"All frontiers empty. Pages crawled: {total_pages}. Monitoring...")
                         await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
                         
                         # Re-check after wait
@@ -737,9 +782,14 @@ class CrawlerOrchestrator:
                             break
                 
                 # Check global stopping conditions (max_pages, max_duration)
-                if self.config.max_pages and self.pages_crawled_count >= self.config.max_pages:
-                    logger.info(f"Stopping: Max pages reached ({self.pages_crawled_count}/{self.config.max_pages})")
-                    self._shutdown_event.set()
+                if self.config.max_pages:
+                    # Get actual page count from aggregated Prometheus metrics
+                    total_pages_crawled = get_pages_crawled_total()
+                    self.pages_crawled_count = total_pages_crawled  # Update local count for logging
+                    
+                    if total_pages_crawled >= self.config.max_pages:
+                        logger.info(f"Stopping: Max pages reached ({total_pages_crawled}/{self.config.max_pages})")
+                        self._shutdown_event.set()
                 if self.config.max_duration and (time.time() - self.start_time) >= self.config.max_duration:
                     logger.info(f"Stopping: Max duration reached ({time.time() - self.start_time:.0f}s / {self.config.max_duration}s)")
                     self._shutdown_event.set()
@@ -793,5 +843,7 @@ class CrawlerOrchestrator:
             # Close all Redis connections
             await self.pod_manager.close_all()
             
-            logger.info(f"Crawl finished. Total pages crawled across all fetchers: {self.pages_crawled_count}")
+            # Get final page count from aggregated metrics
+            final_pages_crawled = get_pages_crawled_total()
+            logger.info(f"Crawl finished. Total pages crawled across all fetchers: {final_pages_crawled}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

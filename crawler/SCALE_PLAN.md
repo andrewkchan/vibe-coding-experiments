@@ -23,9 +23,9 @@ See the architecture diagram in the main conversation for a visual representatio
 
 ## Implementation Tasks
 
-### 1. Configuration System Update
+### 1. Configuration System Update ✅
 
-**File: `config.yaml` (NEW)**
+**File: `config.yaml` (IMPLEMENTED)**
 ```yaml
 # Pod configuration
 pods:
@@ -53,7 +53,6 @@ parser_workers: 50       # Async workers per parser process
 
 # CPU affinity
 enable_cpu_affinity: true
-cores_per_pod: 12        # 192 / 16 = 12
 ```
 
 **File: `crawler_module/config.py`**
@@ -62,9 +61,9 @@ cores_per_pod: 12        # 192 / 16 = 12
 - Add properties: `pod_configs`, `data_dirs`, `log_dir`
 - Calculate total processes from pod configuration
 
-### 2. Docker Compose Generation
+### 2. Docker Compose Generation ✅
 
-**File: `generate_docker_compose.py` (NEW)**
+**File: `generate_docker_compose.py` (IMPLEMENTED)**
 ```python
 # Generate docker-compose.yml with 16 Redis instances
 # Each Redis on ports 6379-6394
@@ -72,9 +71,9 @@ cores_per_pod: 12        # 192 / 16 = 12
 # Separate data volumes and log directories per instance
 ```
 
-### 3. Pod Management
+### 3. Pod Management ✅
 
-**File: `crawler_module/pod_manager.py` (NEW)**
+**File: `crawler_module/pod_manager.py` (IMPLEMENTED)**
 ```python
 class PodManager:
     def __init__(self, pod_configs):
@@ -89,9 +88,9 @@ class PodManager:
         # Return correct Redis client for domain's pod
 ```
 
-### 4. Process Architecture Updates
+### 4. Process Architecture Updates ✅
 
-**File: `crawler_module/orchestrator.py`**
+**File: `crawler_module/orchestrator.py` (UPDATED)**
 - Instead of spawning individual processes, spawn pods
 - Each pod gets a unique pod_id (0-15)
 - Pod 0's orchestrator is the global coordinator
@@ -107,9 +106,9 @@ class PodManager:
 - Use PodManager for cross-pod frontier writes
 - Batch cross-pod writes for efficiency
 
-### 5. Storage Sharding
+### 5. Storage Sharding ✅
 
-**File: `crawler_module/storage.py`**
+**File: `crawler_module/storage.py` (UPDATED)**
 ```python
 def get_content_path(self, url: str) -> Path:
     url_hash = hashlib.sha256(url.encode()).hexdigest()
@@ -118,38 +117,32 @@ def get_content_path(self, url: str) -> Path:
     return Path(self.data_dirs[dir_index]) / "content" / f"{url_hash}.txt"
 ```
 
-### 6. Logging Updates
+### 6. Logging Updates ✅
 
-**File: `crawler_module/logging_utils.py` (NEW or update existing)**
+**File: `crawler_module/logging_utils.py` (IMPLEMENTED)**
 - Configure per-pod log directories
 - Format: `{log_dir}/pod_{pod_id}/{process_type}_{process_id}.log`
 - Add pod_id to all log formats
 
-### 7. CPU Affinity
+### 7. CPU Affinity ✅
 
-**File: `crawler_module/process_utils.py` (NEW)**
-```python
-def set_cpu_affinity(pod_id: int, process_type: str, process_id: int):
-    cores_per_pod = 12  # 192 / 16
-    pod_start_core = pod_id * cores_per_pod
-    
-    if process_type == "fetcher":
-        # First 8 cores of pod for fetchers
-        cores = list(range(pod_start_core, pod_start_core + 8))
-    else:  # parser
-        # Last 4 cores of pod for parsers
-        cores = list(range(pod_start_core + 8, pod_start_core + 12))
-    
-    psutil.Process().cpu_affinity(cores)
-```
+**File: `crawler_module/process_utils.py` (IMPLEMENTED)**
+- Each process gets exactly one dedicated CPU core
+- Cores per pod is automatically calculated as `fetchers_per_pod + parsers_per_pod`
+- Core allocation within each pod:
+  - Pod 0: orchestrator (fetcher 0) gets core 0, fetchers 1-5 get cores 1-5, parsers get cores 6-7
+  - Other pods: fetchers 0-5 get cores 0-5, parsers get cores 6-7
+- Example with 16 pods × 8 cores = 128 total cores used (out of 192 available)
 
-### 8. Global Coordination
+### 8. Global Coordination ✅
 
-**Updates needed:**
-- Pod 0's orchestrator maintains global metrics in Redis
-- Key: `global:pages_crawled` (atomic increment)
-- Key: `global:stop_signal` (for coordinated shutdown)
-- All pods check global stopping conditions
+**Implementation:**
+- **Metrics**: Using existing Prometheus multiprocess support (no Redis needed)
+  - `pages_crawled_counter` aggregates across all processes automatically
+  - `get_pages_crawled_total()` reads aggregated values
+- **Shutdown**: Using OS signals (SIGTERM/SIGKILL) for process management
+  - No Redis-based stop signal needed
+  - Orchestrator manages child processes directly
 
 ### 9. Monitoring Updates
 
@@ -216,11 +209,12 @@ python main.py --config crawler_config.yaml --override-fetchers-per-pod 8 --over
 
 ## Performance Targets
 
-With 16 pods on 192 cores:
+With 16 pods using 128 cores (out of 192 available):
 - 96 fetcher processes × 200 workers = 19,200 concurrent fetches
 - 32 parser processes × 50 workers = 1,600 concurrent parsers
 - Target: ~10,000 pages/second sustained
 - 1 billion pages in ~28 hours
+- Note: 64 cores remain available for Redis, OS, and other system processes
 
 ## Known Limitations
 
@@ -232,8 +226,19 @@ With 16 pods on 192 cores:
 
 **Domain to Pod**: `pod_id = md5(domain) % 16`
 **URL to Storage**: `dir_id = sha256(url)[:8] % num_dirs`
-**CPU Assignment**: `pod_N gets cores [N*12 : (N+1)*12]`
+**CPU Assignment**: `pod_N gets cores [N*(fetchers+parsers) : (N+1)*(fetchers+parsers)]`
+**Core Allocation**: One core per process (automatically calculated)
 
----
+## Implementation Status
 
-Ready to implement! 🚀 
+✅ **COMPLETE** - All major components implemented:
+- Configuration system with YAML support
+- Docker Compose generation for 16 pods
+- Pod management and domain sharding
+- Process architecture updates
+- Storage sharding across multiple drives
+- Per-pod logging with rotation
+- CPU affinity with proportional allocation
+- Global coordination via Prometheus
+
+The crawler is now ready to scale to 100+ processes across 16 pods! 🚀 

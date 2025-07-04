@@ -32,14 +32,13 @@ log_dir: "/var/log/crawler"
 log_level: "INFO"
 
 # Process configuration (per pod)
-fetchers_per_pod: 6      # 96 total fetcher processes with 16 pods
+fetchers_per_pod: 6      # 96 total fetcher processes with 16 pods (pod 0's orchestrator counts as fetcher 0)
 parsers_per_pod: 2       # 32 total parser processes
 fetcher_workers: 200     # Async workers per fetcher process
 parser_workers: 50       # Async workers per parser process
 
 # CPU affinity settings
 enable_cpu_affinity: true
-cores_per_pod: 12        # 192 total cores / 16 pods = 12
 
 # Redis configuration (applied to all pods)
 redis_db: 0

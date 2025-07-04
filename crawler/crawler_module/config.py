@@ -230,7 +230,6 @@ class CrawlerConfig:
     
     # CPU affinity
     enable_cpu_affinity: bool = False
-    cores_per_pod: int = 12
     
     # Redis configuration (for backward compatibility and global settings)
     redis_db: int = DEFAULT_REDIS_DB
@@ -416,7 +415,6 @@ class CrawlerConfig:
             
             # CPU affinity
             enable_cpu_affinity=config_data.get('enable_cpu_affinity', False),
-            cores_per_pod=config_data.get('cores_per_pod', 12),
             
             # Redis configuration
             redis_db=args.redis_db or config_data.get('redis_db', DEFAULT_REDIS_DB),
