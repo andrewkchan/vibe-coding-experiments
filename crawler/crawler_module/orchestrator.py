@@ -16,7 +16,6 @@ from .config import CrawlerConfig
 from .redis_shield import ShieldedRedis
 from .fetcher_process import FetcherProcess, run_fetcher_process
 from .parser_consumer import ParserConsumer
-from .redis_lock import LockManager
 from .storage import StorageManager
 from .fetcher import Fetcher
 from .politeness import PolitenessEnforcer
@@ -295,12 +294,6 @@ class CrawlerOrchestrator:
     async def _initialize_components(self):
         """Initializes orchestrator components that require async setup."""
         logger.info("Initializing orchestrator components...")
-        
-        # Clear any zombie locks from previous runs
-        lock_manager = LockManager(self.redis_client)
-        cleared_count = await lock_manager.clear_all_locks()
-        if cleared_count > 0:
-            logger.warning(f"Cleared {cleared_count} zombie locks from previous run")
         
         # One-time initialization shared across all processes
         logger.info("Performing one-time initialization...")

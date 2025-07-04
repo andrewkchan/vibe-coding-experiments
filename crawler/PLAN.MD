@@ -150,8 +150,6 @@ The crawler uses a hybrid of Redis and the file system for persistence.
     *   An exact record of every URL that has been fetched (or attempted). Stores metadata like status code, content hash, timestamp, and content path.
 *   **Parser Queue (List):** `fetch:queue`
     *   A list used as a queue to pass raw HTML from fetchers to parsers.
-*   **Domain Write Locks (Keys):** `lock:domain:{domain}`
-    *   Simple keys used with `SETNX` to ensure that only one parser process can write to a domain's frontier file at a time.
 
 ### 3.2. File System Storage
 
@@ -169,7 +167,6 @@ The crawler uses a hybrid of Redis and the file system for persistence.
 *   **State Persistence:** All critical state is persisted in Redis.
 *   **Redis Persistence:** The provided Docker Compose setup for Redis uses RDB snapshots only (AOF disabled) for simplicity and lower memory usage. Snapshots occur every 1-15 minutes based on change frequency.
 *   **Resumption:** When the crawler is started with the `--resume` flag, it picks up where it left off using the data in Redis.
-*   **Zombie Lock Cleanup:** On startup, the orchestrator scans Redis for and removes any stale domain write locks that might have been left over from a previous crashed run.
 
 ## 6. Multiprocess Configuration
 

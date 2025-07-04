@@ -1,5 +1,5 @@
 # Redesigning the web crawler's frontier storage
-_Exported on 7/3/2025 at 18:40:22 PDT from Cursor (1.0.0)_
+_Exported on 7/3/2025 at 19:20:12 PDT from Cursor (1.0.0)_
 
 ---
 
@@ -3410,4 +3410,161 @@ This should be **~1000x faster** for large migrations!
 3. **Better progress tracking**: You can see progress during large migrations
 
 The script is now production-ready for migrating even very large domain queues efficiently!
+
+---
+
+**User**
+
+Let's also delete all the locking code as that is no longer used?
+
+---
+
+**Cursor**
+
+Absolutely! Since we're now using atomic Redis operations with a single queue, all the locking code is obsolete. Let me find and remove it:
+
+```python
+import asyncio
+import logging
+import time
+from pathlib import Path
+from typing import Optional, List
+import os # For process ID
+import psutil
+import functools
+from pympler import muppy, summary
+from multiprocessing import Process
+import redis.asyncio as redis
+from redis.asyncio import BlockingConnectionPool
+import gc
+
+from .config import CrawlerConfig
+from .redis_shield import ShieldedRedis
+from .fetcher_process import FetcherProcess, run_fetcher_process
+from .parser_consumer import ParserConsumer
+from .storage import StorageManager
+from .fetcher import Fetcher
+from .politeness import PolitenessEnforcer
+from .frontier import FrontierManager
+from .memory_diagnostics import memory_diagnostics
+from .metrics import (
+    start_metrics_server,
+    frontier_size_gauge,
+    content_size_histogram,
+    # System metrics
+    cpu_usage_gauge,
+    memory_free_gauge,
+    memory_available_gauge,
+    disk_free_gauge,
+    disk_usage_percent_gauge,
+    io_read_count_gauge,
+    io_write_count_gauge,
+    io_read_bytes_gauge,
+    io_write_bytes_gauge,
+    network_bytes_sent_gauge,
+    network_bytes_recv_gauge,
+    network_packets_sent_gauge,
+    network_packets_recv_gauge,
+    # Redis metrics
+    redis_ops_per_sec_gauge,
+    redis_memory_usage_gauge,
+    redis_connected_clients_gauge,
+    redis_hit_rate_gauge,
+    # FD type metrics
+    fd_redis_gauge,
+    fd_http_gauge,
+    fd_https_gauge,
+    fd_frontier_files_gauge,
+    fd_prometheus_gauge,
+    fd_other_sockets_gauge,
+    fd_pipes_gauge,
+    fd_other_gauge,
+    process_memory_usage_gauge,
+    process_open_fds_gauge
+)
+
+logger = logging.getLogger(__name__)
+
+# ... existing code ...
+
+    async def _initialize_components(self):
+        """Initializes orchestrator components that require async setup."""
+        logger.info("Initializing orchestrator components...")
+        
+        # One-time initialization shared across all processes
+        logger.info("Performing one-time initialization...")
+        
+        # Initialize storage schema
+        storage = StorageManager(self.config, self.redis_client)  # type: ignore
+        await storage.init_db_schema()
+        await storage.close()
+        
+        temp_fetcher = Fetcher(self.config)
+        politeness = PolitenessEnforcer(self.config, self.redis_client, temp_fetcher)
+        # Initialize frontier (also initializes politeness with manual exclusions, seeds, etc.)
+        frontier = FrontierManager(self.config, politeness, self.redis_client)
+        await frontier.initialize_frontier()
+        
+        # Clean up temporary instances
+        await temp_fetcher.close_session()
+            
+        logger.info("Orchestrator components initialized.")
+```
+
+```markdown
+### 3.1. Redis Data Structures
+
+*   **Domain Metadata (Hash):** `domain:{domain}`
+    *   `next_fetch_time`: UNIX timestamp for when this domain can be crawled next.
+    *   `robots_txt`: Cached content of `robots.txt`.
+    *   `robots_expires`: Expiry timestamp for the `robots.txt` cache.
+    *   `is_excluded`: Flag for manually excluded domains.
+*   **Frontier Lists:** `frontier:{domain}`
+    *   Lists containing URLs to crawl for each domain in "url|depth" format.
+*   **Domain Queue (List):** `domains:queue`
+    *   Single queue that contains all domains with URLs to crawl.
+*   **"Seen" URLs (Bloom Filter):** `seen:bloom`
+    *   A probabilistic data structure used for fast, memory-efficient de-duplication of all URLs ever encountered. This prevents re-adding URLs to the frontier.
+*   **"Visited" URLs (Hashes):** `visited:{url_hash}`
+    *   An exact record of every URL that has been fetched (or attempted). Stores metadata like status code, content hash, timestamp, and content path.
+*   **Parser Queue (List):** `fetch:queue`
+    *   A list used as a queue to pass raw HTML from fetchers to parsers.
+```
+
+```markdown
+## 5. Fault Tolerance and Resumption
+
+*   **State Persistence:** All critical state is persisted in Redis.
+*   **Redis Persistence:** The provided Docker Compose setup for Redis uses RDB snapshots only (AOF disabled) for simplicity and lower memory usage. Snapshots occur every 1-15 minutes based on change frequency.
+*   **Resumption:** When the crawler is started with the `--resume` flag, it picks up where it left off using the data in Redis.
+```
+
+## Summary
+
+I've successfully removed all the locking code from the crawler since it's no longer needed with the single queue architecture. Here's what was done:
+
+### 1. **Deleted Obsolete Files**
+- `crawler/crawler_module/redis_lock.py` - The entire Redis-based locking implementation
+
+### 2. **Updated Code**
+- **orchestrator.py**:
+  - Removed import of `LockManager`
+  - Removed zombie lock cleanup code from `_initialize_components()`
+
+### 3. **Updated Documentation**
+- **PLAN.MD**:
+  - Removed "Domain Write Locks" from Redis data structures section
+  - Removed "Zombie Lock Cleanup" from fault tolerance section
+
+### Why Locking is No Longer Needed
+
+With the new single queue architecture:
+- All fetcher processes read from a single `domains:queue` using atomic `LPOP` operations
+- Domain URLs are stored in Redis lists (`frontier:{domain}`) accessed with atomic `RPOP`
+- No file I/O means no filesystem locks needed
+- Redis's built-in atomicity guarantees prevent race conditions
+
+The system is now simpler, more efficient, and more reliable without the locking overhead!
+
+All tests are passing, confirming that the system works correctly without the locking code.
 
