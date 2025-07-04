@@ -15,6 +15,7 @@ import redis.asyncio as redis
 from redis.asyncio import BlockingConnectionPool
 
 from .config import CrawlerConfig
+from .pod_manager import PodManager
 from .parser import PageParser
 from .storage import StorageManager
 from .frontier import FrontierManager
@@ -40,33 +41,26 @@ METRICS_LOG_INTERVAL_SECONDS = 60
 class ParserConsumer:
     """Consumes raw HTML from Redis queue and processes it."""
     
-    def __init__(self, config: CrawlerConfig, num_workers: int = 80):
+    def __init__(self, config: CrawlerConfig, pod_id: int = 0, num_workers: int = None):
         self.config = config
-        self.num_workers = num_workers
+        self.pod_id = pod_id
+        self.num_workers = num_workers or config.parser_workers
         
-        # Create Redis client with BlockingConnectionPool to prevent "Too many connections" errors
-        redis_kwargs = config.get_redis_connection_kwargs()
-        text_pool = BlockingConnectionPool(**redis_kwargs)
-        self.redis_client = redis.Redis(connection_pool=text_pool)
+        # Initialize PodManager for cross-pod frontier writes
+        self.pod_manager = PodManager(config)
         
-        # Create a separate Redis client for binary data (pickle)
-        binary_redis_kwargs = config.get_redis_connection_kwargs()
-        binary_redis_kwargs['decode_responses'] = False
-        binary_pool = BlockingConnectionPool(**binary_redis_kwargs)
-        self.redis_client_binary = redis.Redis(connection_pool=binary_pool)
+        # We'll initialize Redis clients in async _init_async_components method
+        self.redis_client: Optional[redis.Redis] = None
+        self.redis_client_binary: Optional[redis.Redis] = None
         
         self.parser = PageParser()
         
-        # Initialize storage and frontier for adding URLs
-        self.storage = StorageManager(config, self.redis_client)
-        # Need fetcher for politeness enforcer
-        self.fetcher = Fetcher(config)
-        self.politeness = PolitenessEnforcer(config, self.redis_client, self.fetcher)
-        self.frontier = FrontierManager(
-            config, 
-            self.politeness,
-            self.redis_client
-        )
+        # Components will be initialized after Redis clients
+        self.storage: Optional[StorageManager] = None
+        self.fetcher: Optional[Fetcher] = None
+        self.politeness: Optional[PolitenessEnforcer] = None
+        # We'll create multiple frontiers (one per pod) for cross-pod writes
+        self.frontiers: Dict[int, FrontierManager] = {}
         
         self._shutdown_event = asyncio.Event()
         self._setup_signal_handlers()
@@ -81,8 +75,34 @@ class ParserConsumer:
         
         # Process monitoring
         self.process = psutil.Process(os.getpid())
-        self.process_id = os.getpid()  # Save PID for consistent labeling
+        self.process_id = f"{pod_id}-parser"  # Include pod ID in process identifier
+    
+    async def _init_async_components(self):
+        """Initialize components that require async setup."""
+        # Get Redis clients for this pod
+        self.redis_client = await self.pod_manager.get_redis_client(self.pod_id, binary=False)
+        self.redis_client_binary = await self.pod_manager.get_redis_client(self.pod_id, binary=True)
         
+        # Initialize storage with this pod's Redis
+        self.storage = StorageManager(self.config, self.redis_client)
+        
+        # Initialize fetcher and politeness for frontier
+        self.fetcher = Fetcher(self.config)
+        
+        # Initialize frontiers for all pods (for cross-pod writes)
+        for target_pod_id in range(self.config.num_pods):
+            redis_client = await self.pod_manager.get_redis_client(target_pod_id, binary=False)
+            politeness = PolitenessEnforcer(self.config, redis_client, self.fetcher)
+            frontier = FrontierManager(
+                self.config, 
+                politeness,
+                redis_client,
+                pod_id=target_pod_id
+            )
+            self.frontiers[target_pod_id] = frontier
+        
+        logger.info(f"Parser for pod {self.pod_id}: Async components initialized")
+    
     def _setup_signal_handlers(self):
         """Setup graceful shutdown on SIGINT/SIGTERM."""
         def signal_handler(signum, frame):
@@ -129,13 +149,13 @@ class ParserConsumer:
             active_workers = sum(1 for task in self.worker_tasks if not task.done())
             
             # Log metrics
-            logger.info(f"[Parser Metrics] Pages/sec: {pages_per_second:.2f}, Queue: {queue_size}, Active workers: {active_workers}/{self.num_workers}")
+            logger.info(f"[Parser Metrics] Pod {self.pod_id}: Pages/sec: {pages_per_second:.2f}, Queue: {queue_size}, Active workers: {active_workers}/{self.num_workers}")
             
             # Log cumulative stats periodically (every 60 seconds)
             if current_time - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                 total_runtime = current_time - self.start_time
                 overall_rate = self.pages_parsed_count / total_runtime if total_runtime > 0 else 0
-                logger.info(f"[Parser Metrics] Total parsed: {self.pages_parsed_count}, Overall rate: {overall_rate:.2f}/sec, Runtime: {total_runtime:.0f}s")
+                logger.info(f"[Parser Metrics] Pod {self.pod_id}: Total parsed: {self.pages_parsed_count}, Overall rate: {overall_rate:.2f}/sec, Runtime: {total_runtime:.0f}s")
                 self.last_metrics_log_time = current_time
             
             # Reset counter and update time
@@ -167,26 +187,40 @@ class ParserConsumer:
             
             # Save parsed text content if available
             if parse_result.text_content:
+                # Use URL-based sharding for storage across multiple drives
+                content_dir = self.config.get_data_dir_for_url(url)
                 url_hash = self.storage.get_url_sha256(url)
-                saved_path = await self.storage.save_content_to_file(url_hash, parse_result.text_content)
+                saved_path = await self.storage.save_content_to_file(url_hash, parse_result.text_content, base_dir=content_dir)
                 if saved_path:
-                    # Store relative path from data_dir for portability
-                    try:
-                        content_storage_path_str = str(saved_path.relative_to(self.config.data_dir))
-                    except ValueError:
-                        content_storage_path_str = str(saved_path)
+                    content_storage_path_str = str(saved_path)
                     logger.debug(f"Saved content for {url} to {content_storage_path_str}")
             
-            # Add extracted links to frontier
+            # Add extracted links to appropriate frontiers (based on domain->pod mapping)
             links_added = 0
             if parse_result.extracted_links:
                 logger.debug(f"Found {len(parse_result.extracted_links)} links on {url}")
-                links_added = await self.frontier.add_urls_batch(
-                    list(parse_result.extracted_links), 
-                    depth=depth + 1
-                )
+                
+                # Group links by target pod
+                links_by_pod: Dict[int, list] = {}
+                for link in parse_result.extracted_links:
+                    link_domain = extract_domain(link)
+                    if link_domain:
+                        target_pod_id = self.pod_manager.get_pod_for_domain(link_domain)
+                        if target_pod_id not in links_by_pod:
+                            links_by_pod[target_pod_id] = []
+                        links_by_pod[target_pod_id].append(link)
+                
+                # Add links to appropriate frontiers
+                for target_pod_id, pod_links in links_by_pod.items():
+                    frontier = self.frontiers.get(target_pod_id)
+                    if frontier:
+                        added = await frontier.add_urls_batch(pod_links, depth=depth + 1)
+                        links_added += added
+                        if added > 0:
+                            logger.debug(f"Added {added} URLs to pod {target_pod_id}'s frontier")
+                
                 if links_added > 0:
-                    logger.info(f"Added {links_added} new URLs to frontier from {url}")
+                    logger.info(f"Added {links_added} new URLs to frontiers from {url}")
                     # Track URLs added in Redis for the orchestrator to read
                     await self.redis_client.incrby('stats:urls_added', links_added)
             
@@ -212,7 +246,7 @@ class ParserConsumer:
     
     async def _worker(self, worker_id: int):
         """Worker coroutine that processes items from the queue."""
-        logger.info(f"Parser worker {worker_id} starting...")
+        logger.info(f"Parser worker {worker_id} starting for pod {self.pod_id}...")
         
         consecutive_empty = 0
         max_consecutive_empty = 10  # Exit after 10 consecutive empty reads
@@ -221,7 +255,6 @@ class ParserConsumer:
             while not self._shutdown_event.is_set():
                 try:
                     # Use BLPOP for blocking pop with timeout
-                    # Returns tuple of (queue_name, item) or None on timeout
                     result = await self.redis_client_binary.blpop('fetch:queue', timeout=5)
                     
                     if result is None:
@@ -261,15 +294,18 @@ class ParserConsumer:
     
     async def run(self):
         """Main consumer loop."""
-        logger.info(f"Parser consumer starting with {self.num_workers} workers...")
+        logger.info(f"Parser consumer for pod {self.pod_id} starting with {self.num_workers} workers...")
         self.start_time = time.time()
         
         try:
+            # Initialize async components
+            await self._init_async_components()
+            
             # In multiprocess mode, child processes don't start their own server
             # They just write metrics to the shared directory
-            metrics_started = start_metrics_server(port=8002)
+            metrics_started = start_metrics_server(port=8002 + self.pod_id)
             if metrics_started:
-                logger.info("Parser metrics server started on port 8002")
+                logger.info(f"Parser metrics server started on port {8002 + self.pod_id}")
             else:
                 logger.info("Running in multiprocess mode - metrics aggregated by parent")
             
@@ -278,7 +314,7 @@ class ParserConsumer:
                 task = asyncio.create_task(self._worker(i + 1))
                 self.worker_tasks.add(task)
             
-            logger.info(f"Started {len(self.worker_tasks)} parser workers")
+            logger.info(f"Started {len(self.worker_tasks)} parser workers for pod {self.pod_id}")
             
             # Monitor queue size and log metrics periodically
             while not self._shutdown_event.is_set():
@@ -321,10 +357,11 @@ class ParserConsumer:
             if self.worker_tasks:
                 await asyncio.gather(*self.worker_tasks, return_exceptions=True)
             
-            await self.fetcher.close_session()
-            await self.storage.close()
-            await self.redis_client.aclose()
-            await self.redis_client_binary.aclose()
+            if self.fetcher:
+                await self.fetcher.close_session()
+            if self.storage:
+                await self.storage.close()
+            await self.pod_manager.close_all()
             
             # Log final stats
             total_runtime = time.time() - self.start_time
@@ -340,10 +377,10 @@ async def main():
     )
     config = CrawlerConfig.from_args()
     
-    # When run standalone, assume the developer has initialized Redis properly
-    logger.info("Starting standalone parser consumer (assuming Redis is initialized)")
+    # When run standalone, assume pod 0
+    logger.info("Starting standalone parser consumer for pod 0 (assuming Redis is initialized)")
     
-    consumer = ParserConsumer(config)
+    consumer = ParserConsumer(config, pod_id=0)
     await consumer.run()
 
 

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import os # For process ID
 import psutil
 import functools
@@ -13,6 +13,7 @@ from redis.asyncio import BlockingConnectionPool
 import gc
 
 from .config import CrawlerConfig
+from .pod_manager import PodManager
 from .redis_shield import ShieldedRedis
 from .fetcher_process import FetcherProcess, run_fetcher_process
 from .parser_consumer import ParserConsumer
@@ -91,32 +92,13 @@ class CrawlerOrchestrator:
         os.environ['PROMETHEUS_PARENT_PROCESS'] = str(os.getpid())
         logger.info(f"Set PROMETHEUS_PARENT_PROCESS to {os.getpid()}")
 
-        # Initialize Redis client (only for orchestrator tasks like resharding)
-        redis_kwargs = config.get_redis_connection_kwargs()
-        # Create a blocking connection pool for text data
-        text_pool = BlockingConnectionPool(**redis_kwargs)
-        base_redis_client = redis.Redis(connection_pool=text_pool)
-        # Monkey-patch redis client method to remove a useless decorator which incurs extra overhead
-        base_redis_client.connection_pool.get_connection = functools.partial(
-            base_redis_client.connection_pool.get_connection.__wrapped__, 
-            base_redis_client.connection_pool
-        )
-        # Wrap with ShieldedRedis to prevent connection leaks from cancelled operations
-        self.redis_client = ShieldedRedis(base_redis_client)
+        # Initialize PodManager for pod-based architecture
+        self.pod_manager = PodManager(config)
         
-        # Create a separate Redis client for binary data (pickle)
-        binary_redis_kwargs = config.get_redis_connection_kwargs()
-        binary_redis_kwargs['decode_responses'] = False
-        # Create a blocking connection pool for binary data
-        binary_pool = BlockingConnectionPool(**binary_redis_kwargs)
-        base_redis_client_binary = redis.Redis(connection_pool=binary_pool)
-        # Same monkey patching as above
-        base_redis_client_binary.connection_pool.get_connection = functools.partial(
-            base_redis_client_binary.connection_pool.get_connection.__wrapped__, 
-            base_redis_client_binary.connection_pool
-        )
-        # Wrap with ShieldedRedis to prevent connection leaks
-        self.redis_client_binary = ShieldedRedis(base_redis_client_binary)
+        # For backward compatibility, keep redis_client as pod 0's client
+        # This is used for global coordination
+        self.redis_client: Optional[ShieldedRedis] = None
+        self.redis_client_binary: Optional[ShieldedRedis] = None
 
         self.pages_crawled_count: int = 0
         self.start_time: float = 0.0
@@ -135,182 +117,168 @@ class CrawlerOrchestrator:
         self.last_redis_stats = None
         self.last_redis_stats_time = None
         
-        # Process management
-        self.parser_process: Optional[Process] = None
-        self.parser_processes: List[Process] = []  # Support multiple parsers
-        self.fetcher_processes: List[Process] = []  # Additional fetcher processes (1+)
-        self.local_fetcher: Optional[FetcherProcess] = None  # Orchestrator's own fetcher (fetcher 0)
+        # Process management - now organized by pods
+        self.pod_processes: Dict[int, Dict[str, List[Process]]] = {}
+        self.local_pod_fetchers: Dict[int, FetcherProcess] = {}  # Local fetchers by pod
         
         # Backpressure configuration
-        self.fetch_queue_soft_limit = 20000  # Start slowing down at this size
-        self.fetch_queue_hard_limit = 80000  # Maximum queue size
+        self.fetch_queue_soft_limit = config.parse_queue_soft_limit
+        self.fetch_queue_hard_limit = config.parse_queue_hard_limit
+    
+    async def _init_redis_clients(self):
+        """Initialize Redis clients for global coordination (pod 0)."""
+        self.redis_client = await self.pod_manager.get_redis_client(
+            pod_id=self.config.global_coordination_redis_pod, 
+            binary=False
+        )
+        self.redis_client_binary = await self.pod_manager.get_redis_client(
+            pod_id=self.config.global_coordination_redis_pod,
+            binary=True
+        )
+        logger.info(f"Initialized global coordination Redis clients (pod {self.config.global_coordination_redis_pod})")
 
-    def _start_parser_process(self):
-        """Start the parser consumer as a child process."""
-            
-        def run_parser():
-            """Function to run in the parser process."""
-            # Import inside the function to avoid issues with multiprocessing
-            import asyncio
-            import logging
-            
-            # Setup logging for the child process
-            logging.basicConfig(
-                level=logging.INFO,
-                format='%(asctime)s - %(name)s - %(levelname)s - [Parser] %(message)s'
-            )
-            
-            # Create and run the parser consumer
-            consumer = ParserConsumer(self.config)
-            asyncio.run(consumer.run())
+    def _start_pod_processes(self, pod_id: int):
+        """Start all processes for a specific pod."""
+        self.pod_processes[pod_id] = {
+            'fetchers': [],
+            'parsers': []
+        }
         
-        logger.info("Starting parser consumer process...")
-        self.parser_process = Process(target=run_parser, name="ParserConsumer")
-        self.parser_process.daemon = False  # Don't make it daemon so it can clean up properly
-        self.parser_process.start()
-        logger.info(f"Parser consumer process started with PID: {self.parser_process.pid}")
-    
-    def _start_parser_processes(self, num_processes: Optional[int] = None):
-        """Start multiple parser consumer processes."""
-        num_processes = num_processes or self.config.num_parser_processes
-        
-        def run_parser(parser_id: int):
-            """Function to run in the parser process."""
-            # Import inside the function to avoid issues with multiprocessing
-            import asyncio
-            import logging
-            from .parser_consumer import ParserConsumer
-            
-            # Setup logging for the child process
-            logging.basicConfig(
-                level=logging.INFO,
-                format=f'%(asctime)s - %(name)s - %(levelname)s - [Parser-{parser_id}] %(message)s'
-            )
-            
-            # Create and run the parser consumer
-            consumer = ParserConsumer(self.config)
-            asyncio.run(consumer.run())
-        
-        logger.info(f"Starting {num_processes} parser consumer processes...")
-        for i in range(num_processes):
-            process = Process(target=run_parser, args=(i+1,), name=f"ParserConsumer-{i+1}")
-            process.daemon = False  # Don't make it daemon so it can clean up properly
-            process.start()
-            self.parser_processes.append(process)
-            logger.info(f"Parser consumer process {i+1} started with PID: {process.pid}")
-    
-    def _stop_parser_process(self):
-        """Stop the parser consumer process gracefully."""
-        if self.parser_process and self.parser_process.is_alive():
-            logger.info("Stopping parser consumer process...")
-            self.parser_process.terminate()
-            self.parser_process.join(timeout=10)  # Wait up to 10 seconds
-            
-            if self.parser_process.is_alive():
-                logger.warning("Parser process didn't terminate gracefully, forcing...")
-                self.parser_process.kill()
-                self.parser_process.join()
-            
-            logger.info("Parser consumer process stopped.")
-    
-    def _stop_parser_processes(self):
-        """Stop all parser consumer processes gracefully."""
-        if not self.parser_processes:
-            # Fallback to single process stop
-            self._stop_parser_process()
-            return
-            
-        logger.info(f"Stopping {len(self.parser_processes)} parser consumer processes...")
-        
-        # First try to terminate gracefully
-        for process in self.parser_processes:
-            if process.is_alive():
-                process.terminate()
-        
-        # Wait for all to terminate
-        for process in self.parser_processes:
-            process.join(timeout=10)  # Wait up to 10 seconds
-            
-            if process.is_alive():
-                logger.warning(f"Parser process {process.name} didn't terminate gracefully, forcing...")
-                process.kill()
-                process.join()
-        
-        self.parser_processes.clear()
-        logger.info("All parser consumer processes stopped.")
-    
-    def _start_fetcher_processes(self):
-        """Start additional fetcher processes (fetcher 1+).
-        The orchestrator runs fetcher 0 internally."""
-        def run_fetcher(fetcher_id: int):
+        def run_fetcher(pod_id: int, fetcher_id: int):
             """Function to run in the fetcher process."""
-            # Import inside the function to avoid issues with multiprocessing
             import asyncio
             import logging
             from .fetcher_process import run_fetcher_process
             
-            # Run the fetcher
-            run_fetcher_process(self.config, fetcher_id)
+            # Setup logging with pod ID
+            logging.basicConfig(
+                level=logging.INFO,
+                format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Fetcher-{fetcher_id}] %(message)s'
+            )
+            
+            # Run the fetcher with pod ID
+            run_fetcher_process(self.config, fetcher_id, pod_id=pod_id)
         
-        # Start additional fetcher processes (1+)
-        if self.config.num_fetcher_processes > 1:
-            logger.info(f"Starting {self.config.num_fetcher_processes - 1} additional fetcher processes...")
-            for i in range(1, self.config.num_fetcher_processes):  # Start from 1, not 0
-                process = Process(
-                    target=run_fetcher,
-                    args=(i,),
-                    name=f"FetcherProcess-{i}"
-                )
-                process.daemon = False  # Don't make it daemon so it can clean up properly
-                process.start()
-                self.fetcher_processes.append(process)
-                logger.info(f"Fetcher process {i} started with PID: {process.pid}")
+        def run_parser(pod_id: int, parser_id: int):
+            """Function to run in the parser process."""
+            import asyncio
+            import logging
+            from .parser_consumer import ParserConsumer
+            
+            # Setup logging with pod ID
+            logging.basicConfig(
+                level=logging.INFO,
+                format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Parser-{parser_id}] %(message)s'
+            )
+            
+            # Create and run the parser consumer for this pod
+            consumer = ParserConsumer(self.config, pod_id=pod_id)
+            asyncio.run(consumer.run())
+        
+        # Start fetcher processes for this pod
+        for i in range(self.config.fetchers_per_pod):
+            # Skip fetcher 0 of pod 0 (runs in orchestrator)
+            if pod_id == 0 and i == 0:
+                continue
+                
+            process = Process(
+                target=run_fetcher,
+                args=(pod_id, i),
+                name=f"Pod-{pod_id}-Fetcher-{i}"
+            )
+            process.daemon = False
+            process.start()
+            self.pod_processes[pod_id]['fetchers'].append(process)
+            logger.info(f"Started fetcher {i} for pod {pod_id} with PID: {process.pid}")
+        
+        # Start parser processes for this pod
+        for i in range(self.config.parsers_per_pod):
+            process = Process(
+                target=run_parser,
+                args=(pod_id, i),
+                name=f"Pod-{pod_id}-Parser-{i}"
+            )
+            process.daemon = False
+            process.start()
+            self.pod_processes[pod_id]['parsers'].append(process)
+            logger.info(f"Started parser {i} for pod {pod_id} with PID: {process.pid}")
     
-    def _stop_fetcher_processes(self):
-        """Stop all fetcher processes gracefully."""
-        if not self.fetcher_processes:
+    def _stop_pod_processes(self, pod_id: int):
+        """Stop all processes for a specific pod."""
+        if pod_id not in self.pod_processes:
             return
             
-        logger.info(f"Stopping {len(self.fetcher_processes)} fetcher processes...")
+        logger.info(f"Stopping processes for pod {pod_id}...")
         
-        # First try to terminate gracefully
-        for process in self.fetcher_processes:
+        # Stop fetchers first
+        for process in self.pod_processes[pod_id]['fetchers']:
+            if process.is_alive():
+                process.terminate()
+        
+        # Stop parsers
+        for process in self.pod_processes[pod_id]['parsers']:
             if process.is_alive():
                 process.terminate()
         
         # Wait for all to terminate
-        for process in self.fetcher_processes:
-            process.join(timeout=10)  # Wait up to 10 seconds
-            
+        for process in self.pod_processes[pod_id]['fetchers'] + self.pod_processes[pod_id]['parsers']:
+            process.join(timeout=10)
             if process.is_alive():
-                logger.warning(f"Fetcher process {process.name} didn't terminate gracefully, forcing...")
+                logger.warning(f"Process {process.name} didn't terminate gracefully, forcing...")
                 process.kill()
                 process.join()
         
-        self.fetcher_processes.clear()
-        logger.info("All fetcher processes stopped.")
-
+        del self.pod_processes[pod_id]
+        logger.info(f"All processes for pod {pod_id} stopped.")
+    
+    def _stop_all_pod_processes(self):
+        """Stop all pod processes."""
+        pod_ids = list(self.pod_processes.keys())
+        for pod_id in pod_ids:
+            self._stop_pod_processes(pod_id)
 
     async def _initialize_components(self):
         """Initializes orchestrator components that require async setup."""
         logger.info("Initializing orchestrator components...")
         
+        # Initialize Redis clients for global coordination
+        await self._init_redis_clients()
+        
         # One-time initialization shared across all processes
         logger.info("Performing one-time initialization...")
         
-        # Initialize storage schema
-        storage = StorageManager(self.config, self.redis_client)  # type: ignore
-        await storage.init_db_schema()
-        await storage.close()
+        # For each pod, initialize storage schema and frontier
+        for pod_id in self.pod_manager.get_all_pod_ids():
+            logger.info(f"Initializing pod {pod_id}...")
+            
+            # Get Redis clients for this pod
+            redis_client = await self.pod_manager.get_redis_client(pod_id, binary=False)
+            
+            # Initialize storage schema
+            storage = StorageManager(self.config, redis_client)
+            await storage.init_db_schema()
+            await storage.close()
+            
+            # Initialize frontier for this pod
+            temp_fetcher = Fetcher(self.config)
+            politeness = PolitenessEnforcer(self.config, redis_client, temp_fetcher)
+            frontier = FrontierManager(self.config, politeness, redis_client, pod_id=pod_id)
+            await frontier.initialize_frontier()
+            
+            # Clean up temporary instances
+            await temp_fetcher.close_session()
+            
+            # Add debug info for this pod
+            pod_config = self.pod_manager.get_pod_config(pod_id)
+            await redis_client.hset('pod:info', mapping={
+                'pod_id': str(pod_id),
+                'redis_url': pod_config.redis_url,
+                'initialized_at': str(int(time.time()))
+            })
+            
+            logger.info(f"Pod {pod_id} initialized.")
         
-        temp_fetcher = Fetcher(self.config)
-        politeness = PolitenessEnforcer(self.config, self.redis_client, temp_fetcher)
-        # Initialize frontier (also initializes politeness with manual exclusions, seeds, etc.)
-        frontier = FrontierManager(self.config, politeness, self.redis_client)
-        await frontier.initialize_frontier()
-        
-        # Clean up temporary instances
-        await temp_fetcher.close_session()
+        # Pod distribution will be logged when seeds are loaded
             
         logger.info("Orchestrator components initialized.")
 
@@ -442,7 +410,7 @@ class CrawlerOrchestrator:
                 logger.info(f"[Metrics] System memory getting low: {available_gb:.1f}GB available")
             
             # Disk metrics (for the crawler's data directory)
-            disk = psutil.disk_usage(self.config.data_dir)
+            disk = psutil.disk_usage(str(self.config.data_dir))
             disk_free_gauge.set(disk.free)
             disk_usage_percent_gauge.set(disk.percent)
             logger.info(f"[Metrics] Disk ({self.config.data_dir}): Free={disk.free/1024/1024/1024:.1f}GB, Used={disk.percent:.1f}%")
@@ -482,9 +450,14 @@ class CrawlerOrchestrator:
                 self.last_network_stats = net_counters
             
             # Redis metrics
-            redis_info = await self.redis_client.info()
-            redis_memory = await self.redis_client.info('memory')
-            redis_stats = await self.redis_client.info('stats')
+            if self.redis_client:
+                redis_info = await self.redis_client.info()
+                redis_memory = await self.redis_client.info('memory')
+                redis_stats = await self.redis_client.info('stats')
+            else:
+                redis_info = {}
+                redis_memory = {}
+                redis_stats = {}
             
             # Basic Redis metrics
             redis_memory_usage_gauge.set(redis_memory.get('used_memory', 0))
@@ -592,19 +565,24 @@ class CrawlerOrchestrator:
             if start_metrics_server(port=8001):
                 logger.info("Prometheus metrics server started on port 8001")
             
-            # Create and start the local fetcher (fetcher 0) in this process
-            self.local_fetcher = FetcherProcess(self.config, fetcher_id=0)
-            local_fetcher_task = asyncio.create_task(self.local_fetcher.run())
-            logger.info("Started local fetcher (fetcher 0) in orchestrator process")
+            # Start processes for all pods
+            logger.info(f"Starting processes for {self.config.num_pods} pods...")
             
-            # Start additional fetcher processes (1+)
-            self._start_fetcher_processes()
-            self._start_parser_processes()
+            # Start pod 0's local fetcher in this process
+            self.local_pod_fetchers[0] = FetcherProcess(self.config, fetcher_id=0, pod_id=0)
+            local_fetcher_task = asyncio.create_task(self.local_pod_fetchers[0].run())
+            logger.info("Started local fetcher (Pod 0, Fetcher 0) in orchestrator process")
+            
+            # Start all pod processes
+            for pod_id in range(self.config.num_pods):
+                self._start_pod_processes(pod_id)
             
             # Give all processes a moment to initialize
             await asyncio.sleep(2)
             
-            logger.info("All processes started.")
+            total_fetchers = self.config.num_pods * self.config.fetchers_per_pod
+            total_parsers = self.config.num_pods * self.config.parsers_per_pod
+            logger.info(f"All processes started: {total_fetchers} fetchers, {total_parsers} parsers across {self.config.num_pods} pods")
 
             if LOG_MEM_DIAGNOSTICS:
                 with open(f'mem_diagnostics/mem_diagnostics.txt', 'w+') as f:
@@ -616,94 +594,47 @@ class CrawlerOrchestrator:
 
             # Main monitoring loop
             while not self._shutdown_event.is_set():
-                # Check if all processes are still alive
+                # Check pod process health
                 all_processes_dead = True
-                for process in self.fetcher_processes + self.parser_processes:
-                    if process.is_alive():
-                        all_processes_dead = False
-                        break
+                dead_pods = []
                 
-                if all_processes_dead and (self.fetcher_processes or self.parser_processes):
+                for pod_id, pod_procs in self.pod_processes.items():
+                    # Check fetchers
+                    for proc in pod_procs['fetchers']:
+                        if proc.is_alive():
+                            all_processes_dead = False
+                        else:
+                            logger.error(f"Process {proc.name} died unexpectedly!")
+                            if proc.exitcode != 0:
+                                logger.error(f"Process {proc.name} exit code: {proc.exitcode}")
+                    
+                    # Check parsers
+                    for proc in pod_procs['parsers']:
+                        if proc.is_alive():
+                            all_processes_dead = False
+                        else:
+                            logger.error(f"Process {proc.name} died unexpectedly!")
+                            if proc.exitcode != 0:
+                                logger.error(f"Process {proc.name} exit code: {proc.exitcode}")
+                    
+                    # Check if all processes in this pod are dead
+                    pod_dead = all(not proc.is_alive() for proc in pod_procs['fetchers'] + pod_procs['parsers'])
+                    if pod_dead:
+                        dead_pods.append(pod_id)
+                
+                # Check local fetchers too
+                for pod_id, fetcher in self.local_pod_fetchers.items():
+                    if fetcher:
+                        all_processes_dead = False
+                
+                if all_processes_dead and (self.pod_processes or self.local_pod_fetchers):
                     logger.error("All child processes have died!")
                     self._shutdown_event.set()
                     break
                 
-                # Check fetcher process health
-                dead_fetchers = []
-                for i, process in enumerate(self.fetcher_processes):
-                    if not process.is_alive():
-                        logger.error(f"Fetcher process {process.name} died unexpectedly!")
-                        if process.exitcode != 0:
-                            logger.error(f"Fetcher process {process.name} exit code: {process.exitcode}")
-                        dead_fetchers.append(i)
-                
-                # Remove dead fetcher processes
-                for i in reversed(dead_fetchers):
-                    self.fetcher_processes.pop(i)
-                
-                # For now, don't restart dead fetcher processes automatically
-                # as it would require careful resharding
-                if dead_fetchers:
-                    logger.error(f"Lost {len(dead_fetchers)} additional fetcher processes. Manual restart required.")
-                    # Check if we have no fetchers at all (local + additional)
-                    if not self.fetcher_processes and not self.local_fetcher:
-                        logger.critical("All fetcher processes dead! Shutting down...")
-                        self._shutdown_event.set()
-                        break
-                
-                # Check parser process health
-                # Handle single parser process (backward compatibility)
-                if self.parser_process and not self.parser_processes and not self.parser_process.is_alive():
-                    logger.error("Parser process died unexpectedly!")
-                    if self.parser_process.exitcode != 0:
-                        logger.error(f"Parser process exit code: {self.parser_process.exitcode}")
-                    # Restart parser processes
-                    self._start_parser_processes(1)  # Start single parser
-                
-                # Check multiple parser processes health
-                if self.parser_processes:
-                    dead_processes = []
-                    for i, process in enumerate(self.parser_processes):
-                        if not process.is_alive():
-                            logger.error(f"Parser process {process.name} died unexpectedly!")
-                            if process.exitcode != 0:
-                                logger.error(f"Parser process {process.name} exit code: {process.exitcode}")
-                            dead_processes.append(i)
-                    
-                    # Remove dead processes
-                    for i in reversed(dead_processes):  # Reverse to avoid index issues
-                        self.parser_processes.pop(i)
-                    
-                    # Restart if any died
-                    if dead_processes:
-                        missing_count = self.config.num_parser_processes - len(self.parser_processes)
-                        logger.info(f"Restarting {missing_count} parser processes...")
-                        
-                        def run_parser(parser_id: int):
-                            """Function to run in the parser process."""
-                            import asyncio
-                            import logging
-                            from .parser_consumer import ParserConsumer
-                            
-                            logging.basicConfig(
-                                level=logging.INFO,
-                                format=f'%(asctime)s - %(name)s - %(levelname)s - [Parser-{parser_id}] %(message)s'
-                            )
-                            
-                            consumer = ParserConsumer(self.config)
-                            asyncio.run(consumer.run())
-                        
-                        for i in range(missing_count):
-                            process_id = max([int(p.name.split('-')[-1]) for p in self.parser_processes] + [0]) + 1
-                            process = Process(
-                                target=run_parser,
-                                args=(process_id,),
-                                name=f"ParserConsumer-{process_id}"
-                            )
-                            process.daemon = False
-                            process.start()
-                            self.parser_processes.append(process)
-                            logger.info(f"Restarted parser process {process_id} with PID: {process.pid}")
+                # Log dead pods but don't restart automatically (would require careful resharding)
+                if dead_pods:
+                    logger.error(f"Lost all processes for pods: {dead_pods}. Manual restart required.")
                 
                 if time.time() - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
                     await self._log_metrics()
@@ -743,10 +674,10 @@ class CrawlerOrchestrator:
 
                 # TODO: frontier count is very slow with redis right now
                 estimated_frontier_size = -1
-                # Count active fetcher processes
-                # Include local fetcher (orchestrator) plus additional fetcher processes
-                active_fetcher_processes = 1 if self.local_fetcher else 0  # Orchestrator's fetcher
-                active_fetcher_processes += sum(1 for p in self.fetcher_processes if p.is_alive())
+                # Count active fetcher processes across all pods
+                active_fetcher_processes = len(self.local_pod_fetchers)  # Local fetchers
+                for pod_procs in self.pod_processes.values():
+                    active_fetcher_processes += sum(1 for p in pod_procs['fetchers'] if p.is_alive())
                 
                 # Update Prometheus gauges
                 frontier_size_gauge.set(estimated_frontier_size)
@@ -787,20 +718,29 @@ class CrawlerOrchestrator:
                 ]
                 logger.info(f"Status: {', '.join(status_parts)}")
                 
-                # Check if frontier is empty by checking domain queue
-                queue_size = await self.redis_client.llen('domains:queue')
-                
-                if queue_size == 0 and self.pages_crawled_count > 0:
-                    logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
-                    await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
+                # Check if frontier is empty by checking domain queues across all pods
+                if self.redis_client:
+                    total_queue_size = 0
+                    for pod_id in range(self.config.num_pods):
+                        redis_client = await self.pod_manager.get_redis_client(pod_id)
+                        queue_size = await redis_client.llen('domains:queue')
+                        total_queue_size += queue_size
                     
-                    # Re-check after wait
-                    queue_size = await self.redis_client.llen('domains:queue')
-                    
-                    if queue_size == 0:
-                        logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
-                        self._shutdown_event.set()
-                        break
+                    if total_queue_size == 0 and self.pages_crawled_count > 0:
+                        logger.info(f"All frontiers empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
+                        await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
+                        
+                        # Re-check after wait
+                        total_queue_size = 0
+                        for pod_id in range(self.config.num_pods):
+                            redis_client = await self.pod_manager.get_redis_client(pod_id)
+                            queue_size = await redis_client.llen('domains:queue')
+                            total_queue_size += queue_size
+                        
+                        if total_queue_size == 0:
+                            logger.info("All frontiers confirmed empty after wait. Signaling shutdown.")
+                            self._shutdown_event.set()
+                            break
                 
                 # Check global stopping conditions (max_pages, max_duration)
                 if self.config.max_pages and self.pages_crawled_count >= self.config.max_pages:
@@ -817,17 +757,14 @@ class CrawlerOrchestrator:
             
             logger.info("Shutdown signaled. Stopping processes...")
             
-            # Stop the local fetcher first
-            if self.local_fetcher:
-                logger.info("Stopping local fetcher...")
-                self.local_fetcher._shutdown_event.set()
-                # The local fetcher task will finish on its own
+            # Stop local fetchers first
+            for pod_id, fetcher in self.local_pod_fetchers.items():
+                if fetcher:
+                    logger.info(f"Stopping local fetcher for pod {pod_id}...")
+                    fetcher._shutdown_event.set()
             
-            # Stop additional fetcher processes (they push to parser queue)
-            self._stop_fetcher_processes()
-            
-            # Then stop parser processes
-            self._stop_parser_processes()
+            # Stop all pod processes
+            self._stop_all_pod_processes()
             
             logger.info("All processes stopped.")
 
@@ -837,14 +774,14 @@ class CrawlerOrchestrator:
         finally:
             logger.info("Performing final cleanup...")
             
-            # Ensure local fetcher is stopped
-            if self.local_fetcher:
-                self.local_fetcher._shutdown_event.set()
-                await asyncio.sleep(1)  # Give it a moment to clean up
+            # Ensure local fetchers are stopped
+            for fetcher in self.local_pod_fetchers.values():
+                if fetcher:
+                    fetcher._shutdown_event.set()
+            await asyncio.sleep(1)  # Give them a moment to clean up
             
             # Processes should already be stopped, but ensure they are
-            self._stop_fetcher_processes()
-            self._stop_parser_processes()
+            self._stop_all_pod_processes()
             
             # Wait for local fetcher task to complete
             if 'local_fetcher_task' in locals() and not local_fetcher_task.done():
@@ -859,9 +796,8 @@ class CrawlerOrchestrator:
                     except asyncio.CancelledError:
                         pass
             
-            # Close Redis connections
-            await self.redis_client.aclose()
-            await self.redis_client_binary.aclose()
+            # Close all Redis connections
+            await self.pod_manager.close_all()
             
             logger.info(f"Crawl finished. Total pages crawled across all fetchers: {self.pages_crawled_count}")
             logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.") 

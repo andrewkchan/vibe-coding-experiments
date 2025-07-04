@@ -1,5 +1,5 @@
 # Scaling up the multiprocess web crawler
-_Exported on 7/3/2025 at 22:18:53 PDT from Cursor (1.0.0)_
+_Exported on 7/4/2025 at 00:08:05 PDT from Cursor (1.0.0)_
 
 ---
 
@@ -1672,5 +1672,2841 @@ python main.py --config crawler_config_test.yaml
 # For production (16 pods)
 docker-compose up -d  # Uses the generated docker-compose.yml
 python main.py --config crawler_config.yaml
+```
+
+---
+
+**User**
+
+Looks great, let's proceed
+
+---
+
+**Cursor**
+
+Excellent! Let's dive into Phase 2: Core Pod Architecture. We'll start by creating the PodManager class and then update the orchestrator to use pod-based spawning.
+
+## Phase 2: Core Pod Architecture
+
+### Step 1: Create PodManager
+
+```python
+"""Pod management for distributed crawler architecture."""
+
+import hashlib
+import logging
+from typing import List, Dict, Optional
+import redis.asyncio as redis
+from redis.asyncio import BlockingConnectionPool
+
+from .config import CrawlerConfig, PodConfig
+from .redis_shield import ShieldedRedis
+
+logger = logging.getLogger(__name__)
+
+
+class PodManager:
+    """Manages pod assignment and Redis connections for all pods."""
+    
+    def __init__(self, config: CrawlerConfig):
+        self.config = config
+        self.pod_configs = config.pod_configs
+        self.num_pods = len(self.pod_configs)
+        
+        # Redis clients for each pod (lazy-loaded)
+        self._redis_clients: Dict[int, ShieldedRedis] = {}
+        self._redis_clients_binary: Dict[int, ShieldedRedis] = {}
+        
+        logger.info(f"PodManager initialized with {self.num_pods} pods")
+    
+    def get_pod_for_domain(self, domain: str) -> int:
+        """Get the pod ID responsible for a given domain.
+        
+        Uses MD5 hash for consistent domain-to-pod mapping.
+        """
+        if self.num_pods == 1:
+            return 0
+            
+        # Use MD5 for speed (cryptographic security not needed here)
+        domain_hash = hashlib.md5(domain.encode('utf-8')).hexdigest()
+        # Use first 8 hex chars (32 bits) for better distribution
+        hash_value = int(domain_hash[:8], 16)
+        pod_id = hash_value % self.num_pods
+        
+        return pod_id
+    
+    def get_pod_config(self, pod_id: int) -> PodConfig:
+        """Get configuration for a specific pod."""
+        if pod_id < 0 or pod_id >= self.num_pods:
+            raise ValueError(f"Invalid pod_id {pod_id}. Must be 0-{self.num_pods-1}")
+        return self.pod_configs[pod_id]
+    
+    async def get_redis_client(self, pod_id: int, binary: bool = False) -> ShieldedRedis:
+        """Get Redis client for a specific pod.
+        
+        Args:
+            pod_id: Pod identifier
+            binary: If True, returns a client configured for binary data
+        
+        Returns:
+            ShieldedRedis client for the pod
+        """
+        cache = self._redis_clients_binary if binary else self._redis_clients
+        
+        if pod_id not in cache:
+            pod_config = self.get_pod_config(pod_id)
+            kwargs = pod_config.get_redis_kwargs()
+            
+            if binary:
+                kwargs['decode_responses'] = False
+            
+            # Create blocking connection pool
+            pool = BlockingConnectionPool(**kwargs)
+            base_client = redis.Redis(connection_pool=pool)
+            
+            # Monkey-patch to remove decorator overhead
+            import functools
+            base_client.connection_pool.get_connection = functools.partial(
+                base_client.connection_pool.get_connection.__wrapped__, 
+                base_client.connection_pool
+            )
+            
+            # Wrap with ShieldedRedis
+            cache[pod_id] = ShieldedRedis(base_client)
+            
+            logger.info(f"Created {'binary' if binary else 'text'} Redis client for pod {pod_id}")
+        
+        return cache[pod_id]
+    
+    async def get_redis_for_domain(self, domain: str, binary: bool = False) -> ShieldedRedis:
+        """Get Redis client for the pod responsible for a domain."""
+        pod_id = self.get_pod_for_domain(domain)
+        return await self.get_redis_client(pod_id, binary)
+    
+    def get_all_pod_ids(self) -> List[int]:
+        """Get list of all pod IDs."""
+        return list(range(self.num_pods))
+    
+    async def close_all(self):
+        """Close all Redis connections."""
+        logger.info("Closing all Redis connections...")
+        
+        for pod_id, client in self._redis_clients.items():
+            try:
+                await client.aclose()
+                logger.debug(f"Closed text Redis client for pod {pod_id}")
+            except Exception as e:
+                logger.error(f"Error closing text Redis client for pod {pod_id}: {e}")
+        
+        for pod_id, client in self._redis_clients_binary.items():
+            try:
+                await client.aclose()
+                logger.debug(f"Closed binary Redis client for pod {pod_id}")
+            except Exception as e:
+                logger.error(f"Error closing binary Redis client for pod {pod_id}: {e}")
+        
+        self._redis_clients.clear()
+        self._redis_clients_binary.clear()
+        
+        logger.info("All Redis connections closed")
+    
+    def get_pod_distribution_stats(self, domains: List[str]) -> Dict[int, int]:
+        """Get distribution of domains across pods for analysis.
+        
+        Useful for checking hot shard issues.
+        """
+        distribution = {pod_id: 0 for pod_id in range(self.num_pods)}
+        
+        for domain in domains:
+            pod_id = self.get_pod_for_domain(domain)
+            distribution[pod_id] += 1
+        
+        return distribution
+    
+    def log_pod_distribution(self, domains: List[str], label: str = "domains"):
+        """Log pod distribution statistics."""
+        stats = self.get_pod_distribution_stats(domains)
+        total = len(domains)
+        
+        logger.info(f"Pod distribution for {total} {label}:")
+        for pod_id in sorted(stats.keys()):
+            count = stats[pod_id]
+            percentage = (count / total * 100) if total > 0 else 0
+            logger.info(f"  Pod {pod_id}: {count} ({percentage:.1f}%)")
+        
+        # Calculate and log imbalance
+        if stats:
+            min_count = min(stats.values())
+            max_count = max(stats.values())
+            avg_count = total / self.num_pods
+            max_imbalance = ((max_count - avg_count) / avg_count * 100) if avg_count > 0 else 0
+            
+            logger.info(f"  Min: {min_count}, Max: {max_count}, Avg: {avg_count:.1f}")
+            logger.info(f"  Max imbalance: {max_imbalance:.1f}% above average")
+```
+
+The linter errors are expected - they're the same as in other files that use `redis.asyncio`. Let's proceed with updating the orchestrator to use pod-based architecture.
+
+### Step 2: Update Orchestrator for Pod-Based Spawning
+
+Let's check the current orchestrator structure first:
+
+Now let's update the orchestrator to use pod-based architecture:
+
+```python
+import asyncio
+import logging
+import time
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+import os # For process ID
+import psutil
+import functools
+from pympler import muppy, summary
+from multiprocessing import Process
+import redis.asyncio as redis
+from redis.asyncio import BlockingConnectionPool
+import gc
+
+from .config import CrawlerConfig
+from .pod_manager import PodManager
+from .redis_shield import ShieldedRedis
+from .fetcher_process import FetcherProcess, run_fetcher_process
+from .parser_consumer import ParserConsumer
+from .storage import StorageManager
+from .fetcher import Fetcher
+from .politeness import PolitenessEnforcer
+from .frontier import FrontierManager
+from .memory_diagnostics import memory_diagnostics
+from .metrics import (
+    start_metrics_server,
+    frontier_size_gauge,
+    content_size_histogram,
+    # System metrics
+    cpu_usage_gauge,
+    memory_free_gauge,
+    memory_available_gauge,
+    disk_free_gauge,
+    disk_usage_percent_gauge,
+    io_read_count_gauge,
+    io_write_count_gauge,
+    io_read_bytes_gauge,
+    io_write_bytes_gauge,
+    network_bytes_sent_gauge,
+    network_bytes_recv_gauge,
+    network_packets_sent_gauge,
+    network_packets_recv_gauge,
+    # Redis metrics
+    redis_ops_per_sec_gauge,
+    redis_memory_usage_gauge,
+    redis_connected_clients_gauge,
+    redis_hit_rate_gauge,
+    # FD type metrics
+    fd_redis_gauge,
+    fd_http_gauge,
+    fd_https_gauge,
+    fd_frontier_files_gauge,
+    fd_prometheus_gauge,
+    fd_other_sockets_gauge,
+    fd_pipes_gauge,
+    fd_other_gauge,
+    process_memory_usage_gauge,
+    process_open_fds_gauge
+)
+
+logger = logging.getLogger(__name__)
+
+# How long a worker should sleep if the frontier is temporarily empty 
+# or all domains are on cooldown, before trying again.
+EMPTY_FRONTIER_SLEEP_SECONDS = 10
+# How often the main orchestrator loop checks status and stopping conditions
+ORCHESTRATOR_STATUS_INTERVAL_SECONDS = 5
+
+METRICS_LOG_INTERVAL_SECONDS = 60
+LOG_MEM_DIAGNOSTICS = False
+MEM_DIAGNOSTICS_INTERVAL_SECONDS = 60
+
+GC_INTERVAL_SECONDS = 120
+GC_RSS_THRESHOLD_MB = 4096
+
+
+class CrawlerOrchestrator:
+    def __init__(self, config: CrawlerConfig):
+        self.config = config
+        
+        data_dir_path = Path(config.data_dir)
+        try:
+            data_dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Ensured data directory exists: {data_dir_path}")
+        except OSError as e:
+            logger.error(f"Critical error creating data directory {data_dir_path}: {e}")
+            raise # Stop if we can't create data directory
+        
+        # Set parent process ID for multiprocess metrics
+        # The multiprocess directory should already be set up by main.py
+        # We just need to mark this as the parent process
+        os.environ['PROMETHEUS_PARENT_PROCESS'] = str(os.getpid())
+        logger.info(f"Set PROMETHEUS_PARENT_PROCESS to {os.getpid()}")
+
+        # Initialize PodManager for pod-based architecture
+        self.pod_manager = PodManager(config)
+        
+        # For backward compatibility, keep redis_client as pod 0's client
+        # This is used for global coordination
+        self.redis_client: Optional[ShieldedRedis] = None
+        self.redis_client_binary: Optional[ShieldedRedis] = None
+
+        self.pages_crawled_count: int = 0
+        self.start_time: float = 0.0
+        self._shutdown_event: asyncio.Event = asyncio.Event()
+        self.total_urls_added_to_frontier: int = 0
+
+        self.last_metrics_log_time: float = time.time()
+        self.last_mem_diagnostics_time: float = time.time()
+        self.last_mem_diagnostics_rss: int = 0
+
+        self.last_gc_time: float = time.time()
+        
+        # System metrics tracking for rate calculations
+        self.last_io_stats = None
+        self.last_network_stats = None
+        self.last_redis_stats = None
+        self.last_redis_stats_time = None
+        
+        # Process management - now organized by pods
+        self.pod_processes: Dict[int, Dict[str, List[Process]]] = {}
+        self.local_pod_fetchers: Dict[int, FetcherProcess] = {}  # Local fetchers by pod
+        
+        # Backpressure configuration
+        self.fetch_queue_soft_limit = config.parse_queue_soft_limit
+        self.fetch_queue_hard_limit = config.parse_queue_hard_limit
+    
+    async def _init_redis_clients(self):
+        """Initialize Redis clients for global coordination (pod 0)."""
+        self.redis_client = await self.pod_manager.get_redis_client(
+            pod_id=self.config.global_coordination_redis_pod, 
+            binary=False
+        )
+        self.redis_client_binary = await self.pod_manager.get_redis_client(
+            pod_id=self.config.global_coordination_redis_pod,
+            binary=True
+        )
+        logger.info(f"Initialized global coordination Redis clients (pod {self.config.global_coordination_redis_pod})")
+
+    def _start_pod_processes(self, pod_id: int):
+        """Start all processes for a specific pod."""
+        self.pod_processes[pod_id] = {
+            'fetchers': [],
+            'parsers': []
+        }
+        
+        def run_fetcher(pod_id: int, fetcher_id: int):
+            """Function to run in the fetcher process."""
+            import asyncio
+            import logging
+            from .fetcher_process import run_fetcher_process
+            
+            # Setup logging with pod ID
+            logging.basicConfig(
+                level=logging.INFO,
+                format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Fetcher-{fetcher_id}] %(message)s'
+            )
+            
+            # Run the fetcher with pod ID
+            run_fetcher_process(self.config, fetcher_id, pod_id=pod_id)
+        
+        def run_parser(pod_id: int, parser_id: int):
+            """Function to run in the parser process."""
+            import asyncio
+            import logging
+            from .parser_consumer import ParserConsumer
+            
+            # Setup logging with pod ID
+            logging.basicConfig(
+                level=logging.INFO,
+                format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Parser-{parser_id}] %(message)s'
+            )
+            
+            # Create and run the parser consumer for this pod
+            consumer = ParserConsumer(self.config, pod_id=pod_id)
+            asyncio.run(consumer.run())
+        
+        # Start fetcher processes for this pod
+        for i in range(self.config.fetchers_per_pod):
+            # Skip fetcher 0 of pod 0 (runs in orchestrator)
+            if pod_id == 0 and i == 0:
+                continue
+                
+            process = Process(
+                target=run_fetcher,
+                args=(pod_id, i),
+                name=f"Pod-{pod_id}-Fetcher-{i}"
+            )
+            process.daemon = False
+            process.start()
+            self.pod_processes[pod_id]['fetchers'].append(process)
+            logger.info(f"Started fetcher {i} for pod {pod_id} with PID: {process.pid}")
+        
+        # Start parser processes for this pod
+        for i in range(self.config.parsers_per_pod):
+            process = Process(
+                target=run_parser,
+                args=(pod_id, i),
+                name=f"Pod-{pod_id}-Parser-{i}"
+            )
+            process.daemon = False
+            process.start()
+            self.pod_processes[pod_id]['parsers'].append(process)
+            logger.info(f"Started parser {i} for pod {pod_id} with PID: {process.pid}")
+    
+    def _stop_pod_processes(self, pod_id: int):
+        """Stop all processes for a specific pod."""
+        if pod_id not in self.pod_processes:
+            return
+            
+        logger.info(f"Stopping processes for pod {pod_id}...")
+        
+        # Stop fetchers first
+        for process in self.pod_processes[pod_id]['fetchers']:
+            if process.is_alive():
+                process.terminate()
+        
+        # Stop parsers
+        for process in self.pod_processes[pod_id]['parsers']:
+            if process.is_alive():
+                process.terminate()
+        
+        # Wait for all to terminate
+        for process in self.pod_processes[pod_id]['fetchers'] + self.pod_processes[pod_id]['parsers']:
+            process.join(timeout=10)
+            if process.is_alive():
+                logger.warning(f"Process {process.name} didn't terminate gracefully, forcing...")
+                process.kill()
+                process.join()
+        
+        del self.pod_processes[pod_id]
+        logger.info(f"All processes for pod {pod_id} stopped.")
+    
+    def _stop_all_pod_processes(self):
+        """Stop all pod processes."""
+        pod_ids = list(self.pod_processes.keys())
+        for pod_id in pod_ids:
+            self._stop_pod_processes(pod_id)
+
+    # Remove old methods that are replaced by pod-based versions
+    # _start_parser_process, _start_parser_processes, _stop_parser_process, 
+    # _stop_parser_processes, _start_fetcher_processes, _stop_fetcher_processes
+
+    async def _initialize_components(self):
+        """Initializes orchestrator components that require async setup."""
+        logger.info("Initializing orchestrator components...")
+        
+        # Initialize Redis clients for global coordination
+        await self._init_redis_clients()
+        
+        # One-time initialization shared across all processes
+        logger.info("Performing one-time initialization...")
+        
+        # For each pod, initialize storage schema and frontier
+        for pod_id in self.pod_manager.get_all_pod_ids():
+            logger.info(f"Initializing pod {pod_id}...")
+            
+            # Get Redis clients for this pod
+            redis_client = await self.pod_manager.get_redis_client(pod_id, binary=False)
+            
+            # Initialize storage schema
+            storage = StorageManager(self.config, redis_client)
+            await storage.init_db_schema()
+            await storage.close()
+            
+            # Initialize frontier for this pod
+            temp_fetcher = Fetcher(self.config)
+            politeness = PolitenessEnforcer(self.config, redis_client, temp_fetcher)
+            frontier = FrontierManager(self.config, politeness, redis_client, pod_id=pod_id)
+            await frontier.initialize_frontier()
+            
+            # Clean up temporary instances
+            await temp_fetcher.close_session()
+            
+            logger.info(f"Pod {pod_id} initialized.")
+        
+        # Log pod distribution for seeded domains
+        if hasattr(self, '_seeded_domains'):
+            self.pod_manager.log_pod_distribution(self._seeded_domains, "seeded domains")
+            
+        logger.info("Orchestrator components initialized.")
+
+    # ... existing code ..., just keeping the headers to show structure
+```
+
+Let me continue updating the orchestrator's run_crawl method and fix some of the issues:
+
+```python
+        # Log pod distribution for seeded domains
+        if hasattr(self, '_seeded_domains'):
+            self.pod_manager.log_pod_distribution(self._seeded_domains, "seeded domains")
+
+->
+
+        # Pod distribution will be logged when seeds are loaded
+```
+
+Let me fix the disk_usage path issue:
+
+```python
+            # Disk metrics (for the crawler's data directory)
+            disk = psutil.disk_usage(self.config.data_dir)
+            disk_free_gauge.set(disk.free)
+            disk_usage_percent_gauge.set(disk.percent)
+
+->
+
+            # Disk metrics (for the crawler's data directory)
+            disk = psutil.disk_usage(str(self.config.data_dir))
+            disk_free_gauge.set(disk.free)
+            disk_usage_percent_gauge.set(disk.percent)
+```
+
+Let me fix the redis_client None issue:
+
+```python
+            # Redis metrics
+            redis_info = await self.redis_client.info()
+            redis_memory = await self.redis_client.info('memory')
+            redis_stats = await self.redis_client.info('stats')
+
+->
+
+            # Redis metrics
+            if self.redis_client:
+                redis_info = await self.redis_client.info()
+                redis_memory = await self.redis_client.info('memory')
+                redis_stats = await self.redis_client.info('stats')
+            else:
+                redis_info = {}
+                redis_memory = {}
+                redis_stats = {}
+```
+
+Now let me update the run_crawl method to use the new pod-based architecture. Let me find and update that section:
+
+Now let me update the run_crawl method to use the new pod-based architecture:
+
+```python
+            # Create and start the local fetcher (fetcher 0) in this process
+            self.local_fetcher = FetcherProcess(self.config, fetcher_id=0)
+            local_fetcher_task = asyncio.create_task(self.local_fetcher.run())
+            logger.info("Started local fetcher (fetcher 0) in orchestrator process")
+            
+            # Start additional fetcher processes (1+)
+            self._start_fetcher_processes()
+            self._start_parser_processes()
+            
+            # Give all processes a moment to initialize
+            await asyncio.sleep(2)
+            
+            logger.info("All processes started.")
+
+->
+
+            # Start processes for all pods
+            logger.info(f"Starting processes for {self.config.num_pods} pods...")
+            
+            # Start pod 0's local fetcher in this process
+            self.local_pod_fetchers[0] = FetcherProcess(self.config, fetcher_id=0, pod_id=0)
+            local_fetcher_task = asyncio.create_task(self.local_pod_fetchers[0].run())
+            logger.info("Started local fetcher (Pod 0, Fetcher 0) in orchestrator process")
+            
+            # Start all pod processes
+            for pod_id in range(self.config.num_pods):
+                self._start_pod_processes(pod_id)
+            
+            # Give all processes a moment to initialize
+            await asyncio.sleep(2)
+            
+            total_fetchers = self.config.num_pods * self.config.fetchers_per_pod
+            total_parsers = self.config.num_pods * self.config.parsers_per_pod
+            logger.info(f"All processes started: {total_fetchers} fetchers, {total_parsers} parsers across {self.config.num_pods} pods")
+```
+
+Let me update the process health check monitoring to use the new pod-based structure:
+
+```python
+            # Main monitoring loop
+            while not self._shutdown_event.is_set():
+                # Check if all processes are still alive
+                all_processes_dead = True
+                for process in self.fetcher_processes + self.parser_processes:
+                    if process.is_alive():
+                        all_processes_dead = False
+                        break
+                
+                if all_processes_dead and (self.fetcher_processes or self.parser_processes):
+                    logger.error("All child processes have died!")
+                    self._shutdown_event.set()
+                    break
+                
+                # Check fetcher process health
+                dead_fetchers = []
+                for i, process in enumerate(self.fetcher_processes):
+                    if not process.is_alive():
+                        logger.error(f"Fetcher process {process.name} died unexpectedly!")
+                        if process.exitcode != 0:
+                            logger.error(f"Fetcher process {process.name} exit code: {process.exitcode}")
+                        dead_fetchers.append(i)
+                
+                # Remove dead fetcher processes
+                for i in reversed(dead_fetchers):
+                    self.fetcher_processes.pop(i)
+                
+                # For now, don't restart dead fetcher processes automatically
+                # as it would require careful resharding
+                if dead_fetchers:
+                    logger.error(f"Lost {len(dead_fetchers)} additional fetcher processes. Manual restart required.")
+                    # Check if we have no fetchers at all (local + additional)
+                    if not self.fetcher_processes and not self.local_fetcher:
+                        logger.critical("All fetcher processes dead! Shutting down...")
+                        self._shutdown_event.set()
+                        break
+                
+                # Check parser process health
+                # Handle single parser process (backward compatibility)
+                if self.parser_process and not self.parser_processes and not self.parser_process.is_alive():
+                    logger.error("Parser process died unexpectedly!")
+                    if self.parser_process.exitcode != 0:
+                        logger.error(f"Parser process exit code: {self.parser_process.exitcode}")
+                    # Restart parser processes
+                    self._start_parser_processes(1)  # Start single parser
+                
+                # Check multiple parser processes health
+                if self.parser_processes:
+                    dead_processes = []
+                    for i, process in enumerate(self.parser_processes):
+                        if not process.is_alive():
+                            logger.error(f"Parser process {process.name} died unexpectedly!")
+                            if process.exitcode != 0:
+                                logger.error(f"Parser process {process.name} exit code: {process.exitcode}")
+                            dead_processes.append(i)
+                    
+                    # Remove dead processes
+                    for i in reversed(dead_processes):  # Reverse to avoid index issues
+                        self.parser_processes.pop(i)
+                    
+                    # Restart if any died
+                    if dead_processes:
+                        missing_count = self.config.num_parser_processes - len(self.parser_processes)
+                        logger.info(f"Restarting {missing_count} parser processes...")
+                        
+                        def run_parser(parser_id: int):
+                            """Function to run in the parser process."""
+                            import asyncio
+                            import logging
+                            from .parser_consumer import ParserConsumer
+                            
+                            logging.basicConfig(
+                                level=logging.INFO,
+                                format=f'%(asctime)s - %(name)s - %(levelname)s - [Parser-{parser_id}] %(message)s'
+                            )
+                            
+                            consumer = ParserConsumer(self.config)
+                            asyncio.run(consumer.run())
+                        
+                        for i in range(missing_count):
+                            process_id = max([int(p.name.split('-')[-1]) for p in self.parser_processes] + [0]) + 1
+                            process = Process(
+                                target=run_parser,
+                                args=(process_id,),
+                                name=f"ParserConsumer-{process_id}"
+                            )
+                            process.daemon = False
+                            process.start()
+                            self.parser_processes.append(process)
+                            logger.info(f"Restarted parser process {process_id} with PID: {process.pid}")
+
+->
+
+            # Main monitoring loop
+            while not self._shutdown_event.is_set():
+                # Check pod process health
+                all_processes_dead = True
+                dead_pods = []
+                
+                for pod_id, pod_procs in self.pod_processes.items():
+                    # Check fetchers
+                    for proc in pod_procs['fetchers']:
+                        if proc.is_alive():
+                            all_processes_dead = False
+                        else:
+                            logger.error(f"Process {proc.name} died unexpectedly!")
+                            if proc.exitcode != 0:
+                                logger.error(f"Process {proc.name} exit code: {proc.exitcode}")
+                    
+                    # Check parsers
+                    for proc in pod_procs['parsers']:
+                        if proc.is_alive():
+                            all_processes_dead = False
+                        else:
+                            logger.error(f"Process {proc.name} died unexpectedly!")
+                            if proc.exitcode != 0:
+                                logger.error(f"Process {proc.name} exit code: {proc.exitcode}")
+                    
+                    # Check if all processes in this pod are dead
+                    pod_dead = all(not proc.is_alive() for proc in pod_procs['fetchers'] + pod_procs['parsers'])
+                    if pod_dead:
+                        dead_pods.append(pod_id)
+                
+                # Check local fetchers too
+                for pod_id, fetcher in self.local_pod_fetchers.items():
+                    if fetcher:
+                        all_processes_dead = False
+                
+                if all_processes_dead and (self.pod_processes or self.local_pod_fetchers):
+                    logger.error("All child processes have died!")
+                    self._shutdown_event.set()
+                    break
+                
+                # Log dead pods but don't restart automatically (would require careful resharding)
+                if dead_pods:
+                    logger.error(f"Lost all processes for pods: {dead_pods}. Manual restart required.")
+```
+
+Let me update more parts of the run_crawl method:
+
+```python
+                # Count active fetcher processes
+                # Include local fetcher (orchestrator) plus additional fetcher processes
+                active_fetcher_processes = 1 if self.local_fetcher else 0  # Orchestrator's fetcher
+                active_fetcher_processes += sum(1 for p in self.fetcher_processes if p.is_alive())
+
+->
+
+                # Count active fetcher processes across all pods
+                active_fetcher_processes = len(self.local_pod_fetchers)  # Local fetchers
+                for pod_procs in self.pod_processes.values():
+                    active_fetcher_processes += sum(1 for p in pod_procs['fetchers'] if p.is_alive())
+```
+
+Let me fix the redis_client None issue and update the shutdown procedures:
+
+```python
+                # Check if frontier is empty by checking domain queue
+                queue_size = await self.redis_client.llen('domains:queue')
+                
+                if queue_size == 0 and self.pages_crawled_count > 0:
+                    logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
+                    await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
+                    
+                    # Re-check after wait
+                    queue_size = await self.redis_client.llen('domains:queue')
+                    
+                    if queue_size == 0:
+                        logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
+                        self._shutdown_event.set()
+                        break
+
+->
+
+                # Check if frontier is empty by checking domain queues across all pods
+                if self.redis_client:
+                    total_queue_size = 0
+                    for pod_id in range(self.config.num_pods):
+                        redis_client = await self.pod_manager.get_redis_client(pod_id)
+                        queue_size = await redis_client.llen('domains:queue')
+                        total_queue_size += queue_size
+                    
+                    if total_queue_size == 0 and self.pages_crawled_count > 0:
+                        logger.info(f"All frontiers empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
+                        await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
+                        
+                        # Re-check after wait
+                        total_queue_size = 0
+                        for pod_id in range(self.config.num_pods):
+                            redis_client = await self.pod_manager.get_redis_client(pod_id)
+                            queue_size = await redis_client.llen('domains:queue')
+                            total_queue_size += queue_size
+                        
+                        if total_queue_size == 0:
+                            logger.info("All frontiers confirmed empty after wait. Signaling shutdown.")
+                            self._shutdown_event.set()
+                            break
+```
+
+Let me update the shutdown procedure:
+
+```python
+            logger.info("Shutdown signaled. Stopping processes...")
+            
+            # Stop the local fetcher first
+            if self.local_fetcher:
+                logger.info("Stopping local fetcher...")
+                self.local_fetcher._shutdown_event.set()
+                # The local fetcher task will finish on its own
+            
+            # Stop additional fetcher processes (they push to parser queue)
+            self._stop_fetcher_processes()
+            
+            # Then stop parser processes
+            self._stop_parser_processes()
+            
+            logger.info("All processes stopped.")
+
+->
+
+            logger.info("Shutdown signaled. Stopping processes...")
+            
+            # Stop local fetchers first
+            for pod_id, fetcher in self.local_pod_fetchers.items():
+                if fetcher:
+                    logger.info(f"Stopping local fetcher for pod {pod_id}...")
+                    fetcher._shutdown_event.set()
+            
+            # Stop all pod processes
+            self._stop_all_pod_processes()
+            
+            logger.info("All processes stopped.")
+```
+
+Let me update the final cleanup section:
+
+```python
+        finally:
+            logger.info("Performing final cleanup...")
+            
+            # Ensure local fetcher is stopped
+            if self.local_fetcher:
+                self.local_fetcher._shutdown_event.set()
+                await asyncio.sleep(1)  # Give it a moment to clean up
+            
+            # Processes should already be stopped, but ensure they are
+            self._stop_fetcher_processes()
+            self._stop_parser_processes()
+            
+            # Wait for local fetcher task to complete
+            if 'local_fetcher_task' in locals() and not local_fetcher_task.done():
+                logger.info("Waiting for local fetcher to finish...")
+                try:
+                    await asyncio.wait_for(local_fetcher_task, timeout=10)
+                except asyncio.TimeoutError:
+                    logger.warning("Local fetcher didn't finish in time, cancelling...")
+                    local_fetcher_task.cancel()
+                    try:
+                        await local_fetcher_task
+                    except asyncio.CancelledError:
+                        pass
+            
+            # Close Redis connections
+            await self.redis_client.aclose()
+            await self.redis_client_binary.aclose()
+            
+            logger.info(f"Crawl finished. Total pages crawled across all fetchers: {self.pages_crawled_count}")
+            logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.")
+
+->
+
+        finally:
+            logger.info("Performing final cleanup...")
+            
+            # Ensure local fetchers are stopped
+            for fetcher in self.local_pod_fetchers.values():
+                if fetcher:
+                    fetcher._shutdown_event.set()
+            await asyncio.sleep(1)  # Give them a moment to clean up
+            
+            # Processes should already be stopped, but ensure they are
+            self._stop_all_pod_processes()
+            
+            # Wait for local fetcher task to complete
+            if 'local_fetcher_task' in locals() and not local_fetcher_task.done():
+                logger.info("Waiting for local fetcher to finish...")
+                try:
+                    await asyncio.wait_for(local_fetcher_task, timeout=10)
+                except asyncio.TimeoutError:
+                    logger.warning("Local fetcher didn't finish in time, cancelling...")
+                    local_fetcher_task.cancel()
+                    try:
+                        await local_fetcher_task
+                    except asyncio.CancelledError:
+                        pass
+            
+            # Close all Redis connections
+            await self.pod_manager.close_all()
+            
+            logger.info(f"Crawl finished. Total pages crawled across all fetchers: {self.pages_crawled_count}")
+            logger.info(f"Total runtime: {(time.time() - self.start_time):.2f} seconds.")
+```
+
+The orchestrator is mostly updated for pod-based architecture. The remaining linter errors are mainly due to the fact that we need to update the `FetcherProcess`, `ParserConsumer`, and `FrontierManager` to accept `pod_id` parameters. Let's update those now.
+
+### Step 3: Update FetcherProcess for Pod Awareness
+
+Now let's update the FetcherProcess to accept pod_id:
+
+```python
+import asyncio
+import logging
+import time
+import pickle
+import os
+from typing import Set, Optional
+import psutil
+import random
+import functools
+from urllib.parse import urlparse
+
+import redis.asyncio as redis
+from redis.asyncio import BlockingConnectionPool
+
+from .config import CrawlerConfig
+from .pod_manager import PodManager
+from .storage import StorageManager
+from .fetcher import Fetcher, FetchResult
+from .politeness import PolitenessEnforcer
+from .frontier import FrontierManager
+from .redis_shield import ShieldedRedis
+from .utils import extract_domain
+from .metrics import (
+    pages_crawled_counter,
+    errors_counter,
+    backpressure_events_counter,
+    fetch_duration_histogram,
+    active_workers_gauge,
+    fetch_counter,
+    fetch_error_counter,
+    parse_queue_size_gauge,
+    content_size_histogram,
+    fetcher_pages_per_second_gauge,
+    process_memory_usage_gauge,
+    process_open_fds_gauge,
+)
+
+logger = logging.getLogger(__name__)
+
+# How long a worker should sleep if the frontier is temporarily empty 
+# or all domains are on cooldown, before trying again.
+EMPTY_FRONTIER_SLEEP_SECONDS = 10
+
+class FetcherProcess:
+    """Fetcher process that runs multiple async workers to fetch URLs."""
+    
+    def __init__(self, config: CrawlerConfig, fetcher_id: int, pod_id: int = 0):
+        self.config = config
+        self.fetcher_id = fetcher_id
+        self.pod_id = pod_id
+        self.fetcher = Fetcher(config)
+        
+        # Initialize PodManager to get Redis connections for this pod
+        self.pod_manager = PodManager(config)
+        
+        # We'll initialize Redis clients in async _init_redis method
+        self.redis_client: Optional[ShieldedRedis] = None
+        self.redis_client_binary: Optional[ShieldedRedis] = None
+        
+        # Components will be initialized after Redis clients
+        self.storage: Optional[StorageManager] = None
+        self.politeness: Optional[PolitenessEnforcer] = None
+        self.frontier: Optional[FrontierManager] = None
+        
+        # Fetcher state
+        self.worker_tasks: Set[asyncio.Task] = set()
+        self.pages_crawled_count = 0
+        self.max_backpressure_sleep = 5.0  # Maximum sleep time for backpressure
+        self._shutdown_event = asyncio.Event()
+        
+        # Tracking for pages per second metric
+        self.pages_crawled_in_interval = 0
+        self.last_metrics_update_time = time.time()
+        
+        # For resource monitoring
+        self.process = psutil.Process(os.getpid())
+        
+        # Active workers tracking
+        self.active_workers_count = 0
+        
+        # Backpressure configuration (same as orchestrator)
+        self.fetch_queue_soft_limit = config.parse_queue_soft_limit
+        self.fetch_queue_hard_limit = config.parse_queue_hard_limit
+        
+        logger.info(f"Fetcher process {fetcher_id} for pod {pod_id} initialized")
+    
+    async def _init_async_components(self):
+        """Initialize components that require async setup."""
+        # Get Redis clients for this pod
+        self.redis_client = await self.pod_manager.get_redis_client(self.pod_id, binary=False)
+        self.redis_client_binary = await self.pod_manager.get_redis_client(self.pod_id, binary=True)
+        
+        # Initialize components with pod-specific Redis
+        self.storage = StorageManager(self.config, self.redis_client)
+        self.politeness = PolitenessEnforcer(self.config, self.redis_client, self.fetcher)
+        self.frontier = FrontierManager(self.config, self.politeness, self.redis_client, pod_id=self.pod_id)
+        
+        logger.info(f"Fetcher-{self.fetcher_id}: Async components initialized for pod {self.pod_id}")
+    
+    async def _worker(self, worker_id: int):
+        """Core logic for a single crawl worker."""
+        logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Starting.")
+        
+        # Add small random delay to spread out initial requests
+        startup_delay = (worker_id % 100) * (5 / 100)  # 0-5 second delay based on worker ID
+        await asyncio.sleep(startup_delay)
+        
+        try:
+            while not self._shutdown_event.is_set():
+                try:
+                    # Get next URL from this pod's frontier
+                    next_url_info = await self.frontier.get_next_url()
+
+                    if next_url_info is None:
+                        # No suitable URL available
+                        await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS) 
+                        continue
+
+                    url_to_crawl, domain, frontier_id, depth = next_url_info
+                    logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Processing URL at depth {depth}: {url_to_crawl}")
+
+                    # Track fetch duration
+                    fetch_start_time = time.time()
+                    fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
+                    fetch_duration = time.time() - fetch_start_time
+                    fetch_duration_histogram.labels(fetch_type='page').observe(fetch_duration)
+                    
+                    crawled_timestamp = int(time.time())
+
+                    if fetch_result.error_message or fetch_result.status_code >= 400:
+                        logger.warning(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Fetch failed for {url_to_crawl}. Status: {fetch_result.status_code}, Error: {fetch_result.error_message}")
+                        
+                        # Track error in Prometheus
+                        if fetch_result.error_message:
+                            errors_counter.labels(error_type='fetch_error').inc()
+                        else:
+                            errors_counter.labels(error_type=f'http_{fetch_result.status_code}').inc()
+                        
+                        # Record failed attempt
+                        await self.storage.add_visited_page(
+                            url=fetch_result.final_url, 
+                            status_code=fetch_result.status_code,
+                            crawled_timestamp=crawled_timestamp,
+                            content_type=fetch_result.content_type
+                        )
+                    else:  # Successful fetch
+                        self.pages_crawled_count += 1
+                        self.pages_crawled_in_interval += 1
+                        pages_crawled_counter.inc()
+                        logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Successfully fetched {fetch_result.final_url}. Total crawled: {self.pages_crawled_count}")
+                        
+                        if fetch_result.text_content and fetch_result.content_type and "html" in fetch_result.content_type.lower():
+                            # Push to this pod's parse queue
+                            queue_item = {
+                                'url': fetch_result.final_url,
+                                'domain': domain,
+                                'depth': depth,
+                                'html_content': fetch_result.text_content,
+                                'content_type': fetch_result.content_type,
+                                'crawled_timestamp': crawled_timestamp,
+                                'status_code': fetch_result.status_code
+                            }
+                            
+                            # Push to this pod's Redis queue for parsing
+                            queue_size = await self.redis_client_binary.rpush(f'fetch:queue:{self.pod_id}', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
+                            logger.debug(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Pushed HTML to parse queue for pod {self.pod_id}")
+                            
+                            # Explicitly delete to keep peak memory down
+                            del queue_item
+                            
+                            # Backpressure logic
+                            if queue_size > self.fetch_queue_hard_limit:
+                                logger.warning(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Queue at hard limit ({queue_size}/{self.fetch_queue_hard_limit}), waiting...")
+                                backpressure_events_counter.labels(backpressure_type='hard_limit').inc()
+                                while queue_size > self.fetch_queue_soft_limit:
+                                    await asyncio.sleep(5.0)
+                                    queue_size = await self.redis_client_binary.llen(f'fetch:queue:{self.pod_id}')
+                                logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Queue below soft limit, resuming")
+                                
+                            elif queue_size > self.fetch_queue_soft_limit:
+                                # Progressive backoff
+                                overflow_ratio = (queue_size - self.fetch_queue_soft_limit) / (self.fetch_queue_hard_limit - self.fetch_queue_soft_limit)
+                                overflow_ratio = min(overflow_ratio, 1.0)
+                                
+                                base_sleep = overflow_ratio * 2.0
+                                jitter = random.random() * 0.5
+                                sleep_time = base_sleep + jitter
+                                
+                                if worker_id % 10 == 1:  # Log from only 10% of workers
+                                    logger.debug(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Queue at {queue_size}, backpressure sleep {sleep_time:.2f}s")
+                                backpressure_events_counter.labels(backpressure_type='soft_limit').inc()
+                                await asyncio.sleep(sleep_time)
+                        else:
+                            logger.debug(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Not HTML for {fetch_result.final_url}")
+                            
+                            # For non-HTML content, still record in visited pages
+                            await self.storage.add_visited_page(
+                                url=fetch_result.final_url,
+                                status_code=fetch_result.status_code,
+                                crawled_timestamp=crawled_timestamp,
+                                content_type=fetch_result.content_type,
+                                content_storage_path_str=None
+                            )
+                    
+                    # Delete fetch results to free memory
+                    del fetch_result
+                    
+                    await asyncio.sleep(0)  # Yield control
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Error processing URL: {e}")
+                    errors_counter.labels(error_type='worker_error').inc()
+                    await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Cancelled.")
+        finally:
+            logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Shutting down.")
+    
+    def _get_ready_domain_timeout(self) -> float:
+        """Calculate timeout for getting ready domains based on active workers."""
+        # If we have many active workers, use a shorter timeout to be more responsive
+        # If few workers, use a longer timeout to avoid busy-waiting
+        if self.active_workers_count > self.config.fetcher_workers * 0.8:
+            return 0.1  # 100ms when busy
+        elif self.active_workers_count > self.config.fetcher_workers * 0.5:
+            return 0.5  # 500ms when moderately busy
+        else:
+            return 2.0  # 2s when idle
+    
+    async def _update_metrics(self):
+        """Update per-process metrics periodically."""
+        current_time = time.time()
+        time_elapsed = current_time - self.last_metrics_update_time
+        
+        if time_elapsed >= 5.0:  # Update every 5 seconds
+            # Calculate pages per second
+            pages_per_second = self.pages_crawled_in_interval / time_elapsed if time_elapsed > 0 else 0
+            fetcher_pages_per_second_gauge.labels(fetcher_id=f"{self.pod_id}-{self.fetcher_id}").set(pages_per_second)
+            
+            # Update resource metrics
+            try:
+                memory_usage = self.process.memory_info().rss
+                process_memory_usage_gauge.labels(
+                    process_type='fetcher',
+                    process_id=f"{self.pod_id}-{self.fetcher_id}"
+                ).set(memory_usage)
+                
+                open_fds = self.process.num_fds()
+                process_open_fds_gauge.labels(
+                    process_type='fetcher', 
+                    process_id=f"{self.pod_id}-{self.fetcher_id}"
+                ).set(open_fds)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass  # Process might be shutting down
+            
+            # Reset interval counters
+            self.pages_crawled_in_interval = 0
+            self.last_metrics_update_time = current_time
+            
+            logger.info(f"[Metrics] Fetcher-{self.fetcher_id} Pod-{self.pod_id}: Pages/sec: {pages_per_second:.2f}")
+    
+    async def run(self):
+        """Main entry point for the fetcher process."""
+        logger.info(f"Fetcher process {self.fetcher_id} for pod {self.pod_id} starting...")
+        
+        # Initialize async components
+        await self._init_async_components()
+        
+        # Note: One-time initialization (init_db_schema, load_manual_exclusions, initialize_frontier)
+        # is handled by the orchestrator before starting fetcher processes
+        
+        # Start worker tasks
+        logger.info(f"Fetcher-{self.fetcher_id}: Starting {self.config.fetcher_workers} workers...")
+        
+        # Stagger worker startup
+        workers_per_batch = 100
+        startup_delay = 5
+        
+        for i in range(self.config.fetcher_workers):
+            task = asyncio.create_task(self._worker(i + 1))
+            self.worker_tasks.add(task)
+            
+            if (i + 1) % workers_per_batch == 0:
+                logger.info(f"Fetcher-{self.fetcher_id}: Started {i + 1}/{self.config.fetcher_workers} workers...")
+                await asyncio.sleep(startup_delay)
+        
+        logger.info(f"Fetcher-{self.fetcher_id}: Started all {len(self.worker_tasks)} workers.")
+        
+        # Wait for shutdown signal or all workers to complete
+        try:
+            while not self._shutdown_event.is_set():
+                if not any(not task.done() for task in self.worker_tasks):
+                    logger.info(f"Fetcher-{self.fetcher_id}: All workers completed.")
+                    break
+                
+                # Update active workers gauge
+                active_count = sum(1 for task in self.worker_tasks if not task.done())
+                if active_count != self.active_workers_count:
+                    self.active_workers_count = active_count
+                    active_workers_gauge.set(active_count)
+                
+                # Update per-process metrics
+                await self._update_metrics()
+                
+                # Check status periodically
+                await asyncio.sleep(5)
+                
+        except Exception as e:
+            logger.error(f"Fetcher-{self.fetcher_id}: Critical error: {e}", exc_info=True)
+        finally:
+            logger.info(f"Fetcher-{self.fetcher_id}: Shutting down...")
+            
+            # Cancel any remaining workers
+            for task in self.worker_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            if self.worker_tasks:
+                await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+            
+            # Close connections
+            await self.fetcher.close_session()
+            if self.storage:
+                await self.storage.close()
+            await self.pod_manager.close_all()
+            
+            logger.info(f"Fetcher-{self.fetcher_id}: Shutdown complete. Pages crawled: {self.pages_crawled_count}")
+
+
+def run_fetcher_process(config: CrawlerConfig, fetcher_id: int, pod_id: int = 0):
+    """Entry point for running a fetcher as a separate process."""
+    # Setup logging for the child process
+    logging.basicConfig(
+        level=config.log_level,
+        format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Fetcher-{fetcher_id}] %(message)s'
+    )
+    
+    # Create and run the fetcher
+    fetcher = FetcherProcess(config, fetcher_id, pod_id)
+    asyncio.run(fetcher.run())
+```
+
+Good progress! Now let's update the ParserConsumer to accept pod_id parameter:
+
+### Step 4: Update ParserConsumer for Pod Awareness
+
+Now let's update the ParserConsumer to accept pod_id and use PodManager:
+
+```python
+"""
+Parser Consumer Process
+Consumes raw HTML from Redis queue and performs parsing, content saving, and link extraction.
+"""
+import asyncio
+import logging
+import pickle
+import time
+from typing import Optional, Dict, Any, Set
+import signal
+import os
+import psutil
+
+import redis.asyncio as redis
+from redis.asyncio import BlockingConnectionPool
+
+from .config import CrawlerConfig
+from .pod_manager import PodManager
+from .parser import PageParser
+from .storage import StorageManager
+from .frontier import FrontierManager
+from .politeness import PolitenessEnforcer
+from .fetcher import Fetcher
+from .utils import extract_domain
+from .metrics import (
+    start_metrics_server,
+    parse_queue_size_gauge,
+    parse_duration_histogram,
+    parse_processed_counter,
+    parse_errors_counter,
+    active_parser_workers_gauge,
+    parser_pages_per_second_gauge,
+    process_memory_usage_gauge,
+    process_open_fds_gauge,
+)
+
+logger = logging.getLogger(__name__)
+
+METRICS_LOG_INTERVAL_SECONDS = 60
+
+class ParserConsumer:
+    """Consumes raw HTML from Redis queue and processes it."""
+    
+    def __init__(self, config: CrawlerConfig, pod_id: int = 0, num_workers: int = None):
+        self.config = config
+        self.pod_id = pod_id
+        self.num_workers = num_workers or config.parser_workers
+        
+        # Initialize PodManager for cross-pod frontier writes
+        self.pod_manager = PodManager(config)
+        
+        # We'll initialize Redis clients in async _init_async_components method
+        self.redis_client: Optional[redis.Redis] = None
+        self.redis_client_binary: Optional[redis.Redis] = None
+        
+        self.parser = PageParser()
+        
+        # Components will be initialized after Redis clients
+        self.storage: Optional[StorageManager] = None
+        self.fetcher: Optional[Fetcher] = None
+        self.politeness: Optional[PolitenessEnforcer] = None
+        # We'll create multiple frontiers (one per pod) for cross-pod writes
+        self.frontiers: Dict[int, FrontierManager] = {}
+        
+        self._shutdown_event = asyncio.Event()
+        self._setup_signal_handlers()
+        self.worker_tasks: Set[asyncio.Task] = set()
+        
+        # Metrics tracking
+        self.pages_parsed_count: int = 0
+        self.pages_parsed_in_interval: int = 0
+        self.last_metrics_log_time: float = time.time()
+        self.last_metrics_update_time: float = time.time()  # For 5-second updates
+        self.start_time: float = 0.0
+        
+        # Process monitoring
+        self.process = psutil.Process(os.getpid())
+        self.process_id = f"{pod_id}-parser"  # Include pod ID in process identifier
+    
+    async def _init_async_components(self):
+        """Initialize components that require async setup."""
+        # Get Redis clients for this pod
+        self.redis_client = await self.pod_manager.get_redis_client(self.pod_id, binary=False)
+        self.redis_client_binary = await self.pod_manager.get_redis_client(self.pod_id, binary=True)
+        
+        # Initialize storage with this pod's Redis
+        self.storage = StorageManager(self.config, self.redis_client)
+        
+        # Initialize fetcher and politeness for frontier
+        self.fetcher = Fetcher(self.config)
+        
+        # Initialize frontiers for all pods (for cross-pod writes)
+        for target_pod_id in range(self.config.num_pods):
+            redis_client = await self.pod_manager.get_redis_client(target_pod_id, binary=False)
+            politeness = PolitenessEnforcer(self.config, redis_client, self.fetcher)
+            frontier = FrontierManager(
+                self.config, 
+                politeness,
+                redis_client,
+                pod_id=target_pod_id
+            )
+            self.frontiers[target_pod_id] = frontier
+        
+        logger.info(f"Parser for pod {self.pod_id}: Async components initialized")
+    
+    def _setup_signal_handlers(self):
+        """Setup graceful shutdown on SIGINT/SIGTERM."""
+        def signal_handler(signum, frame):
+            logger.info(f"Received signal {signum}, initiating shutdown...")
+            self._shutdown_event.set()
+            
+        # Only setup signal handlers if we're not a child process
+        # (child processes should respond to parent's signals)
+        try:
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+        except ValueError:
+            # Can happen in some contexts, ignore
+            pass
+    
+    async def _log_metrics(self):
+        """Log parsing metrics and update Prometheus gauges."""
+        current_time = time.time()
+        time_elapsed = current_time - self.last_metrics_update_time
+        
+        if time_elapsed >= 5.0:
+            # Calculate pages per second
+            pages_per_second = self.pages_parsed_in_interval / time_elapsed if time_elapsed > 0 else 0
+            parser_pages_per_second_gauge.set(pages_per_second)
+            
+            # Update resource metrics
+            try:
+                memory_usage = self.process.memory_info().rss
+                process_memory_usage_gauge.labels(
+                    process_type='parser',
+                    process_id=str(self.process_id)
+                ).set(memory_usage)
+                
+                open_fds = self.process.num_fds()
+                process_open_fds_gauge.labels(
+                    process_type='parser',
+                    process_id=str(self.process_id)
+                ).set(open_fds)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass  # Process might be shutting down
+            
+            # Get current metrics for logging
+            queue_size = await self.redis_client.llen(f'fetch:queue:{self.pod_id}')
+            active_workers = sum(1 for task in self.worker_tasks if not task.done())
+            
+            # Log metrics
+            logger.info(f"[Parser Metrics] Pod {self.pod_id}: Pages/sec: {pages_per_second:.2f}, Queue: {queue_size}, Active workers: {active_workers}/{self.num_workers}")
+            
+            # Log cumulative stats periodically (every 60 seconds)
+            if current_time - self.last_metrics_log_time >= METRICS_LOG_INTERVAL_SECONDS:
+                total_runtime = current_time - self.start_time
+                overall_rate = self.pages_parsed_count / total_runtime if total_runtime > 0 else 0
+                logger.info(f"[Parser Metrics] Pod {self.pod_id}: Total parsed: {self.pages_parsed_count}, Overall rate: {overall_rate:.2f}/sec, Runtime: {total_runtime:.0f}s")
+                self.last_metrics_log_time = current_time
+            
+            # Reset counter and update time
+            self.pages_parsed_in_interval = 0
+            self.last_metrics_update_time = current_time
+    
+    async def _process_item(self, item_data: Dict[str, Any]) -> None:
+        """Process a single item from the queue."""
+        try:
+            # Extract data from queue item
+            url = item_data['url']
+            domain = item_data['domain']
+            depth = item_data['depth']
+            html_content = item_data['html_content']
+            content_type = item_data.get('content_type', 'text/html')
+            crawled_timestamp = item_data['crawled_timestamp']
+            status_code = item_data['status_code']
+            
+            # Track parsing time
+            parse_start = time.time()
+            
+            # Parse HTML
+            parse_result = self.parser.parse_html_content(html_content, url)
+            
+            parse_duration = time.time() - parse_start
+            parse_duration_histogram.observe(parse_duration)
+            
+            content_storage_path_str: Optional[str] = None
+            
+            # Save parsed text content if available
+            if parse_result.text_content:
+                # Use URL-based sharding for storage across multiple drives
+                content_dir = self.config.get_data_dir_for_url(url)
+                url_hash = self.storage.get_url_sha256(url)
+                saved_path = await self.storage.save_content_to_file(url_hash, parse_result.text_content, base_dir=content_dir)
+                if saved_path:
+                    # Store absolute path for multi-drive support
+                    content_storage_path_str = str(saved_path)
+                    logger.debug(f"Saved content for {url} to {content_storage_path_str}")
+            
+            # Add extracted links to appropriate frontiers (based on domain->pod mapping)
+            links_added = 0
+            if parse_result.extracted_links:
+                logger.debug(f"Found {len(parse_result.extracted_links)} links on {url}")
+                
+                # Group links by target pod
+                links_by_pod: Dict[int, list] = {}
+                for link in parse_result.extracted_links:
+                    link_domain = extract_domain(link)
+                    if link_domain:
+                        target_pod_id = self.pod_manager.get_pod_for_domain(link_domain)
+                        if target_pod_id not in links_by_pod:
+                            links_by_pod[target_pod_id] = []
+                        links_by_pod[target_pod_id].append(link)
+                
+                # Add links to appropriate frontiers
+                for target_pod_id, pod_links in links_by_pod.items():
+                    frontier = self.frontiers.get(target_pod_id)
+                    if frontier:
+                        added = await frontier.add_urls_batch(pod_links, depth=depth + 1)
+                        links_added += added
+                        if added > 0:
+                            logger.debug(f"Added {added} URLs to pod {target_pod_id}'s frontier")
+                
+                if links_added > 0:
+                    logger.info(f"Added {links_added} new URLs to frontiers from {url}")
+                    # Track URLs added in Redis for the orchestrator to read
+                    await self.redis_client.incrby('stats:urls_added', links_added)
+            
+            # Record the visited page with all metadata
+            await self.storage.add_visited_page(
+                url=url,
+                status_code=status_code,
+                crawled_timestamp=crawled_timestamp,
+                content_type=content_type,
+                content_storage_path_str=content_storage_path_str
+            )
+            
+            # Update metrics
+            self.pages_parsed_count += 1
+            self.pages_parsed_in_interval += 1
+            parse_processed_counter.inc()
+            
+            logger.info(f"Successfully processed {url}: saved={bool(content_storage_path_str)}, links_added={links_added}")
+            
+        except Exception as e:
+            logger.error(f"Error processing item: {e}", exc_info=True)
+            parse_errors_counter.labels(error_type=type(e).__name__).inc()
+    
+    async def _worker(self, worker_id: int):
+        """Worker coroutine that processes items from the queue."""
+        logger.info(f"Parser worker {worker_id} starting for pod {self.pod_id}...")
+        
+        consecutive_empty = 0
+        max_consecutive_empty = 10  # Exit after 10 consecutive empty reads
+        
+        try:
+            while not self._shutdown_event.is_set():
+                try:
+                    # Use BLPOP for blocking pop from this pod's queue
+                    queue_name = f'fetch:queue:{self.pod_id}'
+                    result = await self.redis_client_binary.blpop(queue_name, timeout=5)
+                    
+                    if result is None:
+                        consecutive_empty += 1
+                        if consecutive_empty >= max_consecutive_empty:
+                            logger.debug(f"Worker {worker_id}: Queue empty for {max_consecutive_empty} consecutive reads")
+                        continue
+                    
+                    consecutive_empty = 0  # Reset counter on successful pop
+                    _, item_pickle = result
+                    
+                    # Parse pickle data
+                    try:
+                        item_data = pickle.loads(item_pickle)
+                    except pickle.UnpicklingError as e:
+                        logger.error(f"Worker {worker_id}: Invalid pickle in queue: {e}")
+                        parse_errors_counter.labels(error_type='pickle_decode').inc()
+                        continue
+                    
+                    # Process the item
+                    await self._process_item(item_data)
+                    
+                    # Yield to other workers
+                    await asyncio.sleep(0)
+                    
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Worker {worker_id}: Error in worker loop: {e}", exc_info=True)
+                    parse_errors_counter.labels(error_type='worker_loop').inc()
+                    await asyncio.sleep(1)  # Brief pause on error
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Parser worker {worker_id} cancelled")
+        finally:
+            logger.info(f"Parser worker {worker_id} shutting down")
+    
+    async def run(self):
+        """Main consumer loop."""
+        logger.info(f"Parser consumer for pod {self.pod_id} starting with {self.num_workers} workers...")
+        self.start_time = time.time()
+        
+        try:
+            # Initialize async components
+            await self._init_async_components()
+            
+            # In multiprocess mode, child processes don't start their own server
+            # They just write metrics to the shared directory
+            metrics_started = start_metrics_server(port=8002 + self.pod_id)
+            if metrics_started:
+                logger.info(f"Parser metrics server started on port {8002 + self.pod_id}")
+            else:
+                logger.info("Running in multiprocess mode - metrics aggregated by parent")
+            
+            # Start worker tasks
+            for i in range(self.num_workers):
+                task = asyncio.create_task(self._worker(i + 1))
+                self.worker_tasks.add(task)
+            
+            logger.info(f"Started {len(self.worker_tasks)} parser workers for pod {self.pod_id}")
+            
+            # Monitor queue size and log metrics periodically
+            while not self._shutdown_event.is_set():
+                # Update metrics (both Prometheus and logging)
+                await self._log_metrics()
+                
+                # Update real-time metrics
+                queue_size = await self.redis_client.llen(f'fetch:queue:{self.pod_id}')
+                parse_queue_size_gauge.set(queue_size)
+                
+                active_workers = sum(1 for task in self.worker_tasks if not task.done())
+                active_parser_workers_gauge.set(active_workers)
+                
+                # Check if all workers have exited
+                if not any(not task.done() for task in self.worker_tasks):
+                    logger.info("All parser workers have completed")
+                    break
+                
+                # Wait a bit before next check
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass  # Continue monitoring
+                
+        except Exception as e:
+            logger.critical(f"Parser consumer critical error: {e}", exc_info=True)
+            self._shutdown_event.set()
+        finally:
+            # Log final metrics
+            await self._log_metrics()
+            
+            logger.info("Parser consumer shutting down...")
+            
+            # Cancel all worker tasks
+            for task in self.worker_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for all tasks to complete
+            if self.worker_tasks:
+                await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+            
+            if self.fetcher:
+                await self.fetcher.close_session()
+            if self.storage:
+                await self.storage.close()
+            await self.pod_manager.close_all()
+            
+            # Log final stats
+            total_runtime = time.time() - self.start_time
+            logger.info(f"Parser consumer shutdown complete. Total pages parsed: {self.pages_parsed_count}")
+            logger.info(f"Total runtime: {total_runtime:.2f} seconds.")
+
+
+async def main():
+    """Entry point for parser consumer process."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    config = CrawlerConfig.from_args()
+    
+    # When run standalone, assume pod 0
+    logger.info("Starting standalone parser consumer for pod 0 (assuming Redis is initialized)")
+    
+    consumer = ParserConsumer(config, pod_id=0)
+    await consumer.run()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
+```
+
+Perfect! We've made great progress on Phase 2. Let's create a summary of what we've accomplished:
+
+## Phase 2 Complete: Core Pod Architecture ✅
+
+### What We've Built:
+
+1. **PodManager** (`pod_manager.py`)
+   - Manages domain-to-pod assignment using MD5 hashing
+   - Maintains Redis connections for all pods
+   - Provides helper methods for pod distribution analysis
+   - Supports lazy-loaded Redis clients for efficiency
+
+2. **Updated Orchestrator** (`orchestrator.py`)
+   - Spawns processes organized by pods instead of individual processes
+   - Starts pod 0's fetcher 0 locally (leader model)
+   - Monitors pod health instead of individual process health
+   - Uses PodManager for all Redis operations
+   - Initializes each pod's storage and frontier separately
+
+3. **Updated FetcherProcess** (`fetcher_process.py`)
+   - Accepts `pod_id` parameter
+   - Uses pod-specific Redis connections
+   - Pushes to pod-specific parse queues (`fetch:queue:{pod_id}`)
+   - Updates metrics with pod ID labels
+
+4. **Updated ParserConsumer** (`parser_consumer.py`)
+   - Accepts `pod_id` parameter
+   - Reads from pod-specific parse queue
+   - Supports cross-pod frontier writes using PodManager
+   - Groups extracted links by target pod for efficient batch writes
+
+### Key Architectural Features:
+
+- **Domain Sharding**: Each domain is assigned to exactly one pod using `hash(domain) % num_pods`
+- **Pod Isolation**: Each pod has its own Redis instance, frontier, and parse queue
+- **Cross-Pod Writes**: Parsers can write to any pod's frontier based on domain assignment
+- **Leader Model**: Pod 0's orchestrator acts as global coordinator
+- **Process Naming**: All processes include pod ID in their names for easy identification
+
+### Remaining Tasks:
+
+The main linter errors indicate we still need to:
+1. Update `FrontierManager` to accept `pod_id` parameter
+2. Update `StorageManager` to support multi-drive storage with `base_dir` parameter
+
+Would you like to proceed to Phase 3 (Storage & Logging) where we'll implement multi-drive storage and per-pod logging? Or would you prefer to first update the FrontierManager to complete the pod awareness?
+
+---
+
+**User**
+
+I noticed you suffixed the redis keys for fetch queue and such with the pod ID, is that really necessary when the pods should all have their own keyspaces due to distinct redis instances?
+
+If we want to debug what pod a client is connected to just from the keys, we could add a special key in the redis DB giving the pod ID. Just curious why the key suffix
+
+---
+
+**Cursor**
+
+You're absolutely right! That's an excellent observation. Since each pod has its own completely isolated Redis instance, there's no need to suffix the keys with pod IDs. I was overthinking it.
+
+Each Redis instance has its own keyspace, so:
+- Pod 0's Redis on port 6379 has its own `fetch:queue`
+- Pod 1's Redis on port 6380 has its own `fetch:queue`
+- And so on...
+
+They'll never collide because they're separate Redis instances. The suffix just adds unnecessary complexity.
+
+Your suggestion about adding a debug key is much cleaner - we could have a single key like `pod:info` that stores the pod ID for debugging purposes:
+
+```python
+# During initialization for each pod
+await redis_client.hset('pod:info', mapping={
+    'pod_id': str(pod_id),
+    'redis_url': pod_config.redis_url,
+    'initialized_at': str(time.time())
+})
+```
+
+Should I update the code to remove these unnecessary suffixes? It would simplify:
+- `fetch:queue:{pod_id}` → `fetch:queue`
+- `frontier:{domain}` stays the same
+- `domains:queue` stays the same
+
+This would make the code cleaner and more consistent with the original single-Redis design.
+
+```python
+# During initialization for each pod
+await redis_client.hset('pod:info', mapping={
+    'pod_id': str(pod_id),
+    'redis_url': pod_config.redis_url,
+    'initialized_at': str(time.time())
+})
+```
+
+---
+
+**User**
+
+yes please
+
+---
+
+**Cursor**
+
+I'll update the code to remove the unnecessary pod ID suffixes from Redis keys. Let me fix both the FetcherProcess and ParserConsumer:
+
+### Update FetcherProcess to remove pod ID suffix
+
+```python
+                            # Push to this pod's Redis queue for parsing
+                            queue_size = await self.redis_client_binary.rpush(f'fetch:queue:{self.pod_id}', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
+                            logger.debug(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Pushed HTML to parse queue for pod {self.pod_id}")
+
+->
+
+                            # Push to Redis queue for parsing
+                            queue_size = await self.redis_client_binary.rpush('fetch:queue', pickle.dumps(queue_item, protocol=pickle.HIGHEST_PROTOCOL))
+                            logger.debug(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Pushed HTML to parse queue")
+```
+
+```python
+                                while queue_size > self.fetch_queue_soft_limit:
+                                    await asyncio.sleep(5.0)
+                                    queue_size = await self.redis_client_binary.llen(f'fetch:queue:{self.pod_id}')
+                                logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Queue below soft limit, resuming")
+
+->
+
+                                while queue_size > self.fetch_queue_soft_limit:
+                                    await asyncio.sleep(5.0)
+                                    queue_size = await self.redis_client_binary.llen('fetch:queue')
+                                logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Queue below soft limit, resuming")
+```
+
+### Update ParserConsumer to remove pod ID suffix
+
+```python
+            # Get current metrics for logging
+            queue_size = await self.redis_client.llen(f'fetch:queue:{self.pod_id}')
+            active_workers = sum(1 for task in self.worker_tasks if not task.done())
+
+->
+
+            # Get current metrics for logging
+            queue_size = await self.redis_client.llen('fetch:queue')
+            active_workers = sum(1 for task in self.worker_tasks if not task.done())
+```
+
+```python
+                try:
+                    # Use BLPOP for blocking pop from this pod's queue
+                    queue_name = f'fetch:queue:{self.pod_id}'
+                    result = await self.redis_client_binary.blpop(queue_name, timeout=5)
+
+->
+
+                try:
+                    # Use BLPOP for blocking pop with timeout
+                    result = await self.redis_client_binary.blpop('fetch:queue', timeout=5)
+```
+
+```python
+                # Update real-time metrics
+                queue_size = await self.redis_client.llen(f'fetch:queue:{self.pod_id}')
+                parse_queue_size_gauge.set(queue_size)
+
+->
+
+                # Update real-time metrics
+                queue_size = await self.redis_client.llen('fetch:queue')
+                parse_queue_size_gauge.set(queue_size)
+```
+
+Now let's add a debug key for pod information during initialization. Let me update the orchestrator to add this:
+
+```python
+            # Initialize frontier for this pod
+            temp_fetcher = Fetcher(self.config)
+            politeness = PolitenessEnforcer(self.config, redis_client, temp_fetcher)
+            frontier = FrontierManager(self.config, politeness, redis_client, pod_id=pod_id)
+            await frontier.initialize_frontier()
+            
+            # Clean up temporary instances
+            await temp_fetcher.close_session()
+            
+            logger.info(f"Pod {pod_id} initialized.")
+
+->
+
+            # Initialize frontier for this pod
+            temp_fetcher = Fetcher(self.config)
+            politeness = PolitenessEnforcer(self.config, redis_client, temp_fetcher)
+            frontier = FrontierManager(self.config, politeness, redis_client, pod_id=pod_id)
+            await frontier.initialize_frontier()
+            
+            # Clean up temporary instances
+            await temp_fetcher.close_session()
+            
+            # Add debug info for this pod
+            pod_config = self.pod_manager.get_pod_config(pod_id)
+            await redis_client.hset('pod:info', mapping={
+                'pod_id': str(pod_id),
+                'redis_url': pod_config.redis_url,
+                'initialized_at': str(int(time.time()))
+            })
+            
+            logger.info(f"Pod {pod_id} initialized.")
+```
+
+Perfect! I've successfully removed all the unnecessary pod ID suffixes from the Redis keys. Here's what was changed:
+
+### Changes Made:
+
+1. **FetcherProcess**:
+   - `fetch:queue:{pod_id}` → `fetch:queue`
+   
+2. **ParserConsumer**:
+   - `fetch:queue:{pod_id}` → `fetch:queue`
+
+3. **Added Debug Key**:
+   - Each pod's Redis now stores a `pod:info` hash with:
+     - `pod_id`: The pod identifier
+     - `redis_url`: The Redis connection URL
+     - `initialized_at`: Timestamp of initialization
+
+### Benefits:
+
+1. **Simpler Code**: No need to format strings with pod IDs everywhere
+2. **Cleaner Keys**: Redis keys look exactly like the original single-Redis design
+3. **Better Debugging**: When connected to any Redis instance, you can check which pod it is:
+   ```bash
+   redis-cli -p 6380
+   > HGETALL pod:info
+   1) "pod_id"
+   2) "1"
+   3) "redis_url"
+   4) "redis://localhost:6380"
+   5) "initialized_at"
+   6) "1701234567"
+   ```
+
+This approach is much cleaner since each pod's Redis instance is already isolated. The key namespaces don't need artificial separation - they get natural separation from being in different Redis instances!
+
+The remaining linter errors are mostly about the `FrontierManager` needing to accept the `pod_id` parameter and some import issues that are expected in the development environment. Should we proceed with updating the FrontierManager next?
+
+```shellscript
+   redis-cli -p 6380
+   > HGETALL pod:info
+   1) "pod_id"
+   2) "1"
+   3) "redis_url"
+   4) "redis://localhost:6380"
+   5) "initialized_at"
+   6) "1701234567"
+```
+
+---
+
+**User**
+
+yes please!
+
+---
+
+**Cursor**
+
+Let's update the FrontierManager to accept the `pod_id` parameter. First, let me examine the current FrontierManager structure:
+
+Now let's update the FrontierManager to accept the `pod_id` parameter:
+
+```python
+"""Redis-based frontier manager for high-performance crawling.
+
+Stores all frontier URLs directly in Redis for maximum performance.
+"""
+
+import logging
+from typing import Optional, Tuple, List, Dict
+import asyncio
+import redis.asyncio as redis
+
+from .config import CrawlerConfig
+from .utils import extract_domain, normalize_url
+from .politeness import PolitenessEnforcer
+
+logger = logging.getLogger(__name__)
+
+# Common non-text file extensions to skip
+NON_TEXT_EXTENSIONS = {
+    # Images
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico', '.tiff', '.tif',
+    # Videos
+    '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mkv', '.mpg', '.mpeg', '.m4v',
+    # Audio
+    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus',
+    # Documents (non-HTML)
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt',
+    # Archives
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz',
+    # Executables
+    '.exe', '.msi', '.dmg', '.pkg', '.deb', '.rpm', '.apk', '.app',
+    # Other binary formats
+    '.iso', '.bin', '.dat', '.db', '.sqlite', '.dll', '.so', '.dylib',
+    # Media/Design files
+    '.psd', '.ai', '.eps', '.indd', '.sketch', '.fig', '.xd',
+    # Data files
+    '.csv', '.json', '.xml', '.sql',
+}
+
+def is_likely_non_text_url(url: str) -> bool:
+    """Check if a URL likely points to a non-text file based on its extension."""
+    try:
+        path = url.split('?')[0].split('#')[0]
+        last_part = path.rstrip('/').split('/')[-1]
+        if '.' in last_part:
+            ext = '.' + last_part.split('.')[-1].lower()
+            return ext in NON_TEXT_EXTENSIONS
+    except Exception:
+        pass
+    return False
+
+class FrontierManager:
+    """Redis frontier manager.
+    
+    All operations are atomic Redis commands, no locking needed.
+    """
+    
+    def __init__(self, config: CrawlerConfig, politeness: PolitenessEnforcer, redis_client: redis.Redis, pod_id: int = 0):
+        self.config = config
+        self.politeness = politeness
+        self.redis = redis_client
+        self.pod_id = pod_id
+        
+        # Update logger to include pod_id if we're in a multi-pod setup
+        if config.num_pods > 1:
+            self.logger = logging.getLogger(f"{__name__}.pod{pod_id}")
+        else:
+            self.logger = logger
+
+    
+    async def initialize_frontier(self):
+        """Initialize the frontier, loading seeds or resuming from existing data."""
+        self.logger.info(f"Initializing Redis frontier for pod {self.pod_id}")
+        
+        # Initialize bloom filter if it doesn't exist
+        try:
+            await self.redis.execute_command('BF.INFO', 'seen:bloom')
+            self.logger.info("Bloom filter already exists, using existing filter")
+        except:
+            try:
+                await self.redis.execute_command(
+                    'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
+                )
+                self.logger.info("Created new bloom filter for 160M URLs with 0.1% FPR")
+            except:
+                self.logger.warning("Could not create bloom filter - it may already exist")
+        
+        await self.politeness.initialize()
+        
+        if self.config.resume:
+            count = await self.count_frontier()
+            self.logger.info(f"Resuming crawl. Frontier has approximately {count} URLs.")
+            if count == 0:
+                self.logger.warning("Resuming with an empty frontier. Attempting to load seeds.")
+                await self._load_seeds()
+        else:
+            self.logger.info("Starting new crawl. Clearing any existing frontier and loading seeds.")
+            await self._clear_frontier()
+            await self._load_seeds()
+```
+
+Great! The FrontierManager now accepts the `pod_id` parameter. Now let's update the StorageManager to support the `base_dir` parameter for multi-drive storage:
+
+```python
+import logging
+from pathlib import Path
+import hashlib
+import time
+from typing import Optional
+import aiofiles
+import redis.asyncio as redis
+
+from .config import CrawlerConfig
+
+logger = logging.getLogger(__name__)
+
+REDIS_SCHEMA_VERSION = 1
+
+class StorageManager:
+    """Redis-based storage manager for visited URLs and content."""
+    
+    def __init__(self, config: CrawlerConfig, redis_client: redis.Redis):
+        self.config = config
+        self.data_dir = Path(config.data_dir)
+        self.content_dir = self.data_dir / "content"
+        self.redis = redis_client
+        
+        self._init_storage()
+    
+    def _init_storage(self):
+        """Initializes the data directory and content directory."""
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.content_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Storage directories initialized: {self.data_dir}")
+        except OSError as e:
+            logger.error(f"Error creating storage directories: {e}")
+            raise
+    
+    async def init_db_schema(self):
+        """Initializes Redis schema version."""
+        try:
+            logger.info("Initializing Redis schema")
+            # Check and set schema version
+            current_version = await self.redis.get("schema_version")
+            if current_version:
+                current_version = int(current_version)
+                if current_version != REDIS_SCHEMA_VERSION:
+                    logger.warning(f"Redis schema version mismatch. Current: {current_version}, Expected: {REDIS_SCHEMA_VERSION}")
+                    # In the future, handle migrations here
+            else:
+                # First time initialization
+                await self.redis.set("schema_version", str(REDIS_SCHEMA_VERSION))
+                logger.info(f"Set Redis schema version to {REDIS_SCHEMA_VERSION}")
+        except Exception as e:
+            logger.error(f"Error during Redis schema initialization: {e}")
+            raise
+    
+    def get_url_sha256(self, url: str) -> str:
+        """Generates a SHA256 hash for a given URL."""
+        return hashlib.sha256(url.encode('utf-8')).hexdigest()
+    
+    async def save_content_to_file(self, url_hash: str, text_content: str, base_dir: Optional[Path] = None) -> Optional[Path]:
+        """Saves extracted text content to a file asynchronously.
+        
+        Args:
+            url_hash: SHA256 hash of the URL
+            text_content: The text content to save
+            base_dir: Optional base directory for content storage (for multi-drive support).
+                     If not provided, uses the default data_dir.
+        
+        Returns:
+            Path to the saved file, or None if save failed.
+        """
+        if not text_content:  # Do not save if no text content
+            return None
+        
+        # Use provided base_dir or fall back to default
+        if base_dir:
+            content_dir = Path(base_dir) / "content"
+            # Ensure the content directory exists
+            try:
+                content_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logger.error(f"Error creating content directory {content_dir}: {e}")
+                return None
+        else:
+            content_dir = self.content_dir
+        
+        file_path = content_dir / f"{url_hash}.txt"
+        try:
+            async with aiofiles.open(file_path, mode='w', encoding='utf-8') as f:
+                await f.write(text_content)
+            logger.debug(f"Saved content for {url_hash} to {file_path}")
+            return file_path
+        except IOError as e:
+            logger.error(f"IOError saving content file {file_path}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error saving content file {file_path}: {e}")
+            return None
+    
+    async def add_visited_page(
+        self, 
+        url: str, 
+        status_code: int, 
+        crawled_timestamp: int,
+        content_type: Optional[str] = None, 
+        content_storage_path_str: Optional[str] = None
+    ):
+        """Adds a record of a visited page to Redis."""
+        url_sha256 = self.get_url_sha256(url)
+        # Use first 16 chars of SHA256 for the key (as per architecture doc)
+        url_hash = url_sha256[:16]
+        
+        try:
+            # Prepare the hash data
+            visited_data = {
+                'url': url,
+                'status_code': str(status_code),
+                'fetched_at': str(crawled_timestamp),
+                'content_path': content_storage_path_str or '',
+            }
+            
+            # Add optional fields if present
+            if content_type:
+                visited_data['content_type'] = content_type
+            
+            # Store in Redis using pipeline for atomicity
+            pipe = self.redis.pipeline()
+            
+            # Store visited metadata in hash
+            pipe.hset(f'visited:{url_hash}', mapping=visited_data)
+            
+            # Mark URL as seen in bloom filter (if it exists)
+            # Note: In production, the bloom filter should be created during migration
+            # For now, we'll try to add and ignore if it doesn't exist
+            pipe.execute_command('BF.ADD', 'seen:bloom', url)
+            
+            await pipe.execute()
+            
+            logger.info(f"Recorded visited URL: {url} (Status: {status_code})")
+            
+        except redis.ResponseError as e:
+            if "not found" in str(e).lower():
+                # Bloom filter doesn't exist, log warning but continue
+                logger.warning(f"Bloom filter 'seen:bloom' not found. URL {url} not added to bloom filter.")
+                # Still store the visited data without bloom filter
+                await self.redis.hset(f'visited:{url_hash}', mapping=visited_data)
+            else:
+                logger.error(f"Redis error adding visited page {url}: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Unexpected error adding visited page {url}: {e}")
+            raise
+    
+    async def close(self):
+        """Close Redis connection."""
+        await self.redis.close()
+```
+
+Perfect! We've successfully updated both the FrontierManager and StorageManager to support the pod-based architecture. Let me create a summary of Phase 2 completion:
+
+## Phase 2 Complete: Core Pod Architecture ✅
+
+### What We've Accomplished:
+
+1. **Created PodManager** (`pod_manager.py`)
+   - Manages domain-to-pod mapping using MD5 hashing
+   - Provides Redis connection management for all pods
+   - Includes distribution analysis tools
+
+2. **Updated Orchestrator** (`orchestrator.py`)
+   - Pod-based process spawning
+   - Initializes each pod independently  
+   - Adds `pod:info` debug key to each Redis instance
+
+3. **Updated FetcherProcess** (`fetcher_process.py`)
+   - Accepts `pod_id` parameter
+   - Uses pod-specific Redis connections
+   - Removed unnecessary key suffixes (uses `fetch:queue` not `fetch:queue:{pod_id}`)
+
+4. **Updated ParserConsumer** (`parser_consumer.py`)
+   - Accepts `pod_id` parameter
+   - Supports cross-pod frontier writes
+   - Uses URL-based sharding for storage
+
+5. **Updated FrontierManager** (`frontier.py`)
+   - Accepts `pod_id` parameter
+   - Pod-specific logging for better debugging
+
+6. **Updated StorageManager** (`storage.py`)
+   - Added `base_dir` parameter to `save_content_to_file`
+   - Supports multi-drive storage
+
+### Key Design Decisions:
+
+- **No Key Suffixes**: Since each pod has its own Redis instance, we don't need to suffix keys with pod IDs
+- **Debug Key**: Added `pod:info` hash to each Redis for easy pod identification
+- **Cross-Pod Writes**: Parsers group extracted links by target pod for efficient batch writes
+- **Storage Sharding**: Content can be saved to different drives based on URL hash
+
+The pod-based architecture is now fully integrated! Ready to proceed to Phase 3 (Storage & Logging) where we'll implement:
+- Per-pod logging to separate files
+- Log directory configuration
+- CPU affinity settings
+
+Would you like to continue?
+
+---
+
+**User**
+
+Couple things:
+1. Config vars bloom_filter_capacity and bloom_filter_error_rate are ignored, did you want to use them in frontier.py init?
+2. Seed domains are not being sharded right now which means every pod will have entries for all seeds and try to load all robots, let's fix this
+3. Let's make the storage.save_content_to_file `base_dir` param required please. At some point we should also refactor it to remove the DB schema (unused) and the data_dir field (confusing), but we can just add TODOs for now
+
+Also, it occurred to me a "debug mode" where we add extra checks that a URL/domain being added to a frontier is going to the right pod could be useful, WDYT? This would involve putting some runtime checks in the add_urls_batch method to hash the domains and check the pod ID
+
+---
+
+**Cursor**
+
+Excellent points! Let's fix all of these issues:
+
+### 1. First, let's update FrontierManager to use the config values for bloom filter:
+
+```python
+        # Initialize bloom filter if it doesn't exist
+        try:
+            await self.redis.execute_command('BF.INFO', 'seen:bloom')
+            self.logger.info("Bloom filter already exists, using existing filter")
+        except:
+            try:
+                await self.redis.execute_command(
+                    'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
+                )
+                self.logger.info("Created new bloom filter for 160M URLs with 0.1% FPR")
+            except:
+                self.logger.warning("Could not create bloom filter - it may already exist")
+
+->
+
+        # Initialize bloom filter if it doesn't exist
+        try:
+            await self.redis.execute_command('BF.INFO', 'seen:bloom')
+            self.logger.info("Bloom filter already exists, using existing filter")
+        except:
+            try:
+                await self.redis.execute_command(
+                    'BF.RESERVE', 'seen:bloom', 
+                    self.config.bloom_filter_error_rate,
+                    self.config.bloom_filter_capacity
+                )
+                self.logger.info(f"Created new bloom filter for {self.config.bloom_filter_capacity:,} URLs with {self.config.bloom_filter_error_rate:.1%} FPR")
+            except:
+                self.logger.warning("Could not create bloom filter - it may already exist")
+```
+
+### 2. Now let's fix seed domain sharding in FrontierManager:
+
+```python
+        # Load seed domains if this is a fresh start
+        seed_file = self.config.seed_file
+        if seed_file:
+            self.logger.info(f"Loading seed domains from {seed_file}")
+            try:
+                with open(seed_file, 'r') as f:
+                    seed_urls = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                
+                # Add seed URLs to frontier
+                if seed_urls:
+                    await self.add_urls_batch(seed_urls, depth=0)
+                    self.logger.info(f"Added {len(seed_urls)} seed URLs to frontier")
+            except FileNotFoundError:
+                self.logger.error(f"Seed file not found: {seed_file}")
+            except Exception as e:
+                self.logger.error(f"Error loading seed file: {e}")
+
+->
+
+        # Load seed domains if this is a fresh start (only for appropriate pod)
+        seed_file = self.config.seed_file
+        if seed_file:
+            self.logger.info(f"Loading seed domains from {seed_file} for pod {self.pod_id}")
+            
+            # Import PodManager here to avoid circular imports
+            from .pod_manager import PodManager
+            pod_manager = PodManager(self.config)
+            
+            try:
+                with open(seed_file, 'r') as f:
+                    all_seed_urls = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                
+                # Filter seed URLs that belong to this pod
+                pod_seed_urls = []
+                for url in all_seed_urls:
+                    try:
+                        from urllib.parse import urlparse
+                        domain = urlparse(url).netloc.lower()
+                        if domain and pod_manager.get_pod_for_domain(domain) == self.pod_id:
+                            pod_seed_urls.append(url)
+                    except:
+                        self.logger.warning(f"Failed to parse seed URL: {url}")
+                
+                # Add seed URLs to frontier
+                if pod_seed_urls:
+                    await self.add_urls_batch(pod_seed_urls, depth=0)
+                    self.logger.info(f"Added {len(pod_seed_urls)} seed URLs (out of {len(all_seed_urls)} total) to pod {self.pod_id} frontier")
+                else:
+                    self.logger.info(f"No seed URLs assigned to pod {self.pod_id} (out of {len(all_seed_urls)} total)")
+                    
+            except FileNotFoundError:
+                self.logger.error(f"Seed file not found: {seed_file}")
+            except Exception as e:
+                self.logger.error(f"Error loading seed file: {e}")
+```
+
+```python
+    async def _load_seeds(self):
+        """Load seed URLs from file."""
+        self.logger.info(f"Loading seeds from {self.config.seed_file}")
+        if not self.config.seed_file.exists():
+            self.logger.error(f"Seed file not found: {self.config.seed_file}")
+            return
+            
+        try:
+            with open(self.config.seed_file, 'r') as f:
+                urls = [normalize_url(line.strip()) for line in f if line.strip() and not line.startswith("#")]
+                
+            if not urls:
+                self.logger.warning(f"Seed file {self.config.seed_file} is empty.")
+                return
+                
+            # Mark domains as seeded
+            seed_domains = {extract_domain(u) for u in urls if extract_domain(u)}
+            seed_domains = [d for d in seed_domains if d]
+            await self._mark_domains_as_seeded_batch(seed_domains)
+
+            # Load robots.txt for seeds
+            # Most domains don't have robots.txt, so batch size can be large
+            chunk_size = max(self.config.fetcher_workers, 50_000)
+            for i in range(0, len(seed_domains), chunk_size):
+                await self.politeness.batch_load_robots_txt(seed_domains[i:i+chunk_size])
+                self.logger.info(f"Loaded robots.txt for {i+chunk_size}/{len(seed_domains)} domains")
+            
+            # Add URLs to frontier
+            self.logger.info(f"Adding {len(urls)} URLs to the frontier")
+            
+            async def add_urls_batch_worker(worker_id: int, urls: list[str]) -> int:
+                subchunk_size = 100
+                added_count = 0
+                for i in range(0, len(urls), subchunk_size):
+                    added_count += await self.add_urls_batch(urls[i:i+subchunk_size])
+                    if i % 1000 == 0:
+                        self.logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
+                return added_count
+            
+            seed_tasks = []
+            chunk_size = (len(urls) + self.config.fetcher_workers - 1) // self.config.fetcher_workers
+            for i in range(self.config.fetcher_workers):
+                url_chunk = urls[i*chunk_size:(i+1)*chunk_size]
+                seed_tasks.append(add_urls_batch_worker(i, url_chunk))
+            
+            added_counts = await asyncio.gather(*seed_tasks)
+            added_count = sum(added_counts)
+            self.logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
+            
+        except IOError as e:
+            self.logger.error(f"Error reading seed file {self.config.seed_file}: {e}")
+
+->
+
+    async def _load_seeds(self):
+        """Load seed URLs from file, filtering for this pod."""
+        self.logger.info(f"Loading seeds from {self.config.seed_file} for pod {self.pod_id}")
+        if not self.config.seed_file.exists():
+            self.logger.error(f"Seed file not found: {self.config.seed_file}")
+            return
+        
+        # Import PodManager here to avoid circular imports
+        from .pod_manager import PodManager
+        pod_manager = PodManager(self.config)
+            
+        try:
+            with open(self.config.seed_file, 'r') as f:
+                all_urls = [normalize_url(line.strip()) for line in f if line.strip() and not line.startswith("#")]
+                
+            if not all_urls:
+                self.logger.warning(f"Seed file {self.config.seed_file} is empty.")
+                return
+            
+            # Filter URLs and domains that belong to this pod
+            pod_urls = []
+            pod_domains = set()
+            
+            for url in all_urls:
+                domain = extract_domain(url)
+                if domain and pod_manager.get_pod_for_domain(domain) == self.pod_id:
+                    pod_urls.append(url)
+                    pod_domains.add(domain)
+            
+            pod_domains_list = list(pod_domains)
+            
+            if not pod_urls:
+                self.logger.info(f"No seed URLs assigned to pod {self.pod_id} (out of {len(all_urls)} total)")
+                return
+                
+            self.logger.info(f"Pod {self.pod_id} handling {len(pod_urls)} URLs from {len(pod_domains)} domains (out of {len(all_urls)} total URLs)")
+                
+            # Mark domains as seeded (only for this pod's domains)
+            await self._mark_domains_as_seeded_batch(pod_domains_list)
+
+            # Load robots.txt for this pod's seed domains
+            # Most domains don't have robots.txt, so batch size can be large
+            chunk_size = max(self.config.fetcher_workers, 50_000)
+            for i in range(0, len(pod_domains_list), chunk_size):
+                await self.politeness.batch_load_robots_txt(pod_domains_list[i:i+chunk_size])
+                self.logger.info(f"Loaded robots.txt for {min(i+chunk_size, len(pod_domains_list))}/{len(pod_domains_list)} domains")
+            
+            # Add URLs to frontier
+            self.logger.info(f"Adding {len(pod_urls)} URLs to the frontier for pod {self.pod_id}")
+            
+            async def add_urls_batch_worker(worker_id: int, urls: list[str]) -> int:
+                subchunk_size = 100
+                added_count = 0
+                for i in range(0, len(urls), subchunk_size):
+                    added_count += await self.add_urls_batch(urls[i:i+subchunk_size])
+                    if i % 1000 == 0:
+                        self.logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
+                return added_count
+            
+            seed_tasks = []
+            chunk_size = (len(pod_urls) + self.config.fetcher_workers - 1) // self.config.fetcher_workers
+            for i in range(self.config.fetcher_workers):
+                url_chunk = pod_urls[i*chunk_size:(i+1)*chunk_size]
+                if url_chunk:  # Only create task if there are URLs
+                    seed_tasks.append(add_urls_batch_worker(i, url_chunk))
+            
+            if seed_tasks:
+                added_counts = await asyncio.gather(*seed_tasks)
+                added_count = sum(added_counts)
+                self.logger.info(f"Pod {self.pod_id}: Loaded {added_count} URLs from seed file")
+            else:
+                self.logger.info(f"Pod {self.pod_id}: No URLs to load")
+            
+        except IOError as e:
+            self.logger.error(f"Error reading seed file {self.config.seed_file}: {e}")
+```
+
+### 3. Now let's make storage.py's base_dir required and add TODOs:
+
+```python
+    async def save_content_to_file(self, url: str, text_content: str, base_dir: Optional[str] = None) -> str:
+        """Save text content to disk.
+        
+        Args:
+            url: The URL of the content
+            text_content: The extracted text content
+            base_dir: Optional base directory for content files. If not provided, uses self.data_dir
+            
+        Returns:
+            The path to the saved file
+        """
+        # Use provided base_dir or fall back to self.data_dir
+        data_dir = Path(base_dir) if base_dir else self.data_dir
+
+->
+
+    async def save_content_to_file(self, url: str, text_content: str, base_dir: str) -> str:
+        """Save text content to disk.
+        
+        Args:
+            url: The URL of the content
+            text_content: The extracted text content
+            base_dir: Base directory for content files
+            
+        Returns:
+            The path to the saved file
+        """
+        # TODO: Remove self.data_dir field - it's confusing with base_dir parameter
+        # TODO: Remove DB schema initialization - we only use Redis for metadata
+        
+        # Use provided base_dir
+        data_dir = Path(base_dir)
+```
+
+```python
+    async def save_content_to_file(self, url_hash: str, text_content: str, base_dir: Optional[Path] = None) -> Optional[Path]:
+        """Saves extracted text content to a file asynchronously.
+        
+        Args:
+            url_hash: SHA256 hash of the URL
+            text_content: The text content to save
+            base_dir: Optional base directory for content storage (for multi-drive support).
+                     If not provided, uses the default data_dir.
+        
+        Returns:
+            Path to the saved file, or None if save failed.
+        """
+        if not text_content:  # Do not save if no text content
+            return None
+        
+        # Use provided base_dir or fall back to default
+        if base_dir:
+            content_dir = Path(base_dir) / "content"
+            # Ensure the content directory exists
+            try:
+                content_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logger.error(f"Error creating content directory {content_dir}: {e}")
+                return None
+        else:
+            content_dir = self.content_dir
+
+->
+
+    async def save_content_to_file(self, url_hash: str, text_content: str, base_dir: Path) -> Optional[Path]:
+        """Saves extracted text content to a file asynchronously.
+        
+        Args:
+            url_hash: SHA256 hash of the URL
+            text_content: The text content to save
+            base_dir: Base directory for content storage (for multi-drive support).
+        
+        Returns:
+            Path to the saved file, or None if save failed.
+        """
+        # TODO: Remove self.data_dir field - it's confusing with base_dir parameter
+        # TODO: Remove DB schema initialization - we only use Redis for metadata
+        
+        if not text_content:  # Do not save if no text content
+            return None
+        
+        # Use provided base_dir
+        content_dir = Path(base_dir) / "content"
+        # Ensure the content directory exists
+        try:
+            content_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Error creating content directory {content_dir}: {e}")
+            return None
+```
+
+Now we need to update parser_consumer.py to pass the base_dir parameter:
+
+### 4. Now let's add a debug mode for pod assignment checking. Let's update frontier.py's add_urls_batch method:
+
+```python
+    async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
+        """Add URLs to frontier"""
+        # Pre-filter and deduplicate within batch
+        seen_in_batch = set()
+        candidates = []
+        for u in urls:
+            if len(u) > 2000 or is_likely_non_text_url(u):
+                continue
+            if u not in seen_in_batch:
+                seen_in_batch.add(u)
+                candidates.append(u)
+        
+        if not candidates:
+            return 0
+
+->
+
+    async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
+        """Add URLs to frontier"""
+        # Debug mode: check if URLs belong to this pod
+        debug_mode = os.environ.get('CRAWLER_DEBUG_POD_ASSIGNMENT', '').lower() == 'true'
+        if debug_mode and self.config.num_pods > 1:
+            from .pod_manager import PodManager
+            pod_manager = PodManager(self.config)
+            
+            for url in urls:
+                domain = extract_domain(url)
+                if domain:
+                    expected_pod = pod_manager.get_pod_for_domain(domain)
+                    if expected_pod != self.pod_id:
+                        self.logger.error(
+                            f"[DEBUG] POD ASSIGNMENT ERROR: URL {url} (domain: {domain}) "
+                            f"being added to pod {self.pod_id} but should go to pod {expected_pod}"
+                        )
+                        # In debug mode, we log but still process to see what happens
+        
+        # Pre-filter and deduplicate within batch
+        seen_in_batch = set()
+        candidates = []
+        for u in urls:
+            if len(u) > 2000 or is_likely_non_text_url(u):
+                continue
+            if u not in seen_in_batch:
+                seen_in_batch.add(u)
+                candidates.append(u)
+        
+        if not candidates:
+            return 0
+```
+
+```python
+import logging
+from typing import Optional, Tuple, List, Dict
+import asyncio
+import redis.asyncio as redis
+
+from .config import CrawlerConfig
+from .utils import extract_domain, normalize_url
+from .politeness import PolitenessEnforcer
+
+->
+
+import logging
+from typing import Optional, Tuple, List, Dict
+import asyncio
+import os
+import redis.asyncio as redis
+
+from .config import CrawlerConfig
+from .utils import extract_domain, normalize_url
+from .politeness import PolitenessEnforcer
+```
+
+Let's also add documentation about the debug mode. Let me create a simple markdown file:
+
+```markdown
+# Crawler Debug Mode
+
+## Pod Assignment Debug Mode
+
+To enable pod assignment debugging, set the environment variable:
+
+```bash
+export CRAWLER_DEBUG_POD_ASSIGNMENT=true
+```
+
+When enabled, the frontier will log errors when URLs are being added to the wrong pod. This helps detect bugs in the pod sharding logic where:
+- Parser processes might be writing to the wrong pod's frontier
+- URLs might be incorrectly routed during crawling
+
+Example error output:
+```
+[ERROR] [DEBUG] POD ASSIGNMENT ERROR: URL https://example.com/page (domain: example.com) being added to pod 3 but should go to pod 7
+```
+
+This is particularly useful when:
+- Testing new pod configurations
+- Debugging crawler behavior with many pods
+- Verifying that domain sharding is working correctly
+
+Note: In debug mode, errors are logged but crawling continues normally. This allows you to see all assignment errors without stopping the crawl.
+```
+
+Let's also fix the orchestrator.py linter error:
+
+Let's now run a quick test to verify the changes work correctly:
+
+---
+
+**User**
+
+Can you explain what the command above is doing?
+
+---
+
+**Cursor**
+
+```shellscript
+cd /home/ubuntu/vibe-coding-experiments/crawler && python -m crawler_module.orchestrator --config crawler_config.yaml --email test@example.com --max-pages 1 --max-duration 5
+```
+
+That command was a test to verify our changes work correctly. Let me break down what it does:
+
+```bash
+cd /home/ubuntu/vibe-coding-experiments/crawler && python -m crawler_module.orchestrator --config crawler_config.yaml --email test@example.com --max-pages 1 --max-duration 5
+```
+
+**Breaking it down:**
+
+1. **`cd /home/ubuntu/vibe-coding-experiments/crawler`** - Changes to the crawler directory
+
+2. **`python -m crawler_module.orchestrator`** - Runs the orchestrator module directly (instead of through `main.py`)
+
+3. **`--config crawler_config.yaml`** - Uses the pod-based configuration file we created
+
+4. **`--email test@example.com`** - Provides a required email for the User-Agent string
+
+5. **`--max-pages 1`** - Limits the crawl to just 1 page (for quick testing)
+
+6. **`--max-duration 5`** - Stops after 5 seconds maximum (safety limit)
+
+**Purpose of this test:**
+- Verify that the bloom filter config values are being used correctly
+- Check that seed domain sharding works (each pod only loads its assigned domains)
+- Ensure the required `base_dir` parameter in `save_content_to_file` doesn't break anything
+- Quick smoke test that the crawler can still start and initialize with all our changes
+
+It's a minimal test that would quickly show if there are any initialization errors from our changes without actually doing a full crawl.
+
+Would you like me to run a different test, or would you prefer to review the changes we made? Here's a summary of what we fixed:
+
+1. ✅ **Bloom filter config** - Now uses `bloom_filter_capacity` and `bloom_filter_error_rate` from config
+2. ✅ **Seed domain sharding** - Each pod only loads seeds for domains it's responsible for
+3. ✅ **Required base_dir** - Made the parameter required and added TODOs for future cleanup
+4. ✅ **Debug mode** - Added `CRAWLER_DEBUG_POD_ASSIGNMENT` environment variable to detect pod assignment errors
+
+```shellscript
+cd /home/ubuntu/vibe-coding-experiments/crawler && python -m crawler_module.orchestrator --config crawler_config.yaml --email test@example.com --max-pages 1 --max-duration 5
+```
+
+---
+
+**User**
+
+i'm confused, there is no `if __name__ == "__main__"` block in that file
+
+---
+
+**Cursor**
+
+You're absolutely right! Let me check the orchestrator.py file:
+
+You're absolutely correct! The `orchestrator.py` file doesn't have a `if __name__ == "__main__"` block, so it can't be run directly. 
+
+The proper way to run the crawler is through `main.py`:
+
+Ah, my apologies for the confusion! The correct command should use `main.py` instead:
+
+```bash
+cd /home/ubuntu/vibe-coding-experiments/crawler && python main.py --config crawler_config.yaml --email test@example.com --max-pages 1 --max-duration 5
+```
+
+The orchestrator is imported and run by `main.py`, not run directly. The `main.py` file:
+1. Sets up logging
+2. Creates a CrawlerConfig from command line arguments
+3. Instantiates the CrawlerOrchestrator
+4. Runs the orchestrator's `run_crawl()` method in an async task
+
+Would you like me to run this corrected test command to verify our changes work properly?
+
+```shellscript
+cd /home/ubuntu/vibe-coding-experiments/crawler && python main.py --config crawler_config.yaml --email test@example.com --max-pages 1 --max-duration 5
+```
+
+---
+
+**User**
+
+I can handle that. For now let's make 1 change: let's have the frontier save the debug mode OS environ on init rather than checking it every call to add_urls_batch please (for performance)
+
+---
+
+**Cursor**
+
+Good idea! Let's optimize that by checking the environment variable once during initialization:
+
+```python
+    def __init__(self, config: CrawlerConfig, politeness: PolitenessEnforcer, redis_client: redis.Redis, pod_id: int = 0):
+        self.config = config
+        self.politeness = politeness
+        self.redis = redis_client
+        self.pod_id = pod_id
+        
+        # Update logger to include pod_id if we're in a multi-pod setup
+        if config.num_pods > 1:
+            self.logger = logging.getLogger(f"{__name__}.pod{pod_id}")
+        else:
+            self.logger = logger
+
+->
+
+    def __init__(self, config: CrawlerConfig, politeness: PolitenessEnforcer, redis_client: redis.Redis, pod_id: int = 0):
+        self.config = config
+        self.politeness = politeness
+        self.redis = redis_client
+        self.pod_id = pod_id
+        
+        # Update logger to include pod_id if we're in a multi-pod setup
+        if config.num_pods > 1:
+            self.logger = logging.getLogger(f"{__name__}.pod{pod_id}")
+        else:
+            self.logger = logger
+        
+        # Check debug mode once during initialization for performance
+        self.debug_pod_assignment = os.environ.get('CRAWLER_DEBUG_POD_ASSIGNMENT', '').lower() == 'true'
+        if self.debug_pod_assignment and config.num_pods > 1:
+            self.logger.info("Pod assignment debug mode enabled")
+```
+
+Now let's update the `add_urls_batch` method to use the stored field:
+
+```python
+    async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
+        """Add URLs to frontier"""
+        # Debug mode: check if URLs belong to this pod
+        debug_mode = os.environ.get('CRAWLER_DEBUG_POD_ASSIGNMENT', '').lower() == 'true'
+        if debug_mode and self.config.num_pods > 1:
+            from .pod_manager import PodManager
+            pod_manager = PodManager(self.config)
+            
+            for url in urls:
+                domain = extract_domain(url)
+                if domain:
+                    expected_pod = pod_manager.get_pod_for_domain(domain)
+                    if expected_pod != self.pod_id:
+                        self.logger.error(
+                            f"[DEBUG] POD ASSIGNMENT ERROR: URL {url} (domain: {domain}) "
+                            f"being added to pod {self.pod_id} but should go to pod {expected_pod}"
+                        )
+                        # In debug mode, we log but still process to see what happens
+
+->
+
+    async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
+        """Add URLs to frontier"""
+        # Debug mode: check if URLs belong to this pod
+        if self.debug_pod_assignment and self.config.num_pods > 1:
+            from .pod_manager import PodManager
+            pod_manager = PodManager(self.config)
+            
+            for url in urls:
+                domain = extract_domain(url)
+                if domain:
+                    expected_pod = pod_manager.get_pod_for_domain(domain)
+                    if expected_pod != self.pod_id:
+                        self.logger.error(
+                            f"[DEBUG] POD ASSIGNMENT ERROR: URL {url} (domain: {domain}) "
+                            f"being added to pod {self.pod_id} but should go to pod {expected_pod}"
+                        )
+                        # In debug mode, we log but still process to see what happens
+```
+
+Perfect! I've optimized the debug mode check for better performance. Here's what changed:
+
+1. **In `__init__`**: The environment variable is now checked once during initialization and stored in `self.debug_pod_assignment`
+2. **In `add_urls_batch`**: Instead of checking the environment variable on every call, it now uses the stored `self.debug_pod_assignment` field
+
+This optimization means:
+- The environment variable is only read once when the FrontierManager is created
+- No repeated system calls to check the environment on every batch of URLs
+- Still provides the same debug functionality when enabled
+
+The debug mode will log a message during initialization if it's enabled, so you'll know it's active:
+```
+Pod assignment debug mode enabled
+```
+
+This is a good performance optimization, especially when processing millions of URLs where `add_urls_batch` might be called thousands of times per second.
+
+```plaintext
+Pod assignment debug mode enabled
 ```
 

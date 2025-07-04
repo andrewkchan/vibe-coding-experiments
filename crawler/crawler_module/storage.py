@@ -56,12 +56,33 @@ class StorageManager:
         """Generates a SHA256 hash for a given URL."""
         return hashlib.sha256(url.encode('utf-8')).hexdigest()
     
-    async def save_content_to_file(self, url_hash: str, text_content: str) -> Optional[Path]:
-        """Saves extracted text content to a file asynchronously."""
+    async def save_content_to_file(self, url_hash: str, text_content: str, base_dir: Path) -> Optional[Path]:
+        """Saves extracted text content to a file asynchronously.
+        
+        Args:
+            url_hash: SHA256 hash of the URL
+            text_content: The text content to save
+            base_dir: Base directory for content storage (for multi-drive support).
+        
+        Returns:
+            Path to the saved file, or None if save failed.
+        """
+        # TODO: Remove self.data_dir field - it's confusing with base_dir parameter
+        # TODO: Remove DB schema initialization - we only use Redis for metadata
+        
         if not text_content:  # Do not save if no text content
             return None
         
-        file_path = self.content_dir / f"{url_hash}.txt"
+        # Use provided base_dir
+        content_dir = Path(base_dir) / "content"
+        # Ensure the content directory exists
+        try:
+            content_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Error creating content directory {content_dir}: {e}")
+            return None
+        
+        file_path = content_dir / f"{url_hash}.txt"
         try:
             async with aiofiles.open(file_path, mode='w', encoding='utf-8') as f:
                 await f.write(text_content)

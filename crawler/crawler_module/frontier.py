@@ -6,6 +6,7 @@ Stores all frontier URLs directly in Redis for maximum performance.
 import logging
 from typing import Optional, Tuple, List, Dict
 import asyncio
+import os
 import redis.asyncio as redis
 
 from .config import CrawlerConfig
@@ -54,39 +55,53 @@ class FrontierManager:
     All operations are atomic Redis commands, no locking needed.
     """
     
-    def __init__(self, config: CrawlerConfig, politeness: PolitenessEnforcer, redis_client: redis.Redis):
+    def __init__(self, config: CrawlerConfig, politeness: PolitenessEnforcer, redis_client: redis.Redis, pod_id: int = 0):
         self.config = config
         self.politeness = politeness
         self.redis = redis_client
+        self.pod_id = pod_id
+        
+        # Update logger to include pod_id if we're in a multi-pod setup
+        if config.num_pods > 1:
+            self.logger = logging.getLogger(f"{__name__}.pod{pod_id}")
+        else:
+            self.logger = logger
+        
+        # Check debug mode once during initialization for performance
+        self.debug_pod_assignment = os.environ.get('CRAWLER_DEBUG_POD_ASSIGNMENT', '').lower() == 'true'
+        if self.debug_pod_assignment and config.num_pods > 1:
+            self.logger.info("Pod assignment debug mode enabled")
 
     
     async def initialize_frontier(self):
         """Initialize the frontier, loading seeds or resuming from existing data."""
-        logger.info("Initializing Redis frontier")
+        self.logger.info(f"Initializing Redis frontier for pod {self.pod_id}")
         
         # Initialize bloom filter if it doesn't exist
         try:
             await self.redis.execute_command('BF.INFO', 'seen:bloom')
-            logger.info("Bloom filter already exists, using existing filter")
+            self.logger.info("Bloom filter already exists, using existing filter")
         except:
             try:
                 await self.redis.execute_command(
-                    'BF.RESERVE', 'seen:bloom', 0.001, 160_000_000
+                    'BF.RESERVE', 'seen:bloom', 
+                    self.config.bloom_filter_error_rate,
+                    self.config.bloom_filter_capacity
                 )
-                logger.info("Created new bloom filter for 160M URLs with 0.1% FPR")
+                self.logger.info(f"Created new bloom filter for {self.config.bloom_filter_capacity:,} URLs with {self.config.bloom_filter_error_rate:.1%} FPR")
             except:
-                logger.warning("Could not create bloom filter - it may already exist")
+                self.logger.warning("Could not create bloom filter - it may already exist")
         
         await self.politeness.initialize()
         
         if self.config.resume:
             count = await self.count_frontier()
-            logger.info(f"Resuming crawl. Frontier has approximately {count} URLs.")
+            self.logger.info(f"Resuming crawl. Frontier has approximately {count} URLs.")
             if count == 0:
-                logger.warning("Resuming with an empty frontier. Attempting to load seeds.")
+                self.logger.warning("Resuming with an empty frontier. Attempting to load seeds.")
                 await self._load_seeds()
         else:
-            logger.info("Starting new crawl. Clearing any existing frontier and loading seeds.")
+            self.logger.info("Starting new crawl. Clearing any existing frontier and loading seeds.")
             await self._clear_frontier()
             await self._load_seeds()
     
@@ -116,37 +131,57 @@ class FrontierManager:
         pipe.delete('domains:queue')
         
         await pipe.execute()
-        logger.info("Cleared all frontier data")
+        self.logger.info("Cleared all frontier data")
     
     async def _load_seeds(self):
-        """Load seed URLs from file."""
-        logger.info(f"Loading seeds from {self.config.seed_file}")
+        """Load seed URLs from file, filtering for this pod."""
+        self.logger.info(f"Loading seeds from {self.config.seed_file} for pod {self.pod_id}")
         if not self.config.seed_file.exists():
-            logger.error(f"Seed file not found: {self.config.seed_file}")
+            self.logger.error(f"Seed file not found: {self.config.seed_file}")
             return
+        
+        # Import PodManager here to avoid circular imports
+        from .pod_manager import PodManager
+        pod_manager = PodManager(self.config)
             
         try:
             with open(self.config.seed_file, 'r') as f:
-                urls = [normalize_url(line.strip()) for line in f if line.strip() and not line.startswith("#")]
+                all_urls = [normalize_url(line.strip()) for line in f if line.strip() and not line.startswith("#")]
                 
-            if not urls:
-                logger.warning(f"Seed file {self.config.seed_file} is empty.")
+            if not all_urls:
+                self.logger.warning(f"Seed file {self.config.seed_file} is empty.")
+                return
+            
+            # Filter URLs and domains that belong to this pod
+            pod_urls = []
+            pod_domains = set()
+            
+            for url in all_urls:
+                domain = extract_domain(url)
+                if domain and pod_manager.get_pod_for_domain(domain) == self.pod_id:
+                    pod_urls.append(url)
+                    pod_domains.add(domain)
+            
+            pod_domains_list = list(pod_domains)
+            
+            if not pod_urls:
+                self.logger.info(f"No seed URLs assigned to pod {self.pod_id} (out of {len(all_urls)} total)")
                 return
                 
-            # Mark domains as seeded
-            seed_domains = {extract_domain(u) for u in urls if extract_domain(u)}
-            seed_domains = [d for d in seed_domains if d]
-            await self._mark_domains_as_seeded_batch(seed_domains)
+            self.logger.info(f"Pod {self.pod_id} handling {len(pod_urls)} URLs from {len(pod_domains)} domains (out of {len(all_urls)} total URLs)")
+                
+            # Mark domains as seeded (only for this pod's domains)
+            await self._mark_domains_as_seeded_batch(pod_domains_list)
 
-            # Load robots.txt for seeds
+            # Load robots.txt for this pod's seed domains
             # Most domains don't have robots.txt, so batch size can be large
             chunk_size = max(self.config.fetcher_workers, 50_000)
-            for i in range(0, len(seed_domains), chunk_size):
-                await self.politeness.batch_load_robots_txt(seed_domains[i:i+chunk_size])
-                logger.info(f"Loaded robots.txt for {i+chunk_size}/{len(seed_domains)} domains")
+            for i in range(0, len(pod_domains_list), chunk_size):
+                await self.politeness.batch_load_robots_txt(pod_domains_list[i:i+chunk_size])
+                self.logger.info(f"Loaded robots.txt for {min(i+chunk_size, len(pod_domains_list))}/{len(pod_domains_list)} domains")
             
             # Add URLs to frontier
-            logger.info(f"Adding {len(urls)} URLs to the frontier")
+            self.logger.info(f"Adding {len(pod_urls)} URLs to the frontier for pod {self.pod_id}")
             
             async def add_urls_batch_worker(worker_id: int, urls: list[str]) -> int:
                 subchunk_size = 100
@@ -154,21 +189,25 @@ class FrontierManager:
                 for i in range(0, len(urls), subchunk_size):
                     added_count += await self.add_urls_batch(urls[i:i+subchunk_size])
                     if i % 1000 == 0:
-                        logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
+                        self.logger.info(f"Worker {worker_id} seeded {added_count}/{len(urls)} URLs")
                 return added_count
             
             seed_tasks = []
-            chunk_size = (len(urls) + self.config.fetcher_workers - 1) // self.config.fetcher_workers
+            chunk_size = (len(pod_urls) + self.config.fetcher_workers - 1) // self.config.fetcher_workers
             for i in range(self.config.fetcher_workers):
-                url_chunk = urls[i*chunk_size:(i+1)*chunk_size]
-                seed_tasks.append(add_urls_batch_worker(i, url_chunk))
+                url_chunk = pod_urls[i*chunk_size:(i+1)*chunk_size]
+                if url_chunk:  # Only create task if there are URLs
+                    seed_tasks.append(add_urls_batch_worker(i, url_chunk))
             
-            added_counts = await asyncio.gather(*seed_tasks)
-            added_count = sum(added_counts)
-            logger.info(f"Loaded {added_count} URLs from seed file: {self.config.seed_file}")
+            if seed_tasks:
+                added_counts = await asyncio.gather(*seed_tasks)
+                added_count = sum(added_counts)
+                self.logger.info(f"Pod {self.pod_id}: Loaded {added_count} URLs from seed file")
+            else:
+                self.logger.info(f"Pod {self.pod_id}: No URLs to load")
             
         except IOError as e:
-            logger.error(f"Error reading seed file {self.config.seed_file}: {e}")
+            self.logger.error(f"Error reading seed file {self.config.seed_file}: {e}")
     
     async def _mark_domains_as_seeded_batch(self, domains: List[str]):
         """Mark domains as seeded in domain metadata."""
@@ -179,12 +218,28 @@ class FrontierManager:
         for i, domain in enumerate(domains):
             pipe.hset(f'domain:{domain}', 'is_seeded', '1')
             if i % 10_000 == 0:
-                logger.info(f"Mark {i}/{len(domains)} domains as seeded")
+                self.logger.info(f"Mark {i}/{len(domains)} domains as seeded")
         await pipe.execute()
-        logger.debug(f"Marked {len(domains)} domains as seeded")
+        self.logger.debug(f"Marked {len(domains)} domains as seeded")
     
     async def add_urls_batch(self, urls: List[str], depth: int = 0) -> int:
         """Add URLs to frontier"""
+        # Debug mode: check if URLs belong to this pod
+        if self.debug_pod_assignment and self.config.num_pods > 1:
+            from .pod_manager import PodManager
+            pod_manager = PodManager(self.config)
+            
+            for url in urls:
+                domain = extract_domain(url)
+                if domain:
+                    expected_pod = pod_manager.get_pod_for_domain(domain)
+                    if expected_pod != self.pod_id:
+                        self.logger.error(
+                            f"[DEBUG] POD ASSIGNMENT ERROR: URL {url} (domain: {domain}) "
+                            f"being added to pod {self.pod_id} but should go to pod {expected_pod}"
+                        )
+                        # In debug mode, we log but still process to see what happens
+        
         # Pre-filter and deduplicate within batch
         seen_in_batch = set()
         candidates = []
@@ -290,12 +345,12 @@ class FrontierManager:
                     # Skip non-text URLs
                     if is_likely_non_text_url(url):
                         # Don't put it back - just skip it and try next URL
-                        logger.debug(f"Skipping non-text URL: {url}")
+                        self.logger.debug(f"Skipping non-text URL: {url}")
                         continue
                     
                     # Check URL-level politeness
                     if not await self.politeness.is_url_allowed(url):
-                        logger.debug(f"URL {url} disallowed by politeness rules")
+                        self.logger.debug(f"URL {url} disallowed by politeness rules")
                         continue
                     
                     # Record fetch attempt

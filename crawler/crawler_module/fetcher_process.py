@@ -13,6 +13,7 @@ import redis.asyncio as redis
 from redis.asyncio import BlockingConnectionPool
 
 from .config import CrawlerConfig
+from .pod_manager import PodManager
 from .storage import StorageManager
 from .fetcher import Fetcher, FetchResult
 from .politeness import PolitenessEnforcer
@@ -43,40 +44,23 @@ EMPTY_FRONTIER_SLEEP_SECONDS = 10
 class FetcherProcess:
     """Fetcher process that runs multiple async workers to fetch URLs."""
     
-    def __init__(self, config: CrawlerConfig, fetcher_id: int):
+    def __init__(self, config: CrawlerConfig, fetcher_id: int, pod_id: int = 0):
         self.config = config
         self.fetcher_id = fetcher_id
+        self.pod_id = pod_id
         self.fetcher = Fetcher(config)
         
-        # Initialize Redis clients
-        redis_kwargs = config.get_redis_connection_kwargs()
+        # Initialize PodManager to get Redis connections for this pod
+        self.pod_manager = PodManager(config)
         
-        # Text data client
-        text_pool = BlockingConnectionPool(**redis_kwargs)
-        base_redis_client = redis.Redis(connection_pool=text_pool)
-        # Monkey-patch to remove decorator overhead
-        base_redis_client.connection_pool.get_connection = functools.partial(
-            base_redis_client.connection_pool.get_connection.__wrapped__, 
-            base_redis_client.connection_pool
-        )
-        self.redis_client = ShieldedRedis(base_redis_client)
+        # We'll initialize Redis clients in async _init_redis method
+        self.redis_client: Optional[ShieldedRedis] = None
+        self.redis_client_binary: Optional[ShieldedRedis] = None
         
-        # Binary data client (for pickle)
-        binary_redis_kwargs = config.get_redis_connection_kwargs()
-        binary_redis_kwargs['decode_responses'] = False
-        binary_pool = BlockingConnectionPool(**binary_redis_kwargs)
-        base_redis_client_binary = redis.Redis(connection_pool=binary_pool)
-        # Same monkey patching
-        base_redis_client_binary.connection_pool.get_connection = functools.partial(
-            base_redis_client_binary.connection_pool.get_connection.__wrapped__, 
-            base_redis_client_binary.connection_pool
-        )
-        self.redis_client_binary = ShieldedRedis(base_redis_client_binary)
-        
-        # Initialize components
-        self.storage = StorageManager(config, self.redis_client)  # type: ignore
-        self.politeness = PolitenessEnforcer(config, self.redis_client, self.fetcher)
-        self.frontier = FrontierManager(config, self.politeness, self.redis_client)
+        # Components will be initialized after Redis clients
+        self.storage: Optional[StorageManager] = None
+        self.politeness: Optional[PolitenessEnforcer] = None
+        self.frontier: Optional[FrontierManager] = None
         
         # Fetcher state
         self.worker_tasks: Set[asyncio.Task] = set()
@@ -95,10 +79,23 @@ class FetcherProcess:
         self.active_workers_count = 0
         
         # Backpressure configuration (same as orchestrator)
-        self.fetch_queue_soft_limit = 20000
-        self.fetch_queue_hard_limit = 80000
+        self.fetch_queue_soft_limit = config.parse_queue_soft_limit
+        self.fetch_queue_hard_limit = config.parse_queue_hard_limit
         
-        logger.info(f"Fetcher process {fetcher_id} initialized")
+        logger.info(f"Fetcher process {fetcher_id} for pod {pod_id} initialized")
+    
+    async def _init_async_components(self):
+        """Initialize components that require async setup."""
+        # Get Redis clients for this pod
+        self.redis_client = await self.pod_manager.get_redis_client(self.pod_id, binary=False)
+        self.redis_client_binary = await self.pod_manager.get_redis_client(self.pod_id, binary=True)
+        
+        # Initialize components with pod-specific Redis
+        self.storage = StorageManager(self.config, self.redis_client)
+        self.politeness = PolitenessEnforcer(self.config, self.redis_client, self.fetcher)
+        self.frontier = FrontierManager(self.config, self.politeness, self.redis_client, pod_id=self.pod_id)
+        
+        logger.info(f"Fetcher-{self.fetcher_id}: Async components initialized for pod {self.pod_id}")
     
     async def _worker(self, worker_id: int):
         """Core logic for a single crawl worker."""
@@ -111,7 +108,7 @@ class FetcherProcess:
         try:
             while not self._shutdown_event.is_set():
                 try:
-                    # Get next URL
+                    # Get next URL from this pod's frontier
                     next_url_info = await self.frontier.get_next_url()
 
                     if next_url_info is None:
@@ -153,7 +150,7 @@ class FetcherProcess:
                         logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Successfully fetched {fetch_result.final_url}. Total crawled: {self.pages_crawled_count}")
                         
                         if fetch_result.text_content and fetch_result.content_type and "html" in fetch_result.content_type.lower():
-                            # Push to parse queue
+                            # Push to this pod's parse queue
                             queue_item = {
                                 'url': fetch_result.final_url,
                                 'domain': domain,
@@ -241,20 +238,20 @@ class FetcherProcess:
         if time_elapsed >= 5.0:  # Update every 5 seconds
             # Calculate pages per second
             pages_per_second = self.pages_crawled_in_interval / time_elapsed if time_elapsed > 0 else 0
-            fetcher_pages_per_second_gauge.labels(fetcher_id=str(self.fetcher_id)).set(pages_per_second)
+            fetcher_pages_per_second_gauge.labels(fetcher_id=f"{self.pod_id}-{self.fetcher_id}").set(pages_per_second)
             
             # Update resource metrics
             try:
                 memory_usage = self.process.memory_info().rss
                 process_memory_usage_gauge.labels(
                     process_type='fetcher',
-                    process_id=str(self.fetcher_id)
+                    process_id=f"{self.pod_id}-{self.fetcher_id}"
                 ).set(memory_usage)
                 
                 open_fds = self.process.num_fds()
                 process_open_fds_gauge.labels(
                     process_type='fetcher', 
-                    process_id=str(self.fetcher_id)
+                    process_id=f"{self.pod_id}-{self.fetcher_id}"
                 ).set(open_fds)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass  # Process might be shutting down
@@ -263,11 +260,14 @@ class FetcherProcess:
             self.pages_crawled_in_interval = 0
             self.last_metrics_update_time = current_time
             
-            logger.info(f"[Metrics] Fetcher-{self.fetcher_id}: Pages/sec: {pages_per_second:.2f}")
+            logger.info(f"[Metrics] Fetcher-{self.fetcher_id} Pod-{self.pod_id}: Pages/sec: {pages_per_second:.2f}")
     
     async def run(self):
         """Main entry point for the fetcher process."""
-        logger.info(f"Fetcher process {self.fetcher_id} starting...")
+        logger.info(f"Fetcher process {self.fetcher_id} for pod {self.pod_id} starting...")
+        
+        # Initialize async components
+        await self._init_async_components()
         
         # Note: One-time initialization (init_db_schema, load_manual_exclusions, initialize_frontier)
         # is handled by the orchestrator before starting fetcher processes
@@ -323,21 +323,21 @@ class FetcherProcess:
             
             # Close connections
             await self.fetcher.close_session()
-            await self.storage.close()
-            await self.redis_client.aclose()
-            await self.redis_client_binary.aclose()
+            if self.storage:
+                await self.storage.close()
+            await self.pod_manager.close_all()
             
             logger.info(f"Fetcher-{self.fetcher_id}: Shutdown complete. Pages crawled: {self.pages_crawled_count}")
 
 
-def run_fetcher_process(config: CrawlerConfig, fetcher_id: int):
+def run_fetcher_process(config: CrawlerConfig, fetcher_id: int, pod_id: int = 0):
     """Entry point for running a fetcher as a separate process."""
     # Setup logging for the child process
     logging.basicConfig(
         level=config.log_level,
-        format=f'%(asctime)s - %(name)s - %(levelname)s - [Fetcher-{fetcher_id}] %(message)s'
+        format=f'%(asctime)s - %(name)s - %(levelname)s - [Pod-{pod_id}-Fetcher-{fetcher_id}] %(message)s'
     )
     
     # Create and run the fetcher
-    fetcher = FetcherProcess(config, fetcher_id)
+    fetcher = FetcherProcess(config, fetcher_id, pod_id)
     asyncio.run(fetcher.run()) 
