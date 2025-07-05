@@ -72,7 +72,13 @@ class PolitenessEnforcer:
     
     async def batch_load_robots_txt(self, domains: list[str]):
         """Batch load robots.txt for a list of domains."""
-        tasks = [self._get_robots_for_domain(domain) for domain in domains]
+        async def load_robots_txt(domain: str) -> RobotFileParser | None:
+            try:
+                await self._get_robots_for_domain(domain)
+            except Exception as e:
+                logger.error(f"Exception loading robots.txt for {domain}: {e}")
+                return None
+        tasks = [load_robots_txt(domain) for domain in domains]
         await asyncio.gather(*tasks)
     
     async def _get_cached_robots(self, domain: str) -> tuple[str | None, int | None]:
@@ -148,7 +154,11 @@ class PolitenessEnforcer:
         
         # 5. Parse and update in-memory cache
         rfp = RobotFileParser()
-        rfp.parse(fetched_robots_content.split('\n'))
+        try:
+            rfp.parse(fetched_robots_content.split('\n'))
+        except Exception as e:
+            logger.error(f"Exception parsing robots.txt for {domain}: {e}")
+            rfp = RobotFileParser()
         self.robots_parsers.put(domain, rfp)
         
         return rfp

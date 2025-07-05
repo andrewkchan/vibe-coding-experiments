@@ -114,6 +114,8 @@ class FrontierManager:
         
         # Clear domain queue
         pipe.delete('domains:queue')
+        # Bloom filter
+        pipe.delete('seen:bloom')
         
         await pipe.execute()
         logger.info("Cleared all frontier data")
@@ -140,7 +142,7 @@ class FrontierManager:
 
             # Load robots.txt for seeds
             # Most domains don't have robots.txt, so batch size can be large
-            chunk_size = 1_000
+            chunk_size = 2_000
             for i in range(0, len(seed_domains), chunk_size):
                 await self.politeness.batch_load_robots_txt(seed_domains[i:i+chunk_size])
                 logger.info(f"Loaded robots.txt for {i+chunk_size}/{len(seed_domains)} domains")
@@ -190,6 +192,7 @@ class FrontierManager:
         candidates = []
         for u in urls:
             if len(u) > 2000 or is_likely_non_text_url(u):
+                logger.debug(f"Skipping URL due to length or non-text: {u}")
                 continue
             if u not in seen_in_batch:
                 seen_in_batch.add(u)
@@ -211,6 +214,8 @@ class FrontierManager:
         for url, exists in zip(candidates, bloom_results):
             if not exists:
                 new_urls.append(url)
+            else:
+                logger.debug(f"Skipping URL due to bloom filter: {url}")
         
         if not new_urls:
             return 0
@@ -220,6 +225,8 @@ class FrontierManager:
         for url in new_urls:
             if await self.politeness.is_url_allowed(url):
                 allowed_urls.append(url)
+            else:
+                logger.debug(f"Skipping URL due to politeness: {url}")
 
         if not allowed_urls:
             return 0
@@ -231,6 +238,7 @@ class FrontierManager:
             if domain:
                 if domain not in urls_by_domain:
                     urls_by_domain[domain] = []
+                logger.debug(f"Adding URL to frontier with domain {domain}: {url}")
                 urls_by_domain[domain].append((url, depth))
         
         # Add to bloom filter and frontier lists atomically
