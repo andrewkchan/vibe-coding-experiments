@@ -22,7 +22,6 @@ from .redis_shield import ShieldedRedis
 from .utils import extract_domain
 from .metrics import (
     pages_crawled_counter,
-    errors_counter,
     backpressure_events_counter,
     fetch_duration_histogram,
     active_workers_gauge,
@@ -123,7 +122,10 @@ class FetcherProcess:
                     fetch_start_time = time.time()
                     fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
                     fetch_duration = time.time() - fetch_start_time
-                    fetch_duration_histogram.labels(fetch_type='page').observe(fetch_duration)
+                    fetch_duration_histogram.labels(
+                        pod_id=str(self.pod_id),
+                        fetch_type='page'
+                    ).observe(fetch_duration)
                     
                     crawled_timestamp = int(time.time())
 
@@ -132,9 +134,17 @@ class FetcherProcess:
                         
                         # Track error in Prometheus
                         if fetch_result.error_message:
-                            errors_counter.labels(error_type='fetch_error').inc()
+                            fetch_error_counter.labels(
+                                pod_id=str(self.pod_id),
+                                error_type='fetch_error',
+                                fetch_type='page'
+                            ).inc()
                         else:
-                            errors_counter.labels(error_type=f'http_{fetch_result.status_code}').inc()
+                            fetch_error_counter.labels(
+                                pod_id=str(self.pod_id),
+                                error_type=f'http_{fetch_result.status_code}',
+                                fetch_type='page'
+                            ).inc()
                         
                         # Record failed attempt
                         await self.storage.add_visited_page(
@@ -146,7 +156,7 @@ class FetcherProcess:
                     else:  # Successful fetch
                         self.pages_crawled_count += 1
                         self.pages_crawled_in_interval += 1
-                        pages_crawled_counter.inc()
+                        pages_crawled_counter.labels(pod_id=str(self.pod_id)).inc()
                         logger.info(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Successfully fetched {fetch_result.final_url}. Total crawled: {self.pages_crawled_count}")
                         
                         if fetch_result.text_content and fetch_result.content_type and "html" in fetch_result.content_type.lower():
@@ -171,7 +181,10 @@ class FetcherProcess:
                             # Backpressure logic
                             if queue_size > self.fetch_queue_hard_limit:
                                 logger.warning(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Queue at hard limit ({queue_size}/{self.fetch_queue_hard_limit}), waiting...")
-                                backpressure_events_counter.labels(backpressure_type='hard_limit').inc()
+                                backpressure_events_counter.labels(
+                                    pod_id=str(self.pod_id),
+                                    backpressure_type='hard_limit'
+                                ).inc()
                                 while queue_size > self.fetch_queue_soft_limit:
                                     await asyncio.sleep(5.0)
                                     queue_size = await self.redis_client_binary.llen('fetch:queue')
@@ -188,7 +201,10 @@ class FetcherProcess:
                                 
                                 if worker_id % 10 == 1:  # Log from only 10% of workers
                                     logger.debug(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Queue at {queue_size}, backpressure sleep {sleep_time:.2f}s")
-                                backpressure_events_counter.labels(backpressure_type='soft_limit').inc()
+                                backpressure_events_counter.labels(
+                                    pod_id=str(self.pod_id),
+                                    backpressure_type='soft_limit'
+                                ).inc()
                                 await asyncio.sleep(sleep_time)
                         else:
                             logger.debug(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Not HTML for {fetch_result.final_url}")
@@ -211,7 +227,11 @@ class FetcherProcess:
                     raise
                 except Exception as e:
                     logger.error(f"Fetcher-{self.fetcher_id} Worker-{worker_id}: Error processing URL: {e}")
-                    errors_counter.labels(error_type='worker_error').inc()
+                    fetch_error_counter.labels(
+                        pod_id=str(self.pod_id),
+                        error_type='worker_error',
+                        fetch_type='page'
+                    ).inc()
                     await asyncio.sleep(1)
 
         except asyncio.CancelledError:
@@ -305,7 +325,7 @@ class FetcherProcess:
                 active_count = sum(1 for task in self.worker_tasks if not task.done())
                 if active_count != self.active_workers_count:
                     self.active_workers_count = active_count
-                    active_workers_gauge.set(active_count)
+                    active_workers_gauge.labels(pod_id=str(self.pod_id)).set(active_count)
                 
                 # Update per-process metrics
                 await self._update_metrics()

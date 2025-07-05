@@ -187,7 +187,7 @@ class ParserConsumer:
             parse_result = self.parser.parse_html_content(html_content, url)
             
             parse_duration = time.time() - parse_start
-            parse_duration_histogram.observe(parse_duration)
+            parse_duration_histogram.labels(pod_id=str(self.pod_id)).observe(parse_duration)
             
             content_storage_path_str: Optional[str] = None
             
@@ -242,13 +242,16 @@ class ParserConsumer:
             # Update metrics
             self.pages_parsed_count += 1
             self.pages_parsed_in_interval += 1
-            parse_processed_counter.inc()
+            parse_processed_counter.labels(pod_id=str(self.pod_id)).inc()
             
             logger.info(f"Successfully processed {url}: saved={bool(content_storage_path_str)}, links_added={links_added}")
             
         except Exception as e:
             logger.error(f"Error processing item: {e}", exc_info=True)
-            parse_errors_counter.labels(error_type=type(e).__name__).inc()
+            parse_errors_counter.labels(
+                pod_id=str(self.pod_id),
+                error_type=type(e).__name__
+            ).inc()
     
     async def _worker(self, worker_id: int):
         """Worker coroutine that processes items from the queue."""
@@ -277,7 +280,10 @@ class ParserConsumer:
                         item_data = pickle.loads(item_pickle)
                     except pickle.UnpicklingError as e:
                         logger.error(f"Worker {worker_id}: Invalid pickle in queue: {e}")
-                        parse_errors_counter.labels(error_type='pickle_decode').inc()
+                        parse_errors_counter.labels(
+                            pod_id=str(self.pod_id),
+                            error_type='pickle_decode'
+                        ).inc()
                         continue
                     
                     # Process the item
@@ -290,7 +296,10 @@ class ParserConsumer:
                     raise
                 except Exception as e:
                     logger.error(f"Worker {worker_id}: Error in worker loop: {e}", exc_info=True)
-                    parse_errors_counter.labels(error_type='worker_loop').inc()
+                    parse_errors_counter.labels(
+                        pod_id=str(self.pod_id),
+                        error_type='worker_loop'
+                    ).inc()
                     await asyncio.sleep(1)  # Brief pause on error
                     
         except asyncio.CancelledError:
@@ -329,10 +338,10 @@ class ParserConsumer:
                 
                 # Update real-time metrics
                 queue_size = await self.redis_client.llen('fetch:queue')
-                parse_queue_size_gauge.set(queue_size)
+                parse_queue_size_gauge.labels(pod_id=str(self.pod_id)).set(queue_size)
                 
                 active_workers = sum(1 for task in self.worker_tasks if not task.done())
-                active_parser_workers_gauge.set(active_workers)
+                active_parser_workers_gauge.labels(pod_id=str(self.pod_id)).set(active_workers)
                 
                 # Check if all workers have exited
                 if not any(not task.done() for task in self.worker_tasks):

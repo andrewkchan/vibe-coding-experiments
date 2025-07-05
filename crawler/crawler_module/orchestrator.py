@@ -115,8 +115,8 @@ class CrawlerOrchestrator:
         # System metrics tracking for rate calculations
         self.last_io_stats = None
         self.last_network_stats = None
-        self.last_redis_stats = None
-        self.last_redis_stats_time = None
+        self.last_redis_stats_per_pod: Dict[int, Any] = {}
+        self.last_redis_stats_time_per_pod: Dict[int, float] = {}
         
         # Process management - now organized by pods
         self.pod_processes: Dict[int, Dict[str, List[Process]]] = {}
@@ -428,11 +428,22 @@ class CrawlerOrchestrator:
             elif available_gb < 4.0:
                 logger.info(f"[Metrics] System memory getting low: {available_gb:.1f}GB available")
             
-            # Disk metrics (for the crawler's data directory)
-            disk = psutil.disk_usage(str(self.config.data_dir))
-            disk_free_gauge.set(disk.free)
-            disk_usage_percent_gauge.set(disk.percent)
-            logger.info(f"[Metrics] Disk ({self.config.data_dir}): Free={disk.free/1024/1024/1024:.1f}GB, Used={disk.percent:.1f}%")
+            # Disk metrics (for all crawler data directories)
+            if hasattr(self.config, 'data_dirs') and self.config.data_dirs:
+                for data_dir in self.config.data_dirs:
+                    try:
+                        disk = psutil.disk_usage(str(data_dir))
+                        disk_free_gauge.labels(data_dir=str(data_dir)).set(disk.free)
+                        disk_usage_percent_gauge.labels(data_dir=str(data_dir)).set(disk.percent)
+                        logger.info(f"[Metrics] Disk ({data_dir}): Free={disk.free/1024/1024/1024:.1f}GB, Used={disk.percent:.1f}%")
+                    except Exception as e:
+                        logger.warning(f"Could not get disk metrics for {data_dir}: {e}")
+            else:
+                # Fallback to single data_dir
+                disk = psutil.disk_usage(str(self.config.data_dir))
+                disk_free_gauge.labels(data_dir=str(self.config.data_dir)).set(disk.free)
+                disk_usage_percent_gauge.labels(data_dir=str(self.config.data_dir)).set(disk.percent)
+                logger.info(f"[Metrics] Disk ({self.config.data_dir}): Free={disk.free/1024/1024/1024:.1f}GB, Used={disk.percent:.1f}%")
             
             # IO metrics
             io_counters = psutil.disk_io_counters()
@@ -468,69 +479,72 @@ class CrawlerOrchestrator:
                 
                 self.last_network_stats = net_counters
             
-            # Redis metrics
-            if self.redis_client:
-                redis_info = await self.redis_client.info()
-                redis_memory = await self.redis_client.info('memory')
-                redis_stats = await self.redis_client.info('stats')
-            else:
-                redis_info = {}
-                redis_memory = {}
-                redis_stats = {}
-            
-            # Basic Redis metrics
-            redis_memory_usage_gauge.set(redis_memory.get('used_memory', 0))
-            redis_connected_clients_gauge.set(redis_info.get('connected_clients', 0))
-            
-            # Redis ops/sec
-            instantaneous_ops = redis_stats.get('instantaneous_ops_per_sec', 0)
-            redis_ops_per_sec_gauge.set(instantaneous_ops)
-            
-            # Additional Redis memory metrics
-            redis_rss = redis_memory.get('used_memory_rss_human', 'N/A')
-            redis_dataset_perc = redis_memory.get('used_memory_dataset_perc', 'N/A')
-            redis_used = redis_memory.get('used_memory_human', 'N/A')
-            redis_max = redis_memory.get('maxmemory_human', 'N/A')
-            redis_evicted_keys = redis_stats.get('evicted_keys', 0)
-            
-            # Check Redis memory usage percentage and warn if high
-            used_memory_bytes = redis_memory.get('used_memory', 0)
-            max_memory_bytes = redis_memory.get('maxmemory', 0)
-            if max_memory_bytes > 0:
-                memory_usage_percent = (used_memory_bytes / max_memory_bytes) * 100
-                if memory_usage_percent > 90:
-                    logger.warning(f"[Metrics] REDIS MEMORY WARNING: Using {memory_usage_percent:.1f}% of maxmemory ({redis_used}/{redis_max})")
-                elif memory_usage_percent > 80:
-                    logger.info(f"[Metrics] Redis memory usage at {memory_usage_percent:.1f}% of maxmemory")
-            
-            # Calculate hit rate
-            if self.last_redis_stats:
-                time_diff = current_time - self.last_redis_stats_time
-                if time_diff > 0:
-                    hits_diff = redis_stats.get('keyspace_hits', 0) - self.last_redis_stats.get('keyspace_hits', 0)
-                    misses_diff = redis_stats.get('keyspace_misses', 0) - self.last_redis_stats.get('keyspace_misses', 0)
-                    total_diff = hits_diff + misses_diff
-                    if total_diff > 0:
-                        hit_rate = (hits_diff / total_diff) * 100
-                        redis_hit_rate_gauge.set(hit_rate)
-                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Hit Rate={hit_rate:.1f}%, Evicted={redis_evicted_keys}")
+            # Redis metrics - collect for all pods
+            logger.info("[Metrics] Collecting Redis metrics for all pods...")
+            for pod_id in range(self.config.num_pods):
+                try:
+                    # Get Redis client for this pod
+                    redis_client = await self.pod_manager.get_redis_client(pod_id)
+                    
+                    # Get Redis info for this pod
+                    redis_info = await redis_client.info()
+                    redis_memory = await redis_client.info('memory')
+                    redis_stats = await redis_client.info('stats')
+                    
+                    # Basic Redis metrics
+                    redis_memory_usage_gauge.labels(pod_id=str(pod_id)).set(redis_memory.get('used_memory', 0))
+                    redis_connected_clients_gauge.labels(pod_id=str(pod_id)).set(redis_info.get('connected_clients', 0))
+                    
+                    # Redis ops/sec
+                    instantaneous_ops = redis_stats.get('instantaneous_ops_per_sec', 0)
+                    redis_ops_per_sec_gauge.labels(pod_id=str(pod_id)).set(instantaneous_ops)
+                    
+                    # Additional Redis memory metrics
+                    redis_rss = redis_memory.get('used_memory_rss_human', 'N/A')
+                    redis_dataset_perc = redis_memory.get('used_memory_dataset_perc', 'N/A')
+                    redis_used = redis_memory.get('used_memory_human', 'N/A')
+                    redis_max = redis_memory.get('maxmemory_human', 'N/A')
+                    redis_evicted_keys = redis_stats.get('evicted_keys', 0)
+                    
+                    # Check Redis memory usage percentage and warn if high
+                    used_memory_bytes = redis_memory.get('used_memory', 0)
+                    max_memory_bytes = redis_memory.get('maxmemory', 0)
+                    if max_memory_bytes > 0:
+                        memory_usage_percent = (used_memory_bytes / max_memory_bytes) * 100
+                        if memory_usage_percent > 90:
+                            logger.warning(f"[Metrics] Pod {pod_id} REDIS MEMORY WARNING: Using {memory_usage_percent:.1f}% of maxmemory ({redis_used}/{redis_max})")
+                        elif memory_usage_percent > 80:
+                            logger.info(f"[Metrics] Pod {pod_id} Redis memory usage at {memory_usage_percent:.1f}% of maxmemory")
+                    
+                    # Calculate hit rate (per pod tracking)
+                    if pod_id in self.last_redis_stats_per_pod:
+                        time_diff = current_time - self.last_redis_stats_time_per_pod[pod_id]
+                        if time_diff > 0:
+                            last_stats = self.last_redis_stats_per_pod[pod_id]
+                            hits_diff = redis_stats.get('keyspace_hits', 0) - last_stats.get('keyspace_hits', 0)
+                            misses_diff = redis_stats.get('keyspace_misses', 0) - last_stats.get('keyspace_misses', 0)
+                            total_diff = hits_diff + misses_diff
+                            if total_diff > 0:
+                                hit_rate = (hits_diff / total_diff) * 100
+                                redis_hit_rate_gauge.labels(pod_id=str(pod_id)).set(hit_rate)
+                                logger.info(f"[Metrics] Pod {pod_id} Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Hit Rate={hit_rate:.1f}%, Evicted={redis_evicted_keys}")
+                            else:
+                                logger.info(f"[Metrics] Pod {pod_id} Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Evicted={redis_evicted_keys}")
                     else:
-                        logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Evicted={redis_evicted_keys}")
-            else:
-                logger.info(f"[Metrics] Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Evicted={redis_evicted_keys}")
-            
-            self.last_redis_stats = redis_stats
-            self.last_redis_stats_time = current_time
+                        logger.info(f"[Metrics] Pod {pod_id} Redis: Ops/sec={instantaneous_ops}, Memory={redis_used}/{redis_max} (RSS: {redis_rss}, Dataset: {redis_dataset_perc}), Evicted={redis_evicted_keys}")
+                    
+                    # Store stats for next iteration
+                    self.last_redis_stats_per_pod[pod_id] = redis_stats
+                    self.last_redis_stats_time_per_pod[pod_id] = current_time
+                    
+                except Exception as e:
+                    logger.error(f"Error collecting Redis metrics for pod {pod_id}: {e}")
             
         except Exception as e:
             logger.error(f"Error collecting system metrics: {e}")
 
         # Content size metrics - extract data from Prometheus histogram
         try:
-            # Get samples from content_size_histogram for HTML pages
-            html_sizes = []
-            non_html_sizes = []
-            
             # Access the internal metrics structure (this is a bit hacky but works)
             for metric in content_size_histogram._metrics.values():
                 labels = metric._labelnames
@@ -716,7 +730,9 @@ class CrawlerOrchestrator:
                     active_fetcher_processes += sum(1 for p in pod_procs['fetchers'] if p.is_alive())
                 
                 # Update Prometheus gauges
-                frontier_size_gauge.set(estimated_frontier_size)
+                # TODO: Update to track per-pod frontier sizes
+                # For now, just set pod 0's frontier size as placeholder
+                frontier_size_gauge.labels(pod_id='0').set(estimated_frontier_size)
                 
                 # Resource monitoring
                 rss_mem_mb = "N/A"
