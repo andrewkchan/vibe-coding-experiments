@@ -28,7 +28,10 @@ for shard_i in range(24):
       f"--email test@gmail.com --data-dir /mnt/data_{shard_i//2} " + 
       f"--cpu-alloc-start={procs_per_pod * shard_i} --resume --fetcher-workers 6000 " + 
       f"--num-fetcher-processes {fetchers_per_pod} --num-parser-processes {parsers_per_pod} " + 
-      f"--seeded-urls-only 2>&1 | tee -a logs/shard_{shard_i}.log | grep --text 'Metrics\\]|orchestrator'"
+      f"--seeded-urls-only 2>&1 " + 
+      f"| tee -a logs/shard_{shard_i}.log " + 
+      f"| grep --text 'Metrics\\]|orchestrator'" +
+      f"| sed 's/^/[Shard {shard_i}] /'"
     )
     
     p = subprocess.Popen(cmd, shell=True)
