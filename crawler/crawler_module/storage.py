@@ -11,6 +11,7 @@ from .config import CrawlerConfig
 logger = logging.getLogger(__name__)
 
 REDIS_SCHEMA_VERSION = 1
+MAX_CONTENT_LENGTH = 40_000 # truncate to 40k chars to prevent the system from dying during demonstration run
 
 class StorageManager:
     """Redis-based storage manager for visited URLs and content."""
@@ -65,6 +66,7 @@ class StorageManager:
         try:
             async with aiofiles.open(file_path, mode='w', encoding='utf-8') as f:
                 await f.write(text_content)
+                await f.truncate(MAX_CONTENT_LENGTH)
             logger.debug(f"Saved content for {url_hash} to {file_path}")
             return file_path
         except IOError as e:
