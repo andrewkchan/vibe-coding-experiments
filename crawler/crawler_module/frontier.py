@@ -173,7 +173,7 @@ class FrontierManager:
 
             # Load robots.txt for this pod's seed domains
             # Most domains don't have robots.txt, so batch size can be large
-            chunk_size = max(self.config.fetcher_workers, 50_000)
+            chunk_size = max(self.config.fetcher_workers, 25_000)
             for i in range(0, len(pod_domains_list), chunk_size):
                 await self.politeness.batch_load_robots_txt(pod_domains_list[i:i+chunk_size])
                 self.logger.info(f"Loaded robots.txt for {min(i+chunk_size, len(pod_domains_list))}/{len(pod_domains_list)} domains")
