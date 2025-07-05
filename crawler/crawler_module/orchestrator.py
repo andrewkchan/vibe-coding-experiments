@@ -153,11 +153,21 @@ class CrawlerOrchestrator:
             # Import inside the function to avoid issues with multiprocessing
             import asyncio
             import logging
+            from .process_utils import set_cpu_affinity
             
             # Setup logging for the child process
             logging.basicConfig(
                 level=logging.INFO,
                 format='%(asctime)s - %(name)s - %(levelname)s - [Parser] %(message)s'
+            )
+
+            set_cpu_affinity(
+                pod_start_core=self.config.cpu_alloc_start,
+                process_type="parser",
+                process_id=0,
+                fetchers_per_pod=self.config.num_fetcher_processes,
+                parsers_per_pod=self.config.num_parser_processes,
+                enabled=True
             )
             
             # Create and run the parser consumer
@@ -180,11 +190,21 @@ class CrawlerOrchestrator:
             import asyncio
             import logging
             from .parser_consumer import ParserConsumer
+            from .process_utils import set_cpu_affinity
             
             # Setup logging for the child process
             logging.basicConfig(
                 level=logging.INFO,
                 format=f'%(asctime)s - %(name)s - %(levelname)s - [Parser-{parser_id}] %(message)s'
+            )
+
+            set_cpu_affinity(
+                pod_start_core=self.config.cpu_alloc_start,
+                process_type="parser",
+                process_id=parser_id,
+                fetchers_per_pod=self.config.num_fetcher_processes,
+                parsers_per_pod=self.config.num_parser_processes,
+                enabled=True
             )
             
             # Create and run the parser consumer
@@ -248,6 +268,16 @@ class CrawlerOrchestrator:
             import asyncio
             import logging
             from .fetcher_process import run_fetcher_process
+            from .process_utils import set_cpu_affinity
+            
+            set_cpu_affinity(
+                pod_start_core=self.config.cpu_alloc_start,
+                process_type="fetcher",
+                process_id=fetcher_id,
+                fetchers_per_pod=self.config.num_fetcher_processes,
+                parsers_per_pod=self.config.num_parser_processes,
+                enabled=True
+            )
             
             # Run the fetcher
             run_fetcher_process(self.config, fetcher_id)
@@ -593,6 +623,15 @@ class CrawlerOrchestrator:
                 logger.info("Prometheus metrics server started on port 8001")
             
             # Create and start the local fetcher (fetcher 0) in this process
+            from .process_utils import set_cpu_affinity
+            set_cpu_affinity(
+                pod_start_core=self.config.cpu_alloc_start,
+                process_type="fetcher",
+                process_id=0,
+                fetchers_per_pod=self.config.num_fetcher_processes,
+                parsers_per_pod=self.config.num_parser_processes,
+                enabled=True
+            )
             self.local_fetcher = FetcherProcess(self.config, fetcher_id=0)
             local_fetcher_task = asyncio.create_task(self.local_fetcher.run())
             logger.info("Started local fetcher (fetcher 0) in orchestrator process")
@@ -684,10 +723,20 @@ class CrawlerOrchestrator:
                             import asyncio
                             import logging
                             from .parser_consumer import ParserConsumer
+                            from .process_utils import set_cpu_affinity
                             
                             logging.basicConfig(
                                 level=logging.INFO,
                                 format=f'%(asctime)s - %(name)s - %(levelname)s - [Parser-{parser_id}] %(message)s'
+                            )
+
+                            set_cpu_affinity(
+                                pod_start_core=self.config.cpu_alloc_start,
+                                process_type="parser",
+                                process_id=parser_id,
+                                fetchers_per_pod=self.config.num_fetcher_processes,
+                                parsers_per_pod=self.config.num_parser_processes,
+                                enabled=True
                             )
                             
                             consumer = ParserConsumer(self.config)

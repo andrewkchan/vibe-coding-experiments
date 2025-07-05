@@ -36,6 +36,12 @@ def parse_args(sys_args: Optional[List[str]] = None) -> argparse.Namespace:
         help=f"Directory to store database and crawled content (default: {DEFAULT_DATA_DIR})"
     )
     parser.add_argument(
+        "--cpu-alloc-start",
+        type=int,
+        default=0,
+        help="CPU core allocation start index"
+    )
+    parser.add_argument(
         "--exclude-file",
         type=Path,
         default=None,
@@ -133,6 +139,7 @@ class CrawlerConfig:
     seed_file: Path
     email: str
     data_dir: Path
+    cpu_alloc_start: int
     exclude_file: Optional[Path]
     fetcher_workers: int
     parser_workers: int
@@ -181,6 +188,7 @@ class CrawlerConfig:
             seed_file=Path(args.seed_file),
             email=args.email,
             data_dir=Path(args.data_dir),
+            cpu_alloc_start=args.cpu_alloc_start,
             exclude_file=Path(args.exclude_file) if args.exclude_file else None,
             fetcher_workers=args.fetcher_workers,
             parser_workers=args.parser_workers,
