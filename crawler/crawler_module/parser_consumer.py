@@ -206,15 +206,20 @@ class ParserConsumer:
             if parse_result.extracted_links:
                 logger.debug(f"Found {len(parse_result.extracted_links)} links on {url}")
                 
-                # Group links by target pod
-                links_by_pod: Dict[int, list] = {}
+                # Group links by domain, then by target pod
+                links_by_domain: Dict[str, list] = {}
                 for link in parse_result.extracted_links:
                     link_domain = extract_domain(link)
                     if link_domain:
-                        target_pod_id = self.pod_manager.get_pod_for_domain(link_domain)
-                        if target_pod_id not in links_by_pod:
-                            links_by_pod[target_pod_id] = []
-                        links_by_pod[target_pod_id].append(link)
+                        if link_domain not in links_by_domain:
+                            links_by_domain[link_domain] = []
+                        links_by_domain[link_domain].append(link)
+                links_by_pod: Dict[int, list] = {}
+                for domain, links in links_by_domain.items():
+                    target_pod_id = self.pod_manager.get_pod_for_domain(domain)
+                    if target_pod_id not in links_by_pod:
+                        links_by_pod[target_pod_id] = []
+                    links_by_pod[target_pod_id].extend(links)
                 
                 # Add links to appropriate frontiers
                 for target_pod_id, pod_links in links_by_pod.items():
