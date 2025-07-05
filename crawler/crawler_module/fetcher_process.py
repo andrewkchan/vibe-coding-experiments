@@ -298,7 +298,7 @@ class FetcherProcess:
         logger.info(f"Fetcher-{self.fetcher_id}: Starting {self.config.fetcher_workers} workers...")
         
         # Stagger worker startup
-        workers_per_batch = 100
+        workers_per_batch = 500
         startup_delay = 5
         
         for i in range(self.config.fetcher_workers):
