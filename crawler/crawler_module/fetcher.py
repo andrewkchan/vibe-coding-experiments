@@ -28,11 +28,14 @@ class FetchResult:
     is_redirect: bool = False
 
 class Fetcher:
-    def __init__(self, config: CrawlerConfig):
+    def __init__(self, config: CrawlerConfig, temp_fetcher_for_seeding: bool = False):
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
         # Standard timeout settings (can be made configurable)
-        self.timeout = aiohttp.ClientTimeout(total=90, connect=30, sock_read=60, sock_connect=30)
+        if temp_fetcher_for_seeding:
+            self.timeout = aiohttp.ClientTimeout(total=180, connect=60, sock_read=120, sock_connect=60)
+        else:
+            self.timeout = aiohttp.ClientTimeout(total=90, connect=30, sock_read=60, sock_connect=30)
         
         # Create trace config for detailed timing
         self.trace_config = TraceConfig()

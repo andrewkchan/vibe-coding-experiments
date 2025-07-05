@@ -9,7 +9,7 @@ from prometheus_client import generate_latest, CollectorRegistry, CONTENT_TYPE_L
 from prometheus_client import values
 
 # Check if we're in multiprocess mode
-PROMETHEUS_MULTIPROC_DIR = os.environ.get('prometheus_multiproc_dir')
+PROMETHEUS_MULTIPROC_DIR = '/tmp/prometheus_multiproc'
 
 # Create registry based on mode
 if PROMETHEUS_MULTIPROC_DIR:

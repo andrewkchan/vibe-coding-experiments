@@ -333,7 +333,7 @@ class CrawlerOrchestrator:
         await storage.init_db_schema()
         await storage.close()
         
-        temp_fetcher = Fetcher(self.config)
+        temp_fetcher = Fetcher(self.config, temp_fetcher_for_seeding = True)
         politeness = PolitenessEnforcer(self.config, self.redis_client, temp_fetcher)
         # Initialize frontier (also initializes politeness with manual exclusions, seeds, etc.)
         frontier = FrontierManager(self.config, politeness, self.redis_client)
@@ -619,8 +619,9 @@ class CrawlerOrchestrator:
             
             # Start Prometheus metrics server
             # In multiprocess mode, this aggregates metrics from all processes
-            if start_metrics_server(port=8001):
-                logger.info("Prometheus metrics server started on port 8001")
+            if self.config.cpu_alloc_start == 0:
+                if start_metrics_server(port=8001):
+                    logger.info("Prometheus metrics server started on port 8001")
             
             # Create and start the local fetcher (fetcher 0) in this process
             from .process_utils import set_cpu_affinity
