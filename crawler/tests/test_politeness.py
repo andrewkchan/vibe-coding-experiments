@@ -25,7 +25,7 @@ async def politeness_enforcer(
     mock_fetcher: MagicMock
 ) -> PolitenessEnforcer:
     test_config.data_dir.mkdir(parents=True, exist_ok=True)
-    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
+    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher, pod_id=0)
     await pe.initialize()
     return pe
 
@@ -33,7 +33,7 @@ async def politeness_enforcer(
 @pytest.mark.asyncio
 async def test_load_manual_exclusions_no_file(test_config: CrawlerConfig, redis_test_client: redis.Redis, mock_fetcher: MagicMock):
     test_config.exclude_file = None
-    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
+    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher, pod_id=0)
     
     # Should initialize without error
     await pe.initialize()
@@ -54,7 +54,7 @@ async def test_load_manual_exclusions_with_file(
     with open(exclude_file_path, 'w') as f:
         f.write(mock_file_content)
 
-    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
+    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher, pod_id=0)
     await pe.initialize()
     
     # Verify domains are marked as excluded in Redis
@@ -262,7 +262,7 @@ async def test_is_url_allowed_by_robots(politeness_enforcer: PolitenessEnforcer,
 async def test_is_url_allowed_seeded_urls_only(redis_test_client: redis.Redis, mock_fetcher: MagicMock, test_config: CrawlerConfig):
     """Test that non-seeded domains are excluded when seeded_urls_only is True."""
     test_config.seeded_urls_only = True
-    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher)
+    pe = PolitenessEnforcer(config=test_config, redis_client=redis_test_client, fetcher=mock_fetcher, pod_id=0)
     await pe.initialize()
     
     seeded_domain = "seeded.com"

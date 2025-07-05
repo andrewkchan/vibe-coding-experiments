@@ -16,10 +16,11 @@ class PolitenessEnforcer:
     last fetch times, and manual exclusions.
     """
     
-    def __init__(self, config: CrawlerConfig, redis_client, fetcher: Fetcher):
+    def __init__(self, config: CrawlerConfig, redis_client, fetcher: Fetcher, pod_id: int):
         self.config = config
         self.redis = redis_client
         self.fetcher = fetcher
+        self.pod_id = pod_id
         self.robots_parsers_max_size = 100_000
         self.robots_parsers: LRUCache[str, RobotFileParser] = LRUCache(self.robots_parsers_max_size)
         
@@ -121,12 +122,12 @@ class PolitenessEnforcer:
         fetched_robots_content = ""
         try:
             # Try HTTPS first as it's more common now
-            fetch_result = await self.fetcher.fetch_url(f"https://{domain}/robots.txt", is_robots_txt=True)
+            fetch_result = await self.fetcher.fetch_url(f"https://{domain}/robots.txt", self.pod_id, is_robots_txt=True)
             if fetch_result.status_code == 200 and fetch_result.text_content:
                 fetched_robots_content = fetch_result.text_content
             else:
                 # Fallback to HTTP
-                fetch_result = await self.fetcher.fetch_url(f"http://{domain}/robots.txt", is_robots_txt=True)
+                fetch_result = await self.fetcher.fetch_url(f"http://{domain}/robots.txt", self.pod_id, is_robots_txt=True)
                 if fetch_result.status_code == 200 and fetch_result.text_content:
                     fetched_robots_content = fetch_result.text_content
         except Exception as e:

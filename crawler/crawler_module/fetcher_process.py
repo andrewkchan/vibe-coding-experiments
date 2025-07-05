@@ -25,10 +25,7 @@ from .metrics import (
     backpressure_events_counter,
     fetch_duration_histogram,
     active_workers_gauge,
-    fetch_counter,
     fetch_error_counter,
-    parse_queue_size_gauge,
-    content_size_histogram,
     fetcher_pages_per_second_gauge,
     process_memory_usage_gauge,
     process_open_fds_gauge,
@@ -91,7 +88,7 @@ class FetcherProcess:
         
         # Initialize components with pod-specific Redis
         self.storage = StorageManager(self.config, self.redis_client)
-        self.politeness = PolitenessEnforcer(self.config, self.redis_client, self.fetcher)
+        self.politeness = PolitenessEnforcer(self.config, self.redis_client, self.fetcher, self.pod_id)
         self.frontier = FrontierManager(self.config, self.politeness, self.redis_client, pod_id=self.pod_id)
         
         logger.info(f"Fetcher-{self.fetcher_id}: Async components initialized for pod {self.pod_id}")
@@ -120,7 +117,7 @@ class FetcherProcess:
 
                     # Track fetch duration
                     fetch_start_time = time.time()
-                    fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl)
+                    fetch_result: FetchResult = await self.fetcher.fetch_url(url_to_crawl, self.pod_id)
                     fetch_duration = time.time() - fetch_start_time
                     fetch_duration_histogram.labels(
                         pod_id=str(self.pod_id),

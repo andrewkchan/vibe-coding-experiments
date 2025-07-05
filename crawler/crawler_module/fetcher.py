@@ -128,6 +128,7 @@ class Fetcher:
     async def fetch_url(
         self, 
         url: str,
+        pod_id: int,
         is_robots_txt: bool = False,
         max_redirects: int = 5
     ) -> FetchResult:
@@ -136,7 +137,7 @@ class Fetcher:
         
         # Track fetch attempt
         fetch_type = 'robots_txt' if is_robots_txt else 'page'
-        fetch_counter.labels(fetch_type=fetch_type).inc()
+        fetch_counter.labels(fetch_type=fetch_type, pod_id=pod_id).inc()
         
         # Create trace context with fetch type
         trace_request_ctx = {'fetch_type': fetch_type}
@@ -199,7 +200,7 @@ class Fetcher:
 
                 if status_code >= 400:
                     logger.warning(f"HTTP error {status_code} for {actual_final_url} (from {url})")
-                    fetch_error_counter.labels(error_type=f'http_{status_code}', fetch_type=fetch_type).inc()
+                    fetch_error_counter.labels(error_type=f'http_{status_code}', fetch_type=fetch_type, pod_id=pod_id).inc()
                     return FetchResult(
                         initial_url=url,
                         final_url=actual_final_url,
@@ -223,17 +224,17 @@ class Fetcher:
 
         except aiohttp.ClientResponseError as e:
             logger.error(f"ClientResponseError for {url}: {e.message} (status: {e.status})", exc_info=False)
-            fetch_error_counter.labels(error_type='client_response_error', fetch_type=fetch_type).inc()
+            fetch_error_counter.labels(error_type='client_response_error', fetch_type=fetch_type, pod_id=pod_id).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=e.status, error_message=str(e.message))
         except aiohttp.ClientConnectionError as e:
             logger.error(f"ClientConnectionError for {url}: {e}", exc_info=False)
-            fetch_error_counter.labels(error_type='connection_error', fetch_type=fetch_type).inc()
+            fetch_error_counter.labels(error_type='connection_error', fetch_type=fetch_type, pod_id=pod_id).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=901, error_message=f"Connection error: {e}") # Custom status for connection error
         except asyncio.TimeoutError:
             logger.error(f"Timeout for {url}", exc_info=False)
-            fetch_error_counter.labels(error_type='timeout', fetch_type=fetch_type).inc()
+            fetch_error_counter.labels(error_type='timeout', fetch_type=fetch_type, pod_id=pod_id).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=902, error_message="Request timed out") # Custom status for timeout
         except Exception as e:
             logger.error(f"Generic error fetching {url}: {e}")
-            fetch_error_counter.labels(error_type='generic_error', fetch_type=fetch_type).inc()
+            fetch_error_counter.labels(error_type='generic_error', fetch_type=fetch_type, pod_id=pod_id).inc()
             return FetchResult(initial_url=url, final_url=actual_final_url, status_code=900, error_message=str(e)) # Custom status for other errors

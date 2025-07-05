@@ -280,7 +280,7 @@ class CrawlerOrchestrator:
             
             # Initialize frontier for this pod
             temp_fetcher = Fetcher(self.config)
-            politeness = PolitenessEnforcer(self.config, redis_client, temp_fetcher)
+            politeness = PolitenessEnforcer(self.config, redis_client, temp_fetcher, pod_id)
             frontier = FrontierManager(self.config, politeness, redis_client, pod_id=pod_id)
             await frontier.initialize_frontier()
             

@@ -93,7 +93,7 @@ class ParserConsumer:
         # Initialize frontiers for all pods (for cross-pod writes)
         for target_pod_id in range(self.config.num_pods):
             redis_client = await self.pod_manager.get_redis_client(target_pod_id, binary=False)
-            politeness = PolitenessEnforcer(self.config, redis_client, self.fetcher)
+            politeness = PolitenessEnforcer(self.config, redis_client, self.fetcher, target_pod_id)
             frontier = FrontierManager(
                 self.config, 
                 politeness,
