@@ -29,19 +29,20 @@ def monitor_process(p, shard_i):
         cleanup()
 
 # Configuration
-fetchers_per_pod = 4
-parsers_per_pod = 3
+fetchers_per_pod = 9
+parsers_per_pod = 6
 procs_per_pod = fetchers_per_pod + parsers_per_pod
 
 # Start all subprocesses
-for shard_i in range(24):
+for shard_i in range(12):
     cmd = (
       f"python -u main.py " + 
       f"--seed-file top-1M-domain-shards/top-1M-domains-shard-{shard_i}.txt " + 
+    #   f"--log-level DEBUG " +
       f"--redis-port {6379 + shard_i} " +
-      f"--email fruitsaladisland@gmail.com --data-dir /mnt/data_{shard_i//2} " + 
+      f"--email fruitsaladisland@gmail.com --data-dir /mnt/data_{shard_i % 12} " + 
       f"--cpu-alloc-start {procs_per_pod * shard_i} " + 
-    #   f"--resume " + 
+      f"--resume " + 
       f"--fetcher-workers 6000 " + 
       f"--num-fetcher-processes {fetchers_per_pod} --num-parser-processes {parsers_per_pod} " + 
       f"--seeded-urls-only 2>&1 " + 
