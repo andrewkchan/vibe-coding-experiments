@@ -19,9 +19,9 @@ def setup_multiprocess_metrics():
     os.environ['prometheus_multiproc_dir'] = str(metrics_dir)
     # # We'll set the parent process ID later in the orchestrator
     
-    # # Clean up any leftover metric files
-    # for f in metrics_dir.glob('*.db'):
-    #     f.unlink()
+    # Clean up any leftover metric files
+    for f in metrics_dir.glob('*.db'):
+        f.unlink()
     
     logging.info(f"Pre-configured Prometheus multiprocess mode with directory: {metrics_dir}")
 
