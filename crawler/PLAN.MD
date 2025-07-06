@@ -142,8 +142,8 @@ The crawler uses a hybrid of Redis and the file system for persistence.
     *   `is_excluded`: Flag for manually excluded domains.
 *   **Frontier Lists:** `frontier:{domain}`
     *   Lists containing URLs to crawl for each domain in "url|depth" format.
-*   **Domain Queue (List):** `domains:queue`
-    *   Single queue that contains all domains with URLs to crawl.
+*   **Domain Queue (Sorted set):** `domains:queue`
+    *   Single sorted set that contains all domains with URLs to crawl. Keys are domains and values are the next fetch time.
 *   **"Seen" URLs (Bloom Filter):** `seen:bloom`
     *   A probabilistic data structure used for fast, memory-efficient de-duplication of all URLs ever encountered. This prevents re-adding URLs to the frontier.
 *   **"Visited" URLs (Hashes):** `visited:{url_hash}`
