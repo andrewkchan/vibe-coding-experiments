@@ -33,6 +33,7 @@ def test_config(tmp_path: Path) -> CrawlerConfig:
     return CrawlerConfig(
         seed_file=seed_file,
         data_dir=data_dir,
+        cpu_alloc_start=0,
         fetcher_workers=1,
         parser_workers=1,
         num_fetcher_processes=1,

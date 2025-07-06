@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 class FrontierTestConfig:
     data_dir: Path
     seed_file: Path
+    cpu_alloc_start: int = 0
     email: str = "frontier_test@example.com"
     exclude_file: Path | None = None
     fetcher_workers: int = 1
