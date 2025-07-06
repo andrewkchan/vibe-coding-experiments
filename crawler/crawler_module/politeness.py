@@ -19,12 +19,13 @@ class PolitenessEnforcer:
     last fetch times, and manual exclusions.
     """
     
-    def __init__(self, config: CrawlerConfig, redis_client, fetcher: Fetcher):
+    def __init__(self, config: CrawlerConfig, redis_client, fetcher: Fetcher, min_crawl_delay_seconds: int = MIN_CRAWL_DELAY_SECONDS):
         self.config = config
         self.redis = redis_client
         self.fetcher = fetcher
         self.robots_parsers_max_size = 100_000
         self.robots_parsers: LRUCache[str, RobotFileParser] = LRUCache(self.robots_parsers_max_size)
+        self.min_crawl_delay_seconds = min_crawl_delay_seconds
         
         # In-memory exclusion cache (LRU-style)
         self.exclusion_cache_max_size = 100_000
@@ -234,10 +235,10 @@ class PolitenessEnforcer:
                     logger.debug(f"Using {delay}s crawl delay from robots.txt for {domain} (wildcard agent)")
         
         if delay is None:
-            logger.debug(f"No crawl delay specified in robots.txt for {domain}. Using default: {MIN_CRAWL_DELAY_SECONDS}s")
-            return float(MIN_CRAWL_DELAY_SECONDS)
+            logger.debug(f"No crawl delay specified in robots.txt for {domain}. Using default: {self.min_crawl_delay_seconds}s")
+            return float(self.min_crawl_delay_seconds)
         
-        return max(float(delay), float(MIN_CRAWL_DELAY_SECONDS))
+        return max(float(delay), float(self.min_crawl_delay_seconds))
     
     async def can_fetch_domain_now(self, domain: str) -> bool:
         """Checks if the domain can be fetched now based on crawl delay."""
@@ -256,8 +257,8 @@ class PolitenessEnforcer:
         current_time = int(time.time())
         return current_time >= next_fetch_timestamp
     
-    async def record_domain_fetch_attempt(self, domain: str):
-        """Records that we are about to fetch from a domain."""
+    async def record_domain_fetch_attempt(self, domain: str) -> int:
+        """Records that we are about to fetch from a domain and returns the next fetch time."""
         try:
             current_time = int(time.time())
             crawl_delay = await self.get_crawl_delay(domain)
@@ -267,5 +268,8 @@ class PolitenessEnforcer:
             await self.redis.hset(domain_key, 'next_fetch_time', str(next_fetch_time))
             
             logger.debug(f"Recorded fetch attempt for {domain}. Next fetch allowed at: {next_fetch_time}")
+            return next_fetch_time
         except Exception as e:
-            logger.error(f"Error recording fetch attempt for {domain}: {e}") 
+            logger.error(f"Error recording fetch attempt for {domain}: {e}")
+            # Return a safe default - current time plus minimum delay
+            return int(time.time()) + self.min_crawl_delay_seconds 

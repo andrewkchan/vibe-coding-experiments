@@ -76,9 +76,10 @@ def mock_politeness_enforcer_for_frontier() -> MagicMock:
     # Default mock behaviors for permissive testing
     mock_pe.is_url_allowed = AsyncMock(return_value=True)
     mock_pe.can_fetch_domain_now = AsyncMock(return_value=True)
-    mock_pe.record_domain_fetch_attempt = AsyncMock()
+    mock_pe.record_domain_fetch_attempt = AsyncMock(return_value=int(time.time()) + 1)  # Return future time
     mock_pe.get_crawl_delay = AsyncMock(return_value=0.0)
     mock_pe._load_manual_exclusions = AsyncMock()
+    mock_pe.initialize = AsyncMock()  # Add mock for initialize method
     return mock_pe
 
 @pytest_asyncio.fixture
@@ -306,10 +307,10 @@ async def test_redis_list_persistence(
     # Test that we can retrieve all URLs by iterating
     all_retrieved_urls = [url_retrieved[0]]  # Start with the one we already got
     
-    while True:
+    while not await frontier_run1.is_empty():
         next_url = await frontier_run1.get_next_url()
         if next_url is None:
-            break
+            continue
         all_retrieved_urls.append(next_url[0])
     
     # Verify we got all the URLs we added
@@ -376,19 +377,37 @@ async def test_domain_queue(
     await frontier_manager.add_urls_batch(urls)
     
     # Check domain queue
-    queued_domains = await redis_test_client.lrange('domains:queue', 0, -1)
+    # Get all domains with scores
+    queued_domains = await redis_test_client.zrange('domains:queue', 0, -1, withscores=True)
     
-    # Convert to set to ignore order and potential duplicates
-    assert set(queued_domains) == {"domain1.com", "domain2.com"}
+    # Extract just the domain names
+    domain_names = {domain for domain, score in queued_domains}
+    assert domain_names == {"domain1.com", "domain2.com"}
+    
+    # Verify all domains have valid scores (timestamps)
+    current_time = time.time()
+    for domain, score in queued_domains:
+        assert isinstance(score, (int, float))
+        assert score > 0
+        assert score <= current_time + 1  # Allow 1 second buffer
     
     # Get a URL from a domain
     result = await frontier_manager.get_next_url()
     assert result is not None
     url, domain, _, _ = result
     
-    # After fetching, domain should be back in queue
-    updated_queue = await redis_test_client.lrange('domains:queue', 0, -1)
-    assert domain in updated_queue  # Domain should be at the end
+    # After fetching, domain should be back in queue with updated score
+    await asyncio.sleep(0.1)  # Brief wait for async operations
+    updated_queue = await redis_test_client.zrange('domains:queue', 0, -1, withscores=True)
+    domain_dict = dict(updated_queue)
+    
+    # The domain should still be in the queue (it was put back after fetch)
+    assert domain in domain_dict
+    
+    # The score should be updated to a future time (politeness delay)
+    # Note: The exact score depends on the politeness delay, but it should be in the future
+    new_score = domain_dict[domain]
+    assert new_score > current_time  # Should have a future fetch time
     
     logger.info("Domain queue test passed.")
 
@@ -461,6 +480,10 @@ async def test_atomic_domain_claiming_high_concurrency(
     # Allow for a small number of false positives from the bloom filter
     assert total_urls - added < 5, f"Expected close to {total_urls} URLs to be added, but only got {added}. This might indicate a bloom filter issue."
     
+    # Verify domains are in ZSET with proper scores
+    domains_in_queue = await redis_test_client.zcard('domains:queue')
+    assert domains_in_queue == num_domains, f"Expected {num_domains} domains in queue, got {domains_in_queue}"
+    
     # Create multiple frontier managers (simulating workers)
     num_workers = 50
     workers = []
@@ -478,17 +501,22 @@ async def test_atomic_domain_claiming_high_concurrency(
     async def worker_task(worker_id: int, frontier: FrontierManager, max_claims: int):
         """Worker task that claims URLs from the frontier."""
         claims = 0
-        while claims < max_claims:
+        empty_attempts = 0
+        max_empty_attempts = 100  # Prevent infinite loops
+        
+        while claims < max_claims and empty_attempts < max_empty_attempts:
             try:
                 result = await frontier.get_next_url()
                 if result is None:
                     # No URLs available, try again after brief wait
                     await asyncio.sleep(0.01)
+                    empty_attempts += 1
                     continue
                     
                 url, domain, _, depth = result
                 worker_claims[worker_id].append(url)
                 claims += 1
+                empty_attempts = 0  # Reset empty attempts counter
                 
                 # Simulate some work
                 await asyncio.sleep(0.001)
@@ -660,10 +688,10 @@ async def test_url_filtering_in_add_urls_batch(
     
     # Verify the correct URLs were added by retrieving them
     retrieved_urls = []
-    while True:
+    while not await frontier_manager.is_empty():
         result = await frontier_manager.get_next_url()
         if result is None:
-            break
+            continue
         retrieved_urls.append(result[0])
     
     expected_urls = {
@@ -717,14 +745,14 @@ async def test_url_filtering_in_get_next_url(
     )
     
     # Add domain to queue
-    await redis_test_client.rpush('domains:queue', domain)
+    await redis_test_client.zadd('domains:queue', {domain: int(time.time())})
     
     # Get URLs and verify only text URLs are returned
     retrieved_urls = []
-    while True:
+    while not await fm.is_empty():
         result = await fm.get_next_url()
         if result is None:
-            break
+            continue
         retrieved_urls.append(result[0])
     
     expected_urls = [

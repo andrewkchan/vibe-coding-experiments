@@ -7,6 +7,7 @@ import logging
 from typing import Optional, Tuple, List, Dict
 import asyncio
 import redis.asyncio as redis
+import time
 
 from .config import CrawlerConfig
 from .utils import extract_domain, normalize_url
@@ -241,9 +242,10 @@ class FrontierManager:
                 logger.debug(f"Adding URL to frontier with domain {domain}: {url}")
                 urls_by_domain[domain].append((url, depth))
         
-        # Add to bloom filter and frontier lists atomically
+        # Add everything in a single pipeline
         pipe = self.redis.pipeline()
         added_count = 0
+        current_time = int(time.time())
         
         for domain, domain_urls in urls_by_domain.items():
             frontier_key = f"frontier:{domain}"
@@ -261,25 +263,36 @@ class FrontierManager:
             # Initialize domain metadata
             pipe.hsetnx(domain_key, 'is_seeded', '0')
             
-            # Add domain to queue
-            pipe.rpush('domains:queue', domain)
+            # Add domain to queue with LT option
+            # This only updates the score if the new score is less than the existing one
+            # For new domains, it will add them with current_time as the score
+            pipe.execute_command('ZADD', 'domains:queue', 'LT', current_time, domain)
         
         await pipe.execute()
         return added_count
     
     async def get_next_url(self) -> Optional[Tuple[str, str, int, int]]:
         """Get next URL to crawl."""
-        # Pop domain from queue
-        domain = await self.redis.lpop('domains:queue')
+        current_time = int(time.time())
         
-        if not domain:
+        # Pop domain with lowest score (earliest next_fetch_time) that's ready
+        # ZPOPMIN returns [(member, score)] or []
+        result = await self.redis.zpopmin('domains:queue', 1)
+        if not result:
+            logger.debug("No domains in queue")
+            return None
+        
+        domain, score = result[0]
+        next_fetch_time = int(score)
+        
+        # If domain is not ready yet, put it back and return None
+        if next_fetch_time > current_time:
+            await self.redis.zadd('domains:queue', {domain: next_fetch_time})
+            logger.debug(f"Domain {domain} not ready yet, putting back in queue with score {next_fetch_time}")
             return None
         
         try:
-            # Check politeness
-            if not await self.politeness.can_fetch_domain_now(domain):
-                return None
-            
+            # Domain is ready, try to get a URL
             # Keep trying URLs from this domain until we find a valid one
             while True:
                 # Pop URL from domain's frontier (RPOP for FIFO with LPUSH)
@@ -287,7 +300,8 @@ class FrontierManager:
                 url_data = await self.redis.rpop(frontier_key)
                 
                 if not url_data:
-                    # Domain has no URLs left
+                    # Domain has no URLs left - don't put it back in queue
+                    logger.debug(f"Domain {domain} has no URLs left")
                     return None
                 
                 # Parse URL data
@@ -306,16 +320,22 @@ class FrontierManager:
                         logger.debug(f"URL {url} disallowed by politeness rules")
                         continue
                     
-                    # Record fetch attempt
-                    await self.politeness.record_domain_fetch_attempt(domain)
+                    # Record fetch attempt and get new next_fetch_time
+                    new_next_fetch_time = await self.politeness.record_domain_fetch_attempt(domain)
+                    
+                    # Put domain back in queue with updated score
+                    if new_next_fetch_time:
+                        await self.redis.zadd('domains:queue', {domain: new_next_fetch_time})
                     
                     # Return URL (dummy ID for compatibility)
+                    logger.debug(f"Returning URL {url} from domain {domain} at depth {depth_str}")
                     return (url, domain, -1, int(depth_str))
             
-        finally:
-            # Always put domain back at end of queue
-            if domain:
-                await self.redis.rpush('domains:queue', domain)
+        except Exception as e:
+            logger.error(f"Error getting URL for domain {domain}: {e}")
+            # Put domain back with its original score on error
+            await self.redis.zadd('domains:queue', {domain: next_fetch_time})
+            raise
     
     async def count_frontier(self) -> int:
         """Count URLs in frontier - now a simple Redis operation."""
@@ -341,5 +361,5 @@ class FrontierManager:
     
     async def is_empty(self) -> bool:
         """Check if frontier is empty."""
-        count = await self.redis.llen('domains:queue')
+        count = await self.redis.zcard('domains:queue')
         return count == 0 

@@ -838,14 +838,14 @@ class CrawlerOrchestrator:
                 logger.info(f"Status: {', '.join(status_parts)}")
                 
                 # Check if frontier is empty by checking domain queue
-                queue_size = await self.redis_client.llen('domains:queue')
+                queue_size = await self.redis_client.zcard('domains:queue')
                 
                 if queue_size == 0 and self.pages_crawled_count > 0:
                     logger.info(f"Frontier is empty. Pages crawled: {self.pages_crawled_count}. Monitoring...")
                     await asyncio.sleep(EMPTY_FRONTIER_SLEEP_SECONDS * 2)
                     
                     # Re-check after wait
-                    queue_size = await self.redis_client.llen('domains:queue')
+                    queue_size = await self.redis_client.zcard('domains:queue')
                     
                     if queue_size == 0:
                         logger.info("Frontier confirmed empty after wait. Signaling shutdown.")
