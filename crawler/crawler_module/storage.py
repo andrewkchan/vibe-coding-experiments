@@ -62,7 +62,9 @@ class StorageManager:
         if not text_content:  # Do not save if no text content
             return None
         
-        file_path = self.content_dir / f"{url_hash}.txt"
+        # Use a 3-level hierarchical file path based on the URL hash to avoid
+        # running into limits on the number of files in a directory
+        file_path = self.content_dir / f"{url_hash[0:2]}" / f"{url_hash[2:4]}" / f"{url_hash[4:]}.txt"
         try:
             async with aiofiles.open(file_path, mode='w', encoding='utf-8') as f:
                 await f.write(text_content)
