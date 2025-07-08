@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 MAX_CONTENT_SIZE_BYTES = 100 * 1024 * 1024 # Content over 100MB is discarded to avoid memory issues
 MAX_PAGE_LENGTH = 250 * 1024 # Truncate page content to this before parsing
-MAX_ROBOTS_LENGTH = 100 * 1024
+MAX_ROBOTS_LENGTH = 500 * 1024
 
 @dataclass
 class FetchResult:
