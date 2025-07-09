@@ -3,6 +3,30 @@
 import asyncio
 import logging
 import signal
+import resource
+import os
+from pathlib import Path
+
+# Setup multiprocess metrics environment BEFORE importing any crawler modules
+# This is crucial for Prometheus multiprocess mode to work correctly
+def setup_multiprocess_metrics():
+    """Setup environment for multiprocess metrics."""
+    # Create directory for multiprocess metrics
+    metrics_dir = Path('/tmp/prometheus_multiproc')
+    metrics_dir.mkdir(exist_ok=True)
+    
+    # # Set environment variables for multiprocess mode
+    os.environ['prometheus_multiproc_dir'] = str(metrics_dir)
+    # # We'll set the parent process ID later in the orchestrator
+    
+    # Clean up any leftover metric files
+    for f in metrics_dir.glob('*.db'):
+        f.unlink()
+    
+    logging.info(f"Pre-configured Prometheus multiprocess mode with directory: {metrics_dir}")
+
+# Setup multiprocess before any imports
+setup_multiprocess_metrics()
 
 from crawler_module.config import parse_args, CrawlerConfig
 from crawler_module.orchestrator import CrawlerOrchestrator
@@ -16,9 +40,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__) # Get a logger for main
 
 async def main():
-    config: CrawlerConfig = parse_args()
+    config = CrawlerConfig.from_args()
 
-    # Reconfigure logging based on parsed config
+    # Reconfigure logging based on parsed log level
+    # This allows the --log-level argument to control the verbosity
     # Get the root logger and remove existing handlers to avoid duplicate messages
     # if basicConfig was called before (e.g. by imports)
     root_logger = logging.getLogger()
@@ -32,8 +57,13 @@ async def main():
         # filename=config.data_dir / "crawler.log" # Optional: log to file
     )
     
-    logger.info(f"Logging reconfigured to level: {config.log_level.upper()}")
+    logger.info(f"Logging reconfigured to level: {config.log_level}")
     logger.info("Starting crawler...")
+
+    # Account for multiple fetcher processes when checking file descriptor limits
+    total_workers = config.fetcher_workers * config.num_fetcher_processes
+    if 3*total_workers > resource.getrlimit(resource.RLIMIT_OFILE)[0]:
+        raise ValueError(f"3x Total workers (3x{total_workers}) exceeds the number of open files limit ({resource.getrlimit(resource.RLIMIT_OFILE)[0]}). Suggest increasing the limit with 'ulimit -n <new_limit>'.")
 
     orchestrator = CrawlerOrchestrator(config)
 

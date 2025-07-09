@@ -1,8 +1,7 @@
 import pytest
-from pathlib import Path
-from urllib.parse import urlparse
 
-from crawler_module.utils import normalize_url, extract_domain
+from crawler_module.utils import normalize_url_parts, extract_domain
+from urllib.parse import urlparse, urlunparse
 
 # Test cases for normalize_url
 # (original_url, expected_normalized_url)
@@ -25,7 +24,7 @@ normalize_test_cases = [
 
 @pytest.mark.parametrize("original,expected", normalize_test_cases)
 def test_normalize_url(original, expected):
-    assert normalize_url(original) == expected
+    assert urlunparse(normalize_url_parts(urlparse(original.strip()))) == expected
 
 # Test cases for extract_domain
 # (url, expected_domain)
@@ -50,8 +49,8 @@ def test_extract_domain(url, expected):
 
 def test_normalize_url_idempotency():
     url = "http://Example.com/Some_Path/?Query=Test#Fragment"
-    normalized1 = normalize_url(url)
-    normalized2 = normalize_url(normalized1)
+    normalized1 = urlunparse(normalize_url_parts(urlparse(url.strip())))
+    normalized2 = urlunparse(normalize_url_parts(urlparse(normalized1.strip())))
     assert normalized1 == normalized2, "Normalizing an already normalized URL should yield the same URL"
 
 # Clean up the original utils.py by removing its __main__ block 

@@ -2,29 +2,19 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, List
 
 DEFAULT_DATA_DIR = "./crawler_data"
-DEFAULT_MAX_WORKERS = 20
+DEFAULT_FETCHER_WORKERS = 500
+DEFAULT_PARSER_WORKERS = 80
+DEFAULT_NUM_FETCHER_PROCESSES = 2
+DEFAULT_NUM_PARSER_PROCESSES = 1
 DEFAULT_LOG_LEVEL = "INFO"
-DEFAULT_DB_TYPE = "sqlite"
+DEFAULT_REDIS_HOST = "localhost"
+DEFAULT_REDIS_PORT = 6379
+DEFAULT_REDIS_DB = 0
 
-@dataclass
-class CrawlerConfig:
-    seed_file: Path
-    email: str
-    data_dir: Path
-    exclude_file: Path | None
-    max_workers: int
-    max_pages: int | None
-    max_duration: int | None # in seconds
-    log_level: str
-    resume: bool
-    user_agent: str # Will be constructed
-    seeded_urls_only: bool
-    db_type: str # sqlite, postgresql, or redis
-    db_url: str | None # PostgreSQL connection URL
-
-def parse_args() -> CrawlerConfig:
+def parse_args(sys_args: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="An experimental web crawler.")
 
     parser.add_argument(
@@ -46,16 +36,40 @@ def parse_args() -> CrawlerConfig:
         help=f"Directory to store database and crawled content (default: {DEFAULT_DATA_DIR})"
     )
     parser.add_argument(
+        "--cpu-alloc-start",
+        type=int,
+        default=0,
+        help="CPU core allocation start index"
+    )
+    parser.add_argument(
         "--exclude-file",
         type=Path,
         default=None,
         help="Optional path to a file of domains to exclude (newline-separated)."
     )
     parser.add_argument(
-        "--max-workers",
+        "--fetcher-workers",
         type=int,
-        default=DEFAULT_MAX_WORKERS,
-        help=f"Number of concurrent fetcher tasks (default: {DEFAULT_MAX_WORKERS})"
+        default=DEFAULT_FETCHER_WORKERS,
+        help=f"Number of concurrent fetcher tasks per fetcher process (default: {DEFAULT_FETCHER_WORKERS})"
+    )
+    parser.add_argument(
+        "--parser-workers",
+        type=int,
+        default=DEFAULT_PARSER_WORKERS,
+        help=f"Number of concurrent parser tasks per parser process (default: {DEFAULT_PARSER_WORKERS})"
+    )
+    parser.add_argument(
+        "--num-fetcher-processes",
+        type=int,
+        default=DEFAULT_NUM_FETCHER_PROCESSES,
+        help=f"Number of fetcher processes to run (default: {DEFAULT_NUM_FETCHER_PROCESSES})"
+    )
+    parser.add_argument(
+        "--num-parser-processes",
+        type=int,
+        default=DEFAULT_NUM_PARSER_PROCESSES,
+        help=f"Number of parser processes to run (default: {DEFAULT_NUM_PARSER_PROCESSES})"
     )
     parser.add_argument(
         "--max-pages",
@@ -67,7 +81,7 @@ def parse_args() -> CrawlerConfig:
         "--max-duration",
         type=int,
         default=None,
-        help="Maximum duration for the crawl in seconds."
+        help="Maximum duration to run the crawl in seconds. Stops after this time."
     )
     parser.add_argument(
         "--log-level",
@@ -79,65 +93,115 @@ def parse_args() -> CrawlerConfig:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Attempt to resume from existing data in data-dir. If not set and data-dir exists, crawler may exit."
+        help="Attempt to resume a previous crawl from the data in data_dir.",
     )
     parser.add_argument(
         "--seeded-urls-only",
         action="store_true",
-        help="Only crawl seeded URLs."
+        help="Only crawl URLs that were provided in the seed file. Do not crawl any discovered URLs.",
     )
     parser.add_argument(
-        "--db-type",
+        "--redis-host",
         type=str,
-        default=DEFAULT_DB_TYPE,
-        choices=["sqlite", "postgresql", "redis"],
-        help=f"Database backend to use (default: {DEFAULT_DB_TYPE}). Use 'postgresql' for high concurrency, 'redis' for hybrid Redis+file storage."
+        default="localhost",
+        help="Redis host."
     )
     parser.add_argument(
-        "--db-url",
-        type=str,
-        default=None,
-        help="PostgreSQL connection URL (required if db-type is postgresql). Example: postgresql://user:pass@localhost/dbname"
-    )
-    parser.add_argument(
-        "--pg-pool-size",
+        "--redis-port",
         type=int,
+        default=6379,
+        help="Redis port."
+    )
+    parser.add_argument(
+        "--redis-db",
+        type=int,
+        default=0,
+        help="Redis database."
+    )
+    parser.add_argument(
+        "--redis-password",
+        type=str,
         default=None,
-        help="PostgreSQL connection pool size override. If not set, automatically calculated based on worker count."
+        help="Redis password."
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(sys_args)
     
-    # Validate database configuration
-    if args.db_type == "postgresql" and not args.db_url:
-        parser.error("--db-url is required when using PostgreSQL (--db-type=postgresql)")
-    
-    # Store pool size override in environment variable if provided
-    if args.db_type == "postgresql" and args.pg_pool_size:
-        import os
-        os.environ['CRAWLER_PG_POOL_SIZE'] = str(args.pg_pool_size)
-    
-    # Redis doesn't require db_url as it uses default localhost:6379
-    if args.db_type == "redis" and args.db_url:
-        parser.error("--db-url is not used with Redis backend (uses localhost:6379 by default)")
-    
-    # Construct User-Agent
-    # Example: MyEducationalCrawler/1.0 (+http://example.com/crawler-info; mailto:user@example.com)
-    # For now, a simpler version. We can make the URL part configurable later if needed.
-    user_agent = f"MyEducationalCrawler/1.0 (mailto:{args.email})"
+    # Validation for email
+    if not args.email:
+        parser.error("--email is required.")
+        
+    return args
 
-    return CrawlerConfig(
-        seed_file=args.seed_file,
-        email=args.email,
-        data_dir=args.data_dir,
-        exclude_file=args.exclude_file,
-        max_workers=args.max_workers,
-        max_pages=args.max_pages,
-        max_duration=args.max_duration,
-        log_level=args.log_level.upper(), # Ensure log level is uppercase for logging module
-        resume=args.resume,
-        user_agent=user_agent,
-        seeded_urls_only=args.seeded_urls_only,
-        db_type=args.db_type,
-        db_url=args.db_url
-    ) 
+@dataclass
+class CrawlerConfig:
+    """Typed configuration class for the web crawler."""
+    seed_file: Path
+    email: str
+    data_dir: Path
+    cpu_alloc_start: int
+    exclude_file: Optional[Path]
+    fetcher_workers: int
+    parser_workers: int
+    num_fetcher_processes: int
+    num_parser_processes: int
+    max_pages: Optional[int]
+    max_duration: Optional[int]
+    log_level: str
+    resume: bool
+    seeded_urls_only: bool
+    user_agent: str
+    # Redis-specific configuration
+    redis_host: str
+    redis_port: int
+    redis_db: int
+    redis_password: Optional[str]
+
+    def get_redis_connection_kwargs(self) -> dict:
+        """Get Redis connection parameters as kwargs dict."""
+        kwargs = {
+            'host': self.redis_host,
+            'port': self.redis_port,
+            'db': self.redis_db,
+            'decode_responses': True,
+            'max_connections': 100,
+            'timeout': None, # Block forever waiting for a connection from the pool
+            # Health check interval - helps detect stale connections
+            'health_check_interval': 30,
+        }
+        
+        if self.redis_password:
+            kwargs['password'] = self.redis_password
+            
+        # Log configuration (without password)
+        safe_kwargs = {k: v for k, v in kwargs.items() if k != 'password'}
+        logging.info(f"Redis configuration: {safe_kwargs}")
+        
+        return kwargs
+
+    @classmethod
+    def from_args(cls, sys_args: Optional[List[str]] = None) -> "CrawlerConfig":
+        args = parse_args(sys_args)
+        user_agent = f"MyEducationalCrawler/1.0 (mailto:{args.email})"
+
+        return cls(
+            seed_file=Path(args.seed_file),
+            email=args.email,
+            data_dir=Path(args.data_dir),
+            cpu_alloc_start=args.cpu_alloc_start,
+            exclude_file=Path(args.exclude_file) if args.exclude_file else None,
+            fetcher_workers=args.fetcher_workers,
+            parser_workers=args.parser_workers,
+            num_fetcher_processes=args.num_fetcher_processes,
+            num_parser_processes=args.num_parser_processes,
+            max_pages=args.max_pages,
+            max_duration=args.max_duration,
+            log_level=args.log_level.upper(),
+            resume=args.resume,
+            seeded_urls_only=args.seeded_urls_only,
+            user_agent=user_agent,
+            redis_host=args.redis_host,
+            redis_port=args.redis_port,
+            redis_db=args.redis_db,
+            redis_password=args.redis_password,
+        ) 

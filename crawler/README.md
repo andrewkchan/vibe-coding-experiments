@@ -1,82 +1,79 @@
 # Experimental Web Crawler
 
-This project is an experimental/educational web crawler built in Python, designed to crawl web pages, extract text content, and manage politeness and fault tolerance.
+This project is an experimental web crawler built in Python. It is designed to be a high-performance, single-machine crawler that uses a hybrid Redis and file-based storage backend.
 
 Refer to `PLAN.MD` for a detailed project plan and architecture.
 
+## Architecture Overview
+
+The crawler uses a multi-process architecture to maximize performance:
+*   **Main Orchestrator Process**: Manages a pool of asynchronous worker tasks that fetch URLs.
+*   **Parser Processes**: One or more separate processes that consume raw HTML content, parse it, extract links, and save the content.
+
+This design separates I/O-bound work (fetching) from CPU-bound work (parsing), allowing the system to better utilize machine resources. Communication between the fetchers and parsers is handled via a Redis queue.
+
 ## Core Components
 
-*   `crawler_module/config.py`: Handles command-line argument parsing and configuration management.
-*   `crawler_module/utils.py`: Provides utility functions, especially for URL normalization and domain extraction.
-*   `crawler_module/storage.py`: Manages data persistence using SQLite for state (frontier, visited URLs, domain metadata) and the file system for crawled text content.
-*   `crawler_module/fetcher.py`: Asynchronously fetches web content (HTML, robots.txt) using `aiohttp`.
-*   `crawler_module/politeness.py`: Enforces politeness rules, including `robots.txt` parsing, crawl delays, and manual exclusion lists.
-*   `crawler_module/frontier.py`: Manages the queue of URLs to be crawled, interacting with storage and politeness rules.
-*   `crawler_module/parser.py`: Parses HTML content using `lxml` to extract links and text.
-*   `crawler_module/orchestrator.py`: Coordinates all components, manages concurrent worker tasks, and controls the overall crawl lifecycle.
-*   `crawler_module/db_backends.py`: Database abstraction layer supporting both SQLite and PostgreSQL.
+*   `crawler_module/orchestrator.py`: The main controller. It spawns and manages fetcher workers and parser processes.
+*   `crawler_module/parser_consumer.py`: The consumer process that handles all HTML parsing logic.
+*   `crawler_module/frontier.py`: Manages the queue of URLs to crawl. It uses a hybrid approach:
+    *   **Redis**: Stores domain metadata, scheduling information, and URL de-duplication data (via a Bloom filter).
+    *   **File System**: Stores the actual frontier URLs in per-domain files to handle a virtually unlimited frontier size.
+*   `crawler_module/storage.py`: Handles saving visited page metadata to Redis and text content to the file system.
+*   `crawler_module/politeness.py`: Enforces politeness rules (`robots.txt`, crawl delays) using Redis for caching.
+*   `crawler_module/fetcher.py`: Asynchronously fetches web content using `aiohttp`.
+*   `crawler_module/parser.py`: The core HTML parsing logic using `lxml`.
 *   `main.py`: The main entry point to run the crawler.
-
-## Database Backend Support
-
-The crawler supports two database backends:
-
-### SQLite (Default)
-- **Best for**: Testing, development, and small-scale crawls
-- **Max concurrent workers**: ~50-100
-- **Setup**: No additional setup required
-- **Limitations**: Single writer limitation can cause "database is locked" errors at high concurrency
-
-### PostgreSQL
-- **Best for**: Production use and large-scale crawls
-- **Max concurrent workers**: 500+
-- **Setup**: Requires PostgreSQL installation and configuration
-- **Benefits**: True concurrent writes, better performance at scale
-
-For detailed PostgreSQL setup and migration instructions, see [`PostgreSQL_Migration.md`](PostgreSQL_Migration.md).
 
 ## Setup
 
-1.  **Clone/Create Project**: Get the project files into a local directory.
+### 1. Dependencies
+
+*   Python 3.8+
+*   Docker and Docker Compose
+
+### 2. Environment Setup
+
+1.  **Clone Project**: Get the project files into a local directory.
 2.  **Navigate to `crawler/` directory**.
-3.  **Create a Python Virtual Environment**:
+3.  **Create Python Virtual Environment**:
     ```bash
     python3 -m venv .venv
     ```
-4.  **Activate the Virtual Environment**:
-    *   On macOS/Linux:
-        ```bash
-        source .venv/bin/activate
-        ```
-    *   On Windows:
-        ```bash
-        .venv\Scripts\activate
-        ```
+4.  **Activate Virtual Environment**:
+    *   macOS/Linux: `source .venv/bin/activate`
 5.  **Install Dependencies**:
     ```bash
     pip install -r requirements.txt
     ```
-    Key dependencies include: `aiohttp`, `lxml`, `robotexclusionrulesparser`, `aiofiles`, `cchardet`, `tldextract`, `pytest`, `pytest-asyncio`, `httpx`, and optionally `psycopg[binary,pool]` for PostgreSQL support.
+
+### 3. Start Redis
+
+The crawler requires a Redis instance with RedisBloom support. The simplest way to get this is with Docker.
+
+1.  **Start Redis using Docker Compose:**
+    ```bash
+    cd crawler
+    docker-compose up -d redis
+    ```
+    This starts a Redis container with persistence enabled and a 12GB memory limit.
+
+2.  **Verify it's working (optional):**
+    ```bash
+    # Connect to the Redis container
+    docker exec -it crawler-redis redis-cli
+    
+    # Test a Bloom Filter command
+    127.0.0.1:6379> BF.RESERVE test:bloom 0.001 1000
+    OK
+    ```
 
 ## Running the Crawler
 
-The crawler is run via `main.py` from the project root directory (e.g., `vibe-coding-experiments/` if `crawler` is inside it, or directly from `crawler/` if you `cd` into it first):
+The crawler is run via `main.py`.
 
-### Using SQLite (Default)
-```bash
-python crawler/main.py --seed-file path/to/your/seeds.txt --email your.email@example.com [options]
-```
-Or if you are inside the `crawler` directory:
 ```bash
 python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com [options]
-```
-
-### Using PostgreSQL
-```bash
-python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com \
-    --db-type postgresql \
-    --db-url "postgresql://user:password@localhost/crawler_db" \
-    --max-workers 500
 ```
 
 **Required Arguments:**
@@ -84,22 +81,20 @@ python main.py --seed-file path/to/your/seeds.txt --email your.email@example.com
 *   `--seed-file <path>`: Path to the seed file (newline-separated domains/URLs).
 *   `--email <email_address>`: Your contact email for the User-Agent string.
 
-**Optional Arguments (see `crawler_module/config.py` or run with `--help` for full list):**
+**Key Optional Arguments:**
 
-*   `--data-dir <path>`: Directory for database and content (default: `./crawler_data`).
+*   `--data-dir <path>`: Directory to store frontier files and crawled content (default: `./crawler_data`).
 *   `--exclude-file <path>`: File of domains to exclude.
-*   `--max-workers <int>`: Number of concurrent fetchers (default: 20).
-*   `--max-pages <int>`: Max pages to crawl.
+*   `--max-workers <int>`: Number of concurrent fetcher tasks (default: 500).
+*   `--max-pages <int>`: Stop after crawling this many pages.
 *   `--max-duration <seconds>`: Max crawl duration.
 *   `--log-level <LEVEL>`: DEBUG, INFO, WARNING, ERROR (default: INFO).
-*   `--resume`: Attempt to resume from existing data.
-*   `--seeded-urls-only`: Only crawl seeded URLs.
-*   `--db-type <sqlite|postgresql>`: Database backend to use (default: sqlite).
-*   `--db-url <url>`: PostgreSQL connection URL (required if db-type is postgresql).
+*   `--resume`: Attempt to resume a crawl from existing data.
+*   `--seeded-urls-only`: Only crawl URLs from seeded domains
 
 ## System Requirements for High Concurrency
 
-When running with many workers (especially with PostgreSQL), you may need to increase system limits:
+When running with many workers, you may need to increase system limits:
 
 ```bash
 # Run the provided setup script
@@ -112,67 +107,99 @@ ulimit -n 65536  # Increase file descriptor limit
 
 ## Running Tests
 
-The project uses `pytest` for testing. To run the tests:
+The project uses `pytest`.
 
-1.  Ensure you have activated your virtual environment and installed dependencies (including `pytest` and `pytest-asyncio` from `requirements.txt`).
-2.  Navigate to the `crawler/` directory (the root of the crawler project where `tests/` is located).
+1.  Make sure you have activated your virtual environment and installed dependencies.
+2.  Navigate to the `crawler/` directory.
 3.  Run pytest:
     ```bash
-    pytest
+    pytest tests/
     ```
     Or, for more verbose output:
     ```bash
-    pytest -v
+    pytest -v tests/
     ```
 
-## Monitoring with Prometheus and Grafana
+## Monitoring
 
-The crawler includes built-in metrics collection using Prometheus, with visualization through Grafana dashboards.
+The crawler exposes real-time metrics via Prometheus, which can be visualized with Grafana.
 
 ### Quick Start
 
-1. **Install Docker and Docker Compose** (if not already installed)
+1.  **Start the monitoring stack**:
+    ```bash
+    cd crawler
+    docker-compose up -d
+    ```
+    This starts Prometheus (port 9090), Grafana (port 3000), and the required Redis instance.
 
-2. **Start the monitoring stack**:
-   ```bash
-   cd crawler
-   docker-compose up -d
-   ```
-   This starts Prometheus (port 9090) and Grafana (port 3000).
+2.  **Run the crawler**:
+    ```bash
+    python main.py --seed-file seeds.txt --email your@email.com
+    ```
+    The orchestrator exposes aggregated metrics from all processes on port 8001.
 
-3. **Run the crawler** - it will automatically expose metrics on port 8001:
-   ```bash
-   python main.py --seed-file seeds.txt --email your@email.com
-   ```
+3.  **Access Grafana**:
+    *   Open `http://localhost:3000` in your browser.
+    *   Login: `admin` / `admin`.
+    *   The "Crawler Dashboard" is pre-configured and will show live data.
 
-4. **Access Grafana**:
-   - Open http://localhost:3000 in your browser
-   - Login with username: `admin`, password: `admin`
-   - The crawler dashboard is pre-configured and will show real-time metrics
+### Key Metrics to Watch
 
-### Available Metrics
+*   **Crawl Performance**: `pages_crawled_total`, `parser_pages_per_second`
+*   **Queue Health**: `parse_queue_size` (if this grows continuously, your parsers can't keep up with the fetchers)
+*   **Resource Usage**: `memory_usage_bytes`
+*   **Error Tracking**: `errors_total`
 
-The crawler tracks the following metrics:
+#### System Metrics
 
-- **Crawl Performance**:
-  - Pages crawled per second
-  - Total pages crawled
-  - URLs added to frontier
-  - Frontier size
+The crawler also collects comprehensive system metrics to help debug performance issues during long runs:
 
-- **Resource Usage**:
-  - Memory usage (RSS)
-  - Open file descriptors
-  - Active worker threads
-  - Database connection pool status
+**CPU & Memory**
+*   `system_cpu_percent` - System-wide CPU usage percentage (non-blocking measurement)
+*   `system_memory_free_bytes` - Free system memory
+*   `system_memory_available_bytes` - Available system memory (includes cache/buffers that can be freed)
+*   `crawler_memory_usage_bytes` - Crawler process RSS memory usage
 
-- **Performance Metrics**:
-  - URL fetch duration (percentiles)
-  - Database connection acquisition time
-  - Database query execution time
+**Disk**
+*   `system_disk_free_bytes` - Free space in the crawler's data directory
+*   `system_disk_usage_percent` - Disk usage percentage for the data directory
+*   Note: These metrics specifically monitor your `--data-dir` path, not the root filesystem
 
-- **Error Tracking**:
-  - Errors by type (fetch errors, HTTP errors, etc.)
+**Network**
+*   `system_network_bytes_sent` - Total network bytes sent (use `rate()` in queries)
+*   `system_network_bytes_received` - Total network bytes received
+*   `system_network_packets_sent` - Total network packets sent
+*   `system_network_packets_recv` - Total network packets received
+
+**Disk I/O**
+*   `system_io_read_count` - Total read operations (use `rate()` for IOPS)
+*   `system_io_write_count` - Total write operations
+*   `system_io_read_bytes` - Total bytes read
+*   `system_io_write_bytes` - Total bytes written
+
+**Redis Metrics**
+*   `redis_ops_per_second` - Redis operations per second
+*   `redis_memory_usage_bytes` - Redis memory consumption
+*   `redis_connected_clients` - Number of connected clients
+*   `redis_hit_rate_percent` - Cache hit rate percentage
+*   `redis_command_latency_seconds` - Command latency histogram (not yet implemented)
+
+#### Grafana Dashboard Features
+
+The pre-configured dashboard includes panels for all these metrics:
+*   System resource usage (CPU, memory, disk, network)
+*   Disk I/O performance with dual-axis charts (IOPS and throughput)
+*   Redis performance monitoring with hit rate gauge
+*   Correlation between crawler activity and system resources
+
+This comprehensive monitoring helps identify:
+*   Memory leaks (steady RSS increase)
+*   File descriptor leaks
+*   Network saturation
+*   Disk space issues in the data directory
+*   Redis performance bottlenecks
+*   Correlation between system issues and crawler behavior
 
 ### Stopping the Monitoring Stack
 
@@ -180,25 +207,19 @@ The crawler tracks the following metrics:
 docker-compose down
 ```
 
-To also remove the stored metrics data:
-```bash
-docker-compose down -v
-```
-
 ## Progress Inspection
 
-*   **Logs:** Check console output or redirect to a file. Log level is configurable.
-*   **Database (`crawler_data/crawler_state.db` within your specified data directory):** Use any SQLite client (e.g., `sqlite3` CLI, DB Browser for SQLite) to inspect tables like `frontier`, `visited_urls`, `domain_metadata`.
-*   **Content Files (`crawler_data/content/` within your specified data directory):** Extracted text content is stored in `.txt` files named by URL hash.
-
-## Migrating from SQLite to PostgreSQL
-
-If you have an existing SQLite crawler database and want to migrate to PostgreSQL:
-
-```bash
-python migrate_to_postgresql.py \
-    --sqlite-db crawler_data/crawler_state.db \
-    --pg-url "postgresql://user:password@localhost/crawler_db"
-```
-
-See [`PostgreSQL_Migration.md`](PostgreSQL_Migration.md) for detailed instructions. 
+*   **Logs:** Check console output. The orchestrator, fetcher workers, and parser processes all log to standard output.
+*   **Redis Data:** Connect to the Redis instance to inspect metadata.
+    ```bash
+    docker exec -it crawler-redis redis-cli
+    
+    # Check number of domains in the ready queue
+    127.0.0.1:6379> LLEN domains:queue 
+    
+    # Get metadata for a domain
+    127.0.0.1:6379> HGETALL domain:example.com
+    ```
+*   **Content and Frontier Files:**
+    *   Frontier URLs are stored in `[data-dir]/frontiers/`.
+    *   Extracted text content is stored in `[data-dir]/content/`. 

@@ -117,6 +117,8 @@ dmypy.json
 
 # Crawler specific
 crawler_data/
+logs/
+profiles/
 *.db
 *.db-journal
 top-1M-domains.txt

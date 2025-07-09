@@ -119,9 +119,8 @@ For 160M URLs across 1M domains, 7.5M visited:
 - Domain ready queue: 1M domains × 50 bytes = 50MB
 - Seen bloom filter: 2GB (0.1% false positive rate)
 - Visited URL hashes: 7.5M × 200 bytes = 1.5GB
-- Visited time index: 7.5M × 50 bytes = 375MB
 - Active domains set: ~10K domains × 50 bytes = 500KB
-- **Total Redis memory: ~4.5GB** (vs 32GB for full frontier)
+- **Total Redis memory: ~4.125GB** (vs 32GB for full frontier)
 
 File storage:
 - Frontier files: 160M URLs × 200 bytes = 32GB on disk
@@ -269,6 +268,7 @@ class PostgreSQLToHybridMigrator:
 - [X] Update CrawlerOrchestrator to use new frontier and politeness
 - [ ] Implement PostgreSQL migration script
 - [ ] Add monitoring/metrics for new system
+- [ ] Update docs
 
 ### Phase 3: Migration Preparation (Day 4)
 - [ ] Backup PostgreSQL database

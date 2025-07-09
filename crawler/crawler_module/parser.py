@@ -1,12 +1,10 @@
 import logging
 from dataclasses import dataclass, field
 from typing import List, Set, Optional
-from urllib.parse import urljoin, urlparse
+from .utils import normalize_and_join_url, normalize_url_parts
+from urllib.parse import urlparse
 
-from lxml import html, etree # For parsing HTML
-from lxml.html.clean import Cleaner # For basic text extraction
-
-from .utils import normalize_url, extract_domain # For normalizing and validating URLs
+from selectolax.lexbor import LexborHTMLParser
 
 logger = logging.getLogger(__name__)
 
@@ -18,22 +16,7 @@ class ParseResult:
 
 class PageParser:
     def __init__(self):
-        # Initialize a cleaner object. Configure as needed.
-        self.cleaner = Cleaner(
-            scripts=True, # Remove script tags
-            javascript=True, # Remove inline JS
-            comments=True, # Remove comments
-            style=True, # Remove style tags and attributes
-            links=False, # Keep <link> tags if they might be useful, e.g. canonical, but usually for crawler, no
-            meta=False, # Keep <meta> tags for now, could remove if noisy
-            page_structure=False, # Keep page structure (divs, p, etc.)
-            processing_instructions=True, # Remove PIs
-            frames=True, # Remove frames
-            forms=False, # Keep forms if their text content is desired, else True
-            annoying_tags=True, # Remove blink, marquee
-            remove_unknown_tags=False, # Keep unknown tags
-            safe_attrs_only=False, # Keep all attributes for now
-        )
+        pass
 
     def parse_html_content(
         self, 
@@ -46,66 +29,60 @@ class PageParser:
             return ParseResult()
 
         try:
-            # Use lxml.html.fromstring which is more robust for potentially broken HTML
-            doc = html.fromstring(html_string)
-        except etree.ParserError as e:
-            logger.error(f"lxml ParserError for {base_url}: {e}. Content preview: {html_string[:200]}")
-            return ParseResult() # Return empty result on severe parsing error
+            tree = LexborHTMLParser(html_string)
         except Exception as e:
-            logger.error(f"Unexpected error parsing HTML for {base_url}: {e}. Content preview: {html_string[:200]}")
+            logger.error(f"Error parsing HTML for {base_url}: {e}. Content preview: {html_string[:200]}")
             return ParseResult()
+
+        # Check for base href in the document
+        effective_base_url = base_url
+        try:
+            base_tags = tree.css('base[href]')
+            if base_tags:
+                base_href = base_tags[0].attributes.get('href')
+                if base_href:
+                    # If base href is absolute, use it directly
+                    # Otherwise, resolve it relative to the document URL
+                    if base_href.startswith(('http://', 'https://', '//')):
+                        effective_base_url = base_href
+                    else:
+                        # Resolve relative base href against document URL
+                        base_parsed = normalize_url_parts(urlparse(base_url.strip()))
+                        resolved_base = normalize_and_join_url(base_parsed, base_href)
+                        if resolved_base:
+                            effective_base_url = resolved_base
+        except Exception as e:
+            logger.warning(f"Error processing base href for {base_url}: {e}")
 
         # 1. Extract and resolve links
         extracted_links: Set[str] = set()
         try:
-            # Make sure the base_url is properly set for link resolution
-            doc.make_links_absolute(base_url, resolve_base_href=True)
+            # Don't normalize the effective_base_url to preserve trailing slashes
+            base_parsed = urlparse(effective_base_url.strip())
             
-            for element, attribute, link, pos in doc.iterlinks():
-                if attribute == 'href':
-                    try:
-                        parsed_link = urlparse(link)
-                        if parsed_link.scheme not in ['http', 'https']:
-                            continue 
-                    except Exception as e:
-                        continue 
-
-                    normalized = normalize_url(link) 
-                    if normalized:
-                        extracted_links.add(normalized)
+            # In selectolax, we use css() to find all anchor tags
+            for link_tag in tree.css('a'):
+                href = link_tag.attributes.get('href')
+                if href:
+                    u = normalize_and_join_url(base_parsed, href.strip())
+                    if u:
+                        extracted_links.add(u)
         except Exception as e:
             logger.error(f"Error during link extraction for {base_url}: {e}")
 
         # 2. Extract text content
-        text_content: Optional[str] = None
-        try:
-            cleaned_doc = self.cleaner.clean_html(doc)
-
-            body_element_cleaned = cleaned_doc.find('.//body')
-            if body_element_cleaned is not None:
-                text_content = body_element_cleaned.text_content()
-            else:
-                # If there's no body element even after cleaning (or initially),
-                # we define our page's "text_content" as None.
-                # The title is handled separately.
-                text_content = None
-            
-            if text_content: # Process only if text_content was derived (i.e., from a body)
-                text_content = ' \n'.join([line.strip() for line in text_content.splitlines() if line.strip()])
-                text_content = text_content.strip()
-                if not text_content: 
-                    text_content = None
-            # If text_content was initially set to None (no body), it remains None.
-
-        except Exception as e:
-            logger.error(f"Error during text extraction for {base_url}: {e}")
+        # Currently not using any text extraction logic, just returning the raw HTML string
+        # If we want to clean the HTML or extract specific elements we would do so here
+        text_content = html_string
 
         # 3. Extract title
         title: Optional[str] = None
         try:
-            title_element = doc.find('.//title')
-            if title_element is not None and title_element.text:
-                title = title_element.text.strip()
+            title_tags = tree.css('title')
+            if title_tags and len(title_tags) > 0:
+                title_text = title_tags[0].text(strip=True)
+                if title_text:
+                    title = title_text
         except Exception as e:
             logger.warning(f"Error extracting title for {base_url}: {e}")
 
